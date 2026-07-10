@@ -1,31 +1,21 @@
+# Handheld Multi-Sensor Fruit Quality Scanner 🥭
 
-
-# FruitPi 🥭
-
-An edge-computing sorting system designed for real-time fruit anomaly detection. The system runs an INT8 quantized YOLOv11 model on a Raspberry Pi 4 using ONNX Runtime, controlled via a local Flutter Web Dashboard.
+A two-tier, non-destructive fruit quality classification system built on the ESP32-S3-CAM platform. The system combines deterministic physical DSP on the edge with high-tier machine learning models on a mobile companion application to replace traditional destructive testing methods.
 
 ---
 
 ## 📐 System Architecture
 
 ```text
-theshanz/fruitpi/
-├── .github/workflows/
-│   └── release.yml               # CI/CD: Compiles Rust & builds Flutter Web UI
-├── training/                     # 💻 Run Target: Training PC (CPU or GPU)
-│   ├── train_initial.py          # PyTorch training script
-│   ├── export_onnx.py            # Model exporter (PyTorch -> INT8 ONNX)
-│   ├── requirements.txt          # Python dependencies (PyTorch, Ultralytics)
-│   └── dataset_tools/            # Configuration files and dataset utilities
-├── raspi/                        # 🍓 Run Target: Raspberry Pi 4
-│   ├── rust-core/                # Rust main loop, GStreamer, and Axum API
-│   │   ├── Cargo.toml
-│   │   └── src/                  # Inference loop, Camera capture, Web Server
-│   ├── setup_pi.sh               # Systemd installer & dependency setup script
-│   └── trigger_update.sh         # Update script triggered via Dashboard
-└── dashboard/                    # 📱 Run Target: Web Browser (Served by Rust)
-    ├── pubspec.yaml
-    └── lib/                      # Flutter UI (Dashboard, Manual Updates)
+.
+├── app/
+│   └── android_app/              # Mobile companion application (UI & heavy ML diagnostics)
+└── esp/                          # 🍓 Run Target: ESP32-S3 Hardware
+    ├── include/                  # Header files and configurations
+    ├── lib/                      # Edge processing and helper libraries
+    ├── main/
+    │   └── main.ino              # Main DSP core, capture loop, and WebSocket server
+    └── test/                     # Local test scripts and sensor calibration tools
 ```
 
 ---
@@ -34,9 +24,8 @@ theshanz/fruitpi/
 
 | Module | Role | Core Technologies | Run Target |
 | :--- | :--- | :--- | :--- |
-| **`training`** | Handles dataset preparation, model training, and exporting to INT8 ONNX. | Python, PyTorch, Ultralytics YOLOv11 | PC (CPU or GPU) |
-| **`raspi`** | Captures camera streams, crops mango images, runs ONNX inference, and triggers actuators. | Rust, ONNX Runtime (XNNPACK), OpenCV | Raspberry Pi 4 |
-| **`dashboard`** | Displays real-time sorting metrics and provides an interface to trigger updates. | Flutter Web, Axum Web Server (Rust backend) | Local Web Browser |
+| **`esp`** | Captures piezo signals and surface images, runs physical DSP, handles instant ripeness classification, and acts as a local Wi-Fi AP. | C++, `esp-dsp` library, Arduino ESP32 | ESP32-S3-CAM Hardware |
+| **`app`** | Establishes a local WebSocket connection, receives image frames, and executes complex computer vision models for surface pathologies. | Android (Kotlin/Java/Flutter), Mobile ML (EfficientNet-B4 / MobileNetV3) | Android Smartphone |
 
 ---
 
@@ -44,72 +33,69 @@ theshanz/fruitpi/
 
 | Component | Hardware | Role |
 | :--- | :--- | :--- |
-| **Training PC** | Standard PC (CPU or GPU) | Used for the initial model training and ONNX export. |
-| **Edge Compute** | Raspberry Pi 4 | Runs the real-time Rust engine and hosts the local dashboard. |
-| **Camera** | Global Shutter Camera | Captures sharp images of the fruit on the conveyor belt. |
-| **Control UI** | Any Phone, Tablet, or PC | Displays stats and allows manual system updates via web browser. |
+| **Edge Controller** | ESP32-S3-CAM (Xtensa LX7) | Runs the real-time DSP logic, manages sensor interfaces, and serves image data. |
+| **Acoustic Sensor** | Analog Piezo Vibration Module | Captures mechanical resonance frequencies generated from a physical knuckle tap. |
+| **Optical Capture** | Onboard 2MP OV2640 Sensor | Captures surface frames under standardized lighting conditions using the flash LED. |
+| **On-device Display** | SSD1306 I2C OLED | Renders localized zero-latency classification outputs (Unripe, Ripe, Overripe) in the field. |
+| **Power Management** | Lithium-Polymer Battery + Charger | Enables standalone, handheld operation of the instrument. |
 
 ---
 
-## 🧠 Why PyTorch?
+## 🧠 Architectural Philosophy: The Two-Tier System
 
-We utilize PyTorch for the initial model training phase because of its integration with modern computer vision tools:
-* **Native YOLOv11 Support:** The Ultralytics YOLOv11 framework is built directly on PyTorch, ensuring stable training and robust optimization utilities.
-* **Flexible Hardware Acceleration:** PyTorch seamlessly utilizes standard CPUs or dedicated GPUs (via CUDA or ROCm) without altering the codebase.
-* **Clean ONNX Translation:** PyTorch weights (`.pt`) translate reliably into quantized ONNX format for efficient edge CPU execution.
+To balance high-density diagnostic capability with instantaneous field operation, the system splits computational workloads into two independent tiers:
+
+* **Stage 1: Ripeness Scan (On-Device DSP Core):** Runs entirely on the handheld ESP32-S3 using deterministic physical models. By avoiding black-box neural networks for core mechanical metrics, it generates a mathematically explainable, zero-latency maturity verdict without requiring an active internet connection.
+* **Stage 2: Surface Health Check (Companion App Diagnostics):** Offloads computationally heavy pattern recognition to an external smartphone GPU via a local Wi-Fi AP. This allows high-parameter classifiers (like EfficientNet-B4) to identify complex fungal or bacterial pathogens without straining the power and thermal limits of the handheld microcontroller.
 
 ---
 
 ## 🔄 The Operational Pipeline
 
-The system processes fruit on the conveyor belt through a continuous, four-stage pipeline. (Collaborators are encouraged to dive into `raspi/rust-core/src/` to study the low-level implementation details):
+The handheld instrument evaluates fruit through a sequential pipeline designed for speed and diagnostic rigor:
 
 ```text
  ┌───────────────────┐      ┌───────────────────┐      ┌───────────────────┐      ┌───────────────────┐
- │ 1. IMAGE CAPTURE  │ ───> │ 2. PREPROCESSING  │ ───> │  3. ONNX RUNTIME  │ ───> │  4. ACTUATION/UI  │
- │ (GStreamer Stream)│      │  (CV Mango Crop)  │      │  (YOLOv11 INT8)   │      │ (Arduino & Web)   │
+ │ 1. IMPULSE & SCAN │ ───> │  2. HARDWARE DSP  │ ───> │ 3. DECISION MATRIX│ ───> │ 4. OFFLOAD (OPT)  │
+ │ (Piezo + Camera)  │      │ (FFT & Hue Angle) │      │ (Deterministic)   │      │(Wi-Fi WebSocket)  │
  └───────────────────┘      └───────────────────┘      └───────────────────┘      └───────────────────┘
 ```
 
-1. **Image Capture:** A low-latency GStreamer pipeline captures sharp frames from the global shutter camera.
-2. **Preprocessing & ROI (Region of Interest):** Traditional computer vision filters detect the presence of the fruit, calculate its bounding area, and crop the image.
-3. **ONNX Inference:** The cropped fruit image is normalized and run through the lightweight INT8 quantized model using ONNX Runtime.
-4. **Action & Visualization:** Based on the model's confidence scores, the Rust engine logs the decision to SQLite, updates the Flutter Web Dashboard via WebSockets, and signals the mechanical actuator.
+1. **Acoustic & Optical Impulse:** The user taps the fruit while holding the device against the surface. The piezo sensor registers the internal mechanical resonance frequency, and the camera captures a local surface matrix under standard illumination.
+2. **On-Chip DSP Processing:**
+   * **Mechanical Stiffness:** The ESP32-S3 samples the analog signal at $16\text{ kHz}$, processes it through a Hann window, and runs a $1024$-point hardware-accelerated Fast Fourier Transform (FFT) via `esp-dsp` to isolate the peak resonant frequency ($f_0$). Internal elasticity is resolved using the **Cooke-Rand Stiffness Coefficient formula**:
+     $$S = f_0^2 \cdot m^{2/3}$$
+     *(where $m$ represents the estimated mass).*
+   * **Colorimetric Decay:** The camera frame is mapped from RGB to the HSV color space, extracting the average Hue angle ($H$) of the center-weighted region. This yields a light-invariant metric of chlorophyll degradation.
+3. **Maturity Classification:** A localized 2D Decision Matrix cross-references stiffness ($S$) against hue ($H$). This easily isolates anomalies like artificially-ripened specimens (yellow skin with hard interior) or internally bruised specimens (green skin with soft interior).
+4. **Diagnostic Offloading:** If deep pathological verification is required, the ESP32 streams compressed JPEG images and scalar sensor telemetry via local WebSockets to the companion Android application for ML inference.
 
 ---
 
 ## 🏃 Quick Start Guide
 
-### 1. Training on the PC
-Configure your Python environment and train your initial model:
+### 1. Flashing the Handheld Firmware
+To build and upload the core firmware to your ESP32-S3 board:
+
 ```bash
-# Install required dependencies
-pip install -r training/requirements.txt
+# Navigate to the ESP firmware directory
+cd esp/main
 
-# Train the model
-python training/train_initial.py
-
-# Convert the trained model to optimized INT8 ONNX format
-python training/export_onnx.py
+# Open main.ino using your preferred IDE (e.g., Arduino IDE, VS Code with ESP-IDF/Arduino extensions)
+# Set your board target to: ESP32S3 Dev Module
+# Verify that the 'esp-dsp' library is installed in your local library path.
+# Build and flash the firmware over USB-C.
 ```
 
-### 2. Local Rapid-Testing (No Pi Required)
-To iterate on the Rust engine and Flutter UI directly on your PC:
-```bash
-# 1. Run the UI in your browser
-cd dashboard
-flutter run -d chrome
+### 2. Launching the Companion Android App
+To configure the companion app for advanced ML diagnostic testing:
 
-# 2. Test Rust engine locally using a dummy video instead of a physical camera
-cd ../raspi/rust-core
-cargo run -- --input path/to/conveyor_belt.mp4
-```
-
-### 3. Deploying to the Raspberry Pi 4
-Run this setup script on a fresh Raspberry Pi 4 to install the background services and dependencies:
 ```bash
-# SSH into the Pi, clone the repository, and run setup
-git clone https://github.com/theshanz/fruitpi.git
-cd fruitpi/raspi
-bash setup_pi.sh
+# Navigate to the Android application folder
+cd app/android_app
+
+# Open the project directory in Android Studio.
+# Sync the Gradle files to resolve the dependencies (including TensorFlow Lite / PyTorch Mobile).
+# Build and deploy the APK to your test Android device.
+# Connect your mobile device to the local Wi-Fi AP generated by the ESP32-S3 to start listening to the sensor telemetry stream.
 ```
