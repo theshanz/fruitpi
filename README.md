@@ -68,7 +68,7 @@ The scanner operates via a decoupled, two-tier architecture to deliver rapid, ex
 
 ## 🏃 Development & Compilation Setup
 
-This project uses a unified folder structure designed for cross-compatibility. The main firmware sketch is located at `esp/main/main.ino`. This specific subdirectory naming (`main/main.ino`) allows **Arduino IDE** users to open and compile the sketch natively while remaining compatible with standard directory structures.
+
 
 ### 1. Firmware Setup (Arduino IDE)
 
@@ -117,21 +117,17 @@ flutter pub get
 flutter run
 ```
 
-*Note: Ensure your mobile device is connected to the Wi-Fi Access Point broadcasted by the ESP32-S3-CAM (refer to your config settings inside `esp/include/` for default credentials).*
 
 ---
 
 ## 🤝 Contributing
 
-We welcome development contributions, sensor calibration profiles, and pathologically labeled datasets. 
 
 ```bash
-git clone https://github.com/<your-org>/fruitpi.git
+git clone https://github.com/theshanz/fruitpi.git
 cd fruitpi
 ```
 
 ---
 
 ## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
