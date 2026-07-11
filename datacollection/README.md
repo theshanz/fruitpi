@@ -84,9 +84,3 @@ The datacollection firmware is a stripped-down variant of the main `esp/` firmwa
 - **Camera capture:** QVGA JPEG frames encoded to base64 over serial.
 - **Serial protocol:** JSON lines — commands (`ARM`, `CAPTURE`, `PING`) in, JSON objects out.
 
-Build with PlatformIO:
-
-```bash
-cd datacollection/esp
-pio run -e esp32s3cam
-```
