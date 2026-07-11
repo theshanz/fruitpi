@@ -8,7 +8,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   formData.append('image', file);
 
   // Send to backend API
- const response = await fetch('http://127.0.0.1:5501/analyze', {
+ const response = await fetch('http://127.0.0.1:5000/analyze', {
     method: 'POST',
     body: formData
 });
