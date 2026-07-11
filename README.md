@@ -4,6 +4,13 @@ A two-tier, non-destructive fruit quality classification system designed for the
 
 ---
 
+## In development 
+```
+- Data collector
+- Site
+
+```
+
 ## 📐 System Architecture
 
 ```text
