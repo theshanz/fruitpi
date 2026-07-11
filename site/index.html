@@ -16,17 +16,25 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Pacifico&display=swap" rel="stylesheet">
 
+    <!-- font2 -->
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap" rel="stylesheet">
+
+
+
     <!-- css -->
     <link rel="stylesheet" href="style.css">
 
 </head>
 
-<body>
+<body class="bdy">
 
 
     <nav class="navbar navbar-expand-lg bg-body-tertiary">
         <div class="container-fluid">
-            <a class="navbar-brand" href="#" id="pacifico-regular">FRUITY PI</a> &nbsp
+            <a class="navbar-brand" href="#" id="pacifico-regular">FRUITY PIE</a> &nbsp
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
                 data-bs-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false"
                 aria-label="Toggle navigation">
@@ -38,20 +46,23 @@
                         <a class="nav-link active" aria-current="page" href="#">Home</a>
                     </li>
                     <li class="nav-item">
-                        <a class="nav-link" href="#">Link</a>
+                        <a class="nav-link" href="#readme-container">Device</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="">Upload</a>
                     </li>
                     <li class="nav-item dropdown">
                         <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown"
                             aria-expanded="false">
-                            Dropdown
+                            Fruits
                         </a>
                         <ul class="dropdown-menu">
-                            <li><a class="dropdown-item" href="#">Action</a></li>
+                            <li><a class="dropdown-item" href="#">Mango</a></li>
                             <li><a class="dropdown-item" href="#">Another action</a></li>
                             <li>
                                 <hr class="dropdown-divider">
                             </li>
-                            <li><a class="dropdown-item" href="#">Something else here</a></li>
+                            <li><a class="dropdown-item" href="#">Other</a></li>
                         </ul>
                     </li>
                     <li class="nav-item">
@@ -67,7 +78,88 @@
     </nav>
 
 
-   
+
+
+
+
+
+
+    <div class="card text-center" style="margin-top: 200px;">
+
+        <div class="card-body" id="quicksand-regular">
+            <h5 class="card-title" style="font-size: 40px;">
+                <h5 id="pacifico-regular" style="font-size: 40px;">Fruity Pie</h5> — Smart Fruit Firmness Detection
+            </h5>
+            <p class="card-text" style="font-size: 30px;">Analyze fruit quality instantly using AI and sensor data.</p>
+            <a href="#" class="btn btn-primary" style="font-size: 20px; cursor: pointer;">Get Started </a>
+        </div>
+
+    </div>
+
+    <div style="text-align: center; margin-top: 250px; margin-bottom: 50px;">
+        <h1 style="color: aliceblue; " id="quicksand-bold">Device</h1>
+    </div>
+
+
+    <section id="readme-container" style="margin: 50px; border-radius: 40px; ">
+
+
+        <!-- README content will be injected here -->
+    </section>
+
+    <div style="text-align: center; margin-top: 250px; margin-bottom: 50px;">
+        <h1 style="color: aliceblue; " id="quicksand-bold">Upload</h1>
+    </div>
+
+
+    <section id="upload-container" style="margin: 100px; border-radius: 40px; ">
+
+
+
+        <div class="row">
+            <div class="col-sm-6 mb-3 mb-sm-0">
+                <div class="card" id="card">
+                    <form class="form">
+                        <span class="form-title">Upload your file</span>
+                        <p class="form-paragraph">
+                            File should be an image
+                        </p>
+                        <label for="file-input" class="drop-container">
+                            <span class="drop-title">Drop Image here</span>
+                            or
+                            <input type="file" accept="image/*" required="" id="file-input">
+                        </label>
+                    </form>
+
+
+                </div>
+            </div>
+
+            <div class="col-sm-6">
+                <div class="card" id="card">
+
+                    <form class="form">
+                        <span class="form-title">Upload your file</span>
+                        <p class="form-paragraph">
+                            File should be an image
+                        </p>
+                        <label for="file-input" class="drop-container">
+                            <span class="drop-title">Drop Image here</span>
+                            or
+                            <input type="file" accept="image/*" required="" id="file-input">
+                        </label>
+                    </form>
+
+                </div>
+            </div>
+        </div>
+
+
+
+       
+
+
+    </section>
 
 
 
@@ -80,6 +172,16 @@
 
 
 
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+        // Fetch README.md and render
+        fetch('README.md')
+            .then(response => response.text())
+            .then(text => {
+                document.getElementById('readme-container').innerHTML = marked.parse(text);
+            });
+    </script>
 
 
 
