@@ -1,0 +1,6 @@
+numpy>=2.0
+scipy>=1.14
+matplotlib>=3.9
+opencv-python>=4.8
+pillow>=10.0
+pyserial>=3.5

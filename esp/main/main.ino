@@ -1,5 +1,5 @@
 #include <Arduino.h>
-
+#include "sensor.h"
 
 #define LED_PIN 47
 
@@ -13,8 +13,11 @@ void setup() {
 }
 
 void loop() {
-    Serial.println("FruitPi System Heartbeat...");
     digitalWrite(LED_PIN, HIGH);
+
+    SensorReading r = readPiezoSensor();
+    printReading(r);
+
     delay(1000);
     digitalWrite(LED_PIN, LOW);
     delay(1000);
