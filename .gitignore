@@ -1,0 +1,43 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# Build
+build/
+dist/
+*.log
+
+# Temp
+*.tmp
+*.temp
+.tmp/
+.cache/
+
+# Personal editor configs (not for collaborators)
+.clangd
+.zed/
+
+# PlatformIO (keep platformio.ini committed)
+esp/.pio/
+esp/.pioenvs/
+esp/.piolibdeps/
+esp/.cache/
+esp/compile_commands.json
+esp/extra_script.py
+esp/platformio.ini
+esp/.gitignore
+datacollection/python/__pycache__/
+datacollection/python/samples/scan_002/
+datacollection/esp/platformio.ini
+datacollection/python/samples/
+mango-sorting-system/node_modules/
