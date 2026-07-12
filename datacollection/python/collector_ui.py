@@ -15,6 +15,7 @@ import argparse
 import base64
 import csv
 import io
+import json
 import os
 import shutil
 import tkinter as tk
@@ -36,29 +37,25 @@ STATE_LABELS = [
     "rotten_hollow", "artificially_ripened",
 ]
 N_CLASSES = 6
-N_SAMPLES = 1024
-SAMPLE_RATE = 16000
+N_SAMPLES = 4096
+SAMPLE_RATE = 80000
+FFT_MAX_FREQ = 10000  # Hz — focus on the useful piezo range
 
 SAMPLES_DIR = Path(__file__).parent / "samples"
 CSV_PATH = Path(__file__).parent / "real_dataset.csv"
-
-CSV_HEADER = (
-    ["Timestamp", "Fruit_Type", "Actual_State",
-     "Actual_Mass", "Circumference_cm", "Vol_Est",
-     "Photo_Paths", "Raw_Tap_Path"]
-    + [f"Soft_{i}" for i in range(N_CLASSES)]
-)
 
 
 class CollectorUI:
     IDLE = "IDLE"
     ARMED = "ARMED"
-    RECEIVING = "RECEIVING"
+    CAPTURING = "CAPTURING"
     READY = "READY"
     PHOTO = "PHOTO"
 
-    def __init__(self, root, mock=False, port="/dev/ttyUSB0", baud=115200,
-                 n_taps=3, rapid=False, keep_fields=False):
+    DEFAULT_THRESHOLD = 300
+
+    def __init__(self, root, mock=False, port="/dev/ttyUSB0", baud=921600,
+                 rapid=False, keep_fields=False, threshold=None):
         self.root = root
         self.root.title("FruitPi Data Collector")
         self.root.minsize(1100, 680)
@@ -66,21 +63,21 @@ class CollectorUI:
         self.state = self.IDLE
         self.sample_count = 0
         self.scan_count = 0
-        self.taps_received = 0
-        self.raw_taps = []
+        self.raw_taps = None
         self.accepted_photos = []
+        self.threshold = threshold if threshold is not None else self.DEFAULT_THRESHOLD
+        self.fft_log = False
 
-        self.n_taps = n_taps
         self.rapid = rapid
         self.keep_fields = keep_fields
 
         self.bridge = SerialBridge(
             on_message=self._on_message, port=port, baud=baud, mock=mock,
-            n_taps=n_taps,
         )
 
         self._build_ui()
         self._set_state(self.IDLE)
+        self._migrate_csv()
         self._refresh_sidebar()
         self._bind_keys()
 
@@ -96,10 +93,14 @@ class CollectorUI:
         self.root.bind("<Key-P>", lambda e: self._key_photo())
         self.root.bind("<Key-r>", lambda e: self._key_rapid_toggle())
         self.root.bind("<Key-R>", lambda e: self._key_rapid_toggle())
+        self.root.bind("<Key-l>", lambda e: self._key_log_toggle())
+        self.root.bind("<Key-L>", lambda e: self._key_log_toggle())
 
     def _key_space(self):
         if self.state == self.IDLE:
-            self._on_collect()
+            self._on_arm()
+        elif self.state == self.ARMED:
+            self._on_disarm()
         elif self.state == self.READY:
             self._on_finish()
         elif self.state == self.PHOTO:
@@ -117,6 +118,11 @@ class CollectorUI:
         self.rapid = not self.rapid
         self.rapid_var.set(self.rapid)
         self._update_rapid_indicator()
+
+    def _key_log_toggle(self):
+        self.fft_log = not self.fft_log
+        self.fft_log_var.set(self.fft_log)
+        self._compute_fft_display()
 
     def _update_rapid_indicator(self):
         if self.rapid:
@@ -151,12 +157,6 @@ class CollectorUI:
         self.rapid_label = ttk.Label(top, text="", font=("monospace", 9, "bold"))
         self.rapid_label.pack(side=tk.LEFT, padx=(0, 4))
         self._update_rapid_indicator()
-
-        ttk.Label(top, text=f"({self.n_taps} taps)", font=("monospace", 9)
-                  ).pack(side=tk.LEFT, padx=(8, 0))
-
-        self.tap_indicator = ttk.Label(top, text="", font=("monospace", 10))
-        self.tap_indicator.pack(side=tk.RIGHT)
 
         # ── Main area ──
         main = ttk.Frame(self.root)
@@ -197,16 +197,29 @@ class CollectorUI:
         ttk.Entry(meas, textvariable=self.circ_var, width=8).pack(
             side=tk.LEFT, padx=(4, 16))
         self.vol_label = ttk.Label(meas, text="Vol: —")
-        self.vol_label.pack(side=tk.LEFT, padx=(8, 0))
+        self.vol_label.pack(side=tk.LEFT, padx=(8, 16))
         self.circ_var.trace_add("write", self._update_vol_preview)
+
+        ttk.Label(meas, text="Threshold (0-4095):").pack(side=tk.LEFT)
+        self.threshold_var = tk.StringVar(value=str(self.threshold))
+        threshold_entry = ttk.Entry(meas, textvariable=self.threshold_var,
+                                    width=6)
+        threshold_entry.pack(side=tk.LEFT, padx=(4, 0))
+        self.threshold_var.trace_add("write", self._on_threshold_change)
+
+        self.fft_log_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(meas, text="Log FFT", variable=self.fft_log_var,
+                        command=self._on_fft_log_toggle).pack(
+                            side=tk.LEFT, padx=(12, 0))
 
         # ── Buttons ──
         bottom = ttk.Frame(self.root, padding=8)
         bottom.pack(fill=tk.X)
 
-        self.btn_collect = ttk.Button(bottom, text="Collect Sample [Space]",
-                                      command=self._on_collect)
-        self.btn_collect.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_arm = ttk.Button(bottom, text="Arm [Space]",
+                                  command=self._on_arm)
+        self.btn_disarm = ttk.Button(bottom, text="Stop [Space]",
+                                     command=self._on_disarm)
         self.btn_photo = ttk.Button(bottom, text="Take Photo [P]",
                                     command=self._on_take_photo)
         self.btn_accept = ttk.Button(bottom, text="Accept",
@@ -225,7 +238,7 @@ class CollectorUI:
         self.status_label.pack(side=tk.RIGHT, padx=(0, 16))
 
         # ── Shortcut hint ──
-        hint = ttk.Label(bottom, text="Keys: Space=Collect/Finish  P=Photo  R=Rapid",
+        hint = ttk.Label(bottom, text="Keys: Space=Arm/Stop  P=Photo  R=Rapid  L=Log",
                          font=("monospace", 8), foreground="#999")
         hint.pack(side=tk.RIGHT, padx=(0, 16))
 
@@ -293,25 +306,23 @@ class CollectorUI:
 
     def _refresh_sidebar(self):
         self.sample_list.delete(0, tk.END)
-        self.scan_dirs = []
+        self.scan_metas = []
 
         counts = defaultdict(lambda: defaultdict(int))
 
-        if CSV_PATH.exists():
-            with open(CSV_PATH) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    tag = Path(row.get("Raw_Tap_Path", "")).parent.name
-                    fruit = row.get("Fruit_Type", "?")
-                    label = row.get("Actual_State", "?")
-                    mass = row.get("Actual_Mass", "?")
-                    display = f"{tag} | {fruit} | {label} | {mass}g"
-                    self.sample_list.insert(tk.END, display)
-                    self.scan_dirs.append({
-                        "dir": Path(row.get("Raw_Tap_Path", "")).parent,
-                        "row": row,
-                    })
-                    counts[fruit][label] += 1
+        for scan_dir in sorted(SAMPLES_DIR.iterdir()):
+            meta_path = scan_dir / "metadata.json"
+            if not meta_path.is_file():
+                continue
+            with open(meta_path) as f:
+                meta = json.load(f)
+            fruit = meta.get("fruit_type", "?")
+            label = meta.get("label", "?")
+            mass = meta.get("mass_g", "?")
+            display = f"{scan_dir.name} | {fruit} | {label} | {mass}g"
+            self.sample_list.insert(tk.END, display)
+            self.scan_metas.append({"dir": scan_dir, "meta": meta})
+            counts[fruit][label] += 1
 
         for fruit in FRUIT_TYPES:
             for label in STATE_LABELS:
@@ -331,28 +342,20 @@ class CollectorUI:
         if not sel:
             return
         idx = sel[0]
-        if idx >= len(self.scan_dirs):
+        if idx >= len(self.scan_metas):
             return
 
-        info = self.scan_dirs[idx]
-        row = info["row"]
+        info = self.scan_metas[idx]
+        meta = info["meta"]
         scan_dir = info["dir"]
-
-        taps_path = scan_dir / "taps.npy"
-        n_taps = 0
-        if taps_path.exists():
-            arr = np.load(taps_path)
-            n_taps = arr.shape[0] if arr.ndim == 2 else 0
-
-        n_photos = len(list(scan_dir.glob("photo_*.jpg"))) if scan_dir.exists() else 0
 
         lines = [
             f"Scan: {scan_dir.name}",
-            f"Fruit: {row.get('Fruit_Type', '?')}",
-            f"Label: {row.get('Actual_State', '?')}",
-            f"Mass: {row.get('Actual_Mass', '?')} g",
-            f"Circ: {row.get('Circumference_cm', '?')} cm",
-            f"Taps: {n_taps}  |  Photos: {n_photos}",
+            f"Fruit: {meta.get('fruit_type', '?')}",
+            f"Label: {meta.get('label', '?')}",
+            f"Mass: {meta.get('mass_g', '?')} g",
+            f"Circ: {meta.get('circumference_cm', '?')} cm",
+            f"Capture: {SAMPLE_RATE} Hz x {N_SAMPLES} samples  |  Photos: {len(meta.get('photo_files', []))}",
         ]
 
         self.info_text.config(state=tk.NORMAL)
@@ -365,10 +368,10 @@ class CollectorUI:
         if not sel:
             return
         idx = sel[0]
-        if idx >= len(self.scan_dirs):
+        if idx >= len(self.scan_metas):
             return
 
-        info = self.scan_dirs[idx]
+        info = self.scan_metas[idx]
         scan_dir = info["dir"]
 
         if not messagebox.askyesno("Delete Sample",
@@ -378,25 +381,46 @@ class CollectorUI:
         if scan_dir.exists():
             shutil.rmtree(scan_dir)
 
-        self._remove_csv_row(info["row"])
         self._refresh_sidebar()
         self._clear_info()
 
-    def _remove_csv_row(self, target_row):
-        if not CSV_PATH.exists():
+    def _migrate_csv(self):
+        if not CSV_PATH.exists() or CSV_PATH.stat().st_size == 0:
             return
-        rows = []
+        migrated = 0
         with open(CSV_PATH) as f:
             reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames
             for row in reader:
-                if row.get("Raw_Tap_Path") != target_row.get("Raw_Tap_Path"):
-                    rows.append(row)
-
-        with open(CSV_PATH, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
+                tap_path = Path(row.get("Raw_Tap_Path", ""))
+                scan_dir = tap_path.parent
+                if not scan_dir.exists():
+                    continue
+                meta_path = scan_dir / "metadata.json"
+                if meta_path.exists():
+                    continue
+                photo_field = row.get("Photo_Paths", "")
+                photo_files = [Path(p).name for p in photo_field.split(";") if p]
+                soft = [float(row.get(f"Soft_{i}", 0)) for i in range(N_CLASSES)]
+                meta = {
+                    "id": scan_dir.name,
+                    "timestamp": int(row.get("Timestamp", 0)),
+                    "fruit_type": row.get("Fruit_Type", ""),
+                    "label": row.get("Actual_State", ""),
+                    "mass_g": float(row.get("Actual_Mass", 0)),
+                    "circumference_cm": float(row.get("Circumference_cm", 0)),
+                    "vol_est": float(row.get("Vol_Est", 0)),
+                    "n_taps": int(np.load(tap_path).shape[0]) if tap_path.exists() else 0,
+                    "tap_file": "taps.npy",
+                    "photo_files": photo_files,
+                    "soft_labels": soft,
+                    "sample_rate": SAMPLE_RATE,
+                    "n_samples": N_SAMPLES,
+                }
+                with open(meta_path, "w") as mf:
+                    json.dump(meta, mf, indent=2)
+                migrated += 1
+        if migrated > 0:
+            CSV_PATH.rename(CSV_PATH.with_suffix(".csv.migrated"))
 
     def _clear_info(self):
         self.info_text.config(state=tk.NORMAL)
@@ -414,67 +438,75 @@ class CollectorUI:
         )
         self.ax_fft.set_xlabel("Frequency (Hz)")
         self.ax_fft.set_ylabel("Magnitude")
-        self.ax_fft.set_xlim(0, 4000)
+        self.ax_fft.set_xlim(0, FFT_MAX_FREQ)
         self.ax_fft.set_ylim(0, 1)
         self.ax_fft.grid(alpha=0.3)
 
     def _compute_fft_display(self):
-        if not self.raw_taps:
+        if self.raw_taps is None:
             return
-        all_mag = []
-        for tap in self.raw_taps:
-            samples = np.array(tap, dtype=np.float32)
-            samples -= np.mean(samples)
-            windowed = samples * np.hanning(len(samples))
-            fft = np.fft.rfft(windowed)
-            mag = np.abs(fft) / N_SAMPLES
-            all_mag.append(mag)
-        avg_mag = np.mean(all_mag, axis=0)
+        samples = self.raw_taps.astype(np.float32)
+        samples -= np.mean(samples)
+        windowed = samples * np.hanning(len(samples))
+        fft = np.fft.rfft(windowed)
+        mag = np.abs(fft) / N_SAMPLES
         freqs = np.fft.rfftfreq(N_SAMPLES, 1.0 / SAMPLE_RATE)
-        mask = freqs <= 4000
-        self.fft_line.set_data(freqs[mask], avg_mag[mask])
-        ymax = max(np.max(avg_mag[mask]) * 1.3, 0.01)
-        self.ax_fft.set_ylim(0, ymax)
+        mask = freqs <= FFT_MAX_FREQ
+        self.fft_line.set_data(freqs[mask], mag[mask])
+        if self.fft_log:
+            self.ax_fft.set_yscale("log")
+            ymax = max(np.max(mag[mask]) * 1.3, 1e-6)
+            self.ax_fft.set_ylim(ymax * 1e-4, ymax)
+        else:
+            self.ax_fft.set_yscale("linear")
+            ymax = max(np.max(mag[mask]) * 1.3, 0.01)
+            self.ax_fft.set_ylim(0, ymax)
         self.canvas.draw_idle()
 
     # ─── State machine ─────────────────────────────────────────────
 
     def _set_state(self, new_state):
         self.state = new_state
-        for w in (self.btn_photo, self.btn_accept, self.btn_retake,
-                  self.btn_another, self.btn_finish):
+        for w in (self.btn_arm, self.btn_disarm, self.btn_photo,
+                  self.btn_accept, self.btn_retake, self.btn_another,
+                  self.btn_finish):
             w.pack_forget()
 
         if new_state == self.IDLE:
-            self.btn_collect.pack(side=tk.LEFT, padx=(0, 8))
-            self.btn_collect.config(state=tk.NORMAL)
-            self._set_status("IDLE — Space to collect", "#666")
-            self.taps_received = 0
-            self.tap_indicator.config(text="")
+            self.btn_arm.pack(side=tk.LEFT, padx=(0, 8))
+            self.btn_arm.config(state=tk.NORMAL)
+            self.btn_photo.pack(side=tk.LEFT, padx=(0, 8))
+            self._set_status("IDLE — Space to arm", "#666")
             self.accepted_photos = []
-            self.raw_taps = []
+            self.raw_taps = None
+            self.ax_photo.clear()
+            self.ax_photo.set_title("Photo")
+            self.ax_photo.set_xticks([])
+            self.ax_photo.set_yticks([])
+            self.ax_photo.text(0.5, 0.5, "No photo yet", ha="center",
+                               va="center", transform=self.ax_photo.transAxes,
+                               color="#999", fontsize=11)
+            self._init_fft_line()
 
         elif new_state == self.ARMED:
-            self.btn_collect.config(state=tk.DISABLED)
-            self._set_status(f"ARMED — tap the fruit {self.n_taps}x...",
-                             "#F57C00")
+            self.btn_disarm.pack(side=tk.LEFT, padx=(0, 8))
+            self.btn_disarm.config(state=tk.NORMAL)
+            self._set_status("Armed — tap the fruit!", "#FF6F00")
 
-        elif new_state == self.RECEIVING:
-            self._set_status(
-                f"TAP {self.taps_received}/{self.n_taps}", "#1976D2")
+        elif new_state == self.CAPTURING:
+            self._set_status("Capturing 4096 @ 80 kHz...", "#1976D2")
 
         elif new_state == self.READY:
-            self.btn_collect.pack(side=tk.LEFT, padx=(0, 8))
-            self.btn_collect.config(state=tk.NORMAL)
+            self.btn_arm.pack(side=tk.LEFT, padx=(0, 8))
+            self.btn_arm.config(state=tk.NORMAL)
             self.btn_photo.pack(side=tk.LEFT, padx=(0, 8))
             self.btn_finish.pack(side=tk.LEFT, padx=(0, 8))
-            self._set_status(
-                f"{len(self.raw_taps)}/{self.n_taps} taps — Enter to finish",
-                "#388E3C")
+            self._set_status("Captured — Enter to finish or P for photo",
+                             "#388E3C")
 
         elif new_state == self.PHOTO:
-            self.btn_collect.pack(side=tk.LEFT, padx=(0, 8))
-            self.btn_collect.config(state=tk.NORMAL)
+            self.btn_arm.pack(side=tk.LEFT, padx=(0, 8))
+            self.btn_arm.config(state=tk.NORMAL)
             self.btn_photo.pack(side=tk.LEFT, padx=(0, 8))
             self.btn_accept.pack(side=tk.LEFT, padx=(0, 4))
             self.btn_retake.pack(side=tk.LEFT, padx=(0, 4))
@@ -502,26 +534,36 @@ class CollectorUI:
         self.rapid = self.rapid_var.get()
         self._update_rapid_indicator()
 
+    def _on_fft_log_toggle(self):
+        self.fft_log = self.fft_log_var.get()
+        self._compute_fft_display()
+
     # ─── Button callbacks ──────────────────────────────────────────
 
-    def _on_collect(self):
+    def _on_arm(self):
         if not self.bridge.is_connected():
             self.bridge.connect(fruit=self._get_fruit(), label=self._get_label())
-        self.taps_received = 0
-        self.raw_taps = []
-        self.accepted_photos = []
-        self.ax_photo.clear()
-        self.ax_photo.set_title("Photo")
-        self.ax_photo.set_xticks([])
-        self.ax_photo.set_yticks([])
-        self.ax_photo.text(0.5, 0.5, "Waiting for taps...", ha="center",
-                           va="center", transform=self.ax_photo.transAxes,
-                           color="#999", fontsize=11)
-        self._init_fft_line()
         self._set_state(self.ARMED)
         self.bridge.send("ARM")
 
+    def _on_disarm(self):
+        self._set_state(self.IDLE)
+
+    def _on_threshold_change(self, *_args):
+        val_str = self.threshold_var.get().strip()
+        if not val_str:
+            return
+        try:
+            val = int(val_str)
+            if 0 < val < 4096:
+                self.threshold = val
+                self.bridge.send(f"THRESHOLD {val}")
+        except ValueError:
+            pass
+
     def _on_take_photo(self):
+        if not self.bridge.is_connected():
+            self.bridge.connect(fruit=self._get_fruit(), label=self._get_label())
         self.bridge.send("CAPTURE")
 
     def _on_accept_photo(self):
@@ -534,8 +576,8 @@ class CollectorUI:
         mass_str = self.mass_var.get().strip()
         circ_str = self.circ_var.get().strip()
 
-        if not self.raw_taps:
-            messagebox.showwarning("Missing Data", "No tap data collected yet.")
+        if self.raw_taps is None:
+            messagebox.showwarning("Missing Data", "No data captured yet.")
             return
         if not mass_str:
             messagebox.showwarning("Missing Data", "Enter mass in grams.")
@@ -566,35 +608,31 @@ class CollectorUI:
         scan_dir = SAMPLES_DIR / f"scan_{self.scan_count:03d}"
         scan_dir.mkdir(parents=True, exist_ok=True)
 
-        photo_paths = []
+        photo_names = []
         for idx, jpg_bytes in enumerate(self.accepted_photos):
             p = scan_dir / f"photo_{idx}.jpg"
             p.write_bytes(jpg_bytes)
-            photo_paths.append(str(p))
+            photo_names.append(p.name)
 
-        taps_array = np.array(self.raw_taps, dtype=np.float32)
-        raw_path = str(scan_dir / "taps.npy")
-        np.save(raw_path, taps_array)
+        np.save(scan_dir / "taps.npy", self.raw_taps)
 
-        row = {
-            "Timestamp": int(datetime.now().timestamp()),
-            "Fruit_Type": self._get_fruit(),
-            "Actual_State": label,
-            "Actual_Mass": round(mass_g, 1),
-            "Circumference_cm": round(circ_cm, 1),
-            "Vol_Est": round(vol_est, 6),
-            "Photo_Paths": ";".join(photo_paths),
-            "Raw_Tap_Path": raw_path,
+        meta = {
+            "id": scan_dir.name,
+            "timestamp": int(datetime.now().timestamp()),
+            "fruit_type": self._get_fruit(),
+            "label": label,
+            "mass_g": round(mass_g, 1),
+            "circumference_cm": round(circ_cm, 1),
+            "vol_est": round(vol_est, 6),
+            "n_taps": 1,
+            "tap_file": "taps.npy",
+            "photo_files": photo_names,
+            "soft_labels": soft,
+            "sample_rate": SAMPLE_RATE,
+            "n_samples": N_SAMPLES,
         }
-        for i in range(N_CLASSES):
-            row[f"Soft_{i}"] = round(soft[i], 4)
-
-        write_header = not CSV_PATH.exists() or CSV_PATH.stat().st_size == 0
-        with open(CSV_PATH, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
+        with open(scan_dir / "metadata.json", "w") as f:
+            json.dump(meta, f, indent=2)
 
         if not self.keep_fields:
             self.mass_var.set("")
@@ -605,7 +643,7 @@ class CollectorUI:
         self._refresh_sidebar()
 
         if self.rapid:
-            self.root.after(600, self._on_collect)
+            self.root.after(600, self._on_arm)
         else:
             self.root.after(1500, lambda: self._set_state(self.IDLE))
 
@@ -615,19 +653,18 @@ class CollectorUI:
         self.root.after(0, self._handle_msg, obj)
 
     def _handle_msg(self, obj):
-        if "tap" in obj and "samples" in obj:
-            self.taps_received = obj["tap"]
-            self.raw_taps.append(obj["samples"])
-            indicators = " ".join(
-                "●" if i < self.taps_received else "○"
-                for i in range(self.n_taps)
-            )
-            self.tap_indicator.config(text=f"Taps: {indicators}")
+        if "samples_b64" in obj:
+            raw = base64.b64decode(obj["samples_b64"])
+            self.raw_taps = np.frombuffer(raw, dtype=np.uint16).copy()
+            actual_rate = obj.get("actual_rate")
+            if actual_rate:
+                self._set_status(
+                    f"Captured — {int(actual_rate)} Hz actual", "#1976D2")
             self._compute_fft_display()
-            self._set_state(self.RECEIVING)
-
-        elif "status" in obj and obj["status"] == "done":
             self._set_state(self.READY)
+
+        elif "status" in obj and obj["status"] == "armed":
+            self._set_state(self.ARMED)
 
         elif "photo" in obj:
             jpg_bytes = base64.b64decode(obj["photo"])
@@ -648,6 +685,9 @@ class CollectorUI:
                 self.root.after(300, self._on_finish)
             else:
                 self._set_state(self.PHOTO)
+
+        elif "error" in obj:
+            self._set_status(f"ESP32: {obj['error']}", "#D32F2F")
 
     # ─── Helpers ───────────────────────────────────────────────────
 
@@ -674,10 +714,10 @@ def main():
                         help="Use simulated ESP32 (no hardware)")
     parser.add_argument("--port", default="/dev/ttyUSB0",
                         help="Serial port (default: /dev/ttyUSB0)")
-    parser.add_argument("--baud", type=int, default=115200,
-                        help="Baud rate (default: 115200)")
-    parser.add_argument("--taps", type=int, default=3,
-                        help="Number of taps per sample (default: 3)")
+    parser.add_argument("--baud", type=int, default=921600,
+                        help="Baud rate (default: 921600)")
+    parser.add_argument("--threshold", type=int, default=None,
+                        help="Tap detection threshold 0-4095 (default: 300)")
     parser.add_argument("--rapid", action="store_true",
                         help="Rapid mode: auto-rearm after each sample")
     parser.add_argument("--keep-fields", action="store_true",
@@ -686,8 +726,8 @@ def main():
 
     root = tk.Tk()
     app = CollectorUI(root, mock=args.mock, port=args.port, baud=args.baud,
-                      n_taps=args.taps, rapid=args.rapid,
-                      keep_fields=args.keep_fields)
+                      rapid=args.rapid, keep_fields=args.keep_fields,
+                      threshold=args.threshold)
     root.protocol("WM_DELETE_WINDOW", app.close)
     root.mainloop()
 

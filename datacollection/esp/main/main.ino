@@ -1,40 +1,49 @@
-#include "tap_detector.h"
+#include "adc_capture.h"
 #include "camera_handler.h"
+#include <Wire.h>
 
-// ─── State ──────────────────────────────────────────────────────────
-enum AppState { IDLE, ARMED, WAIT_CAPTURE };
-static AppState app_state = IDLE;
-
-static TapDetector tap;
+static ADCCapture adc;
 static String serial_buf;
-static bool done_sent;
 
-// ─── Helpers ────────────────────────────────────────────────────────
-static void ledBlink(int count, int ms = 100) {
-    for (int i = 0; i < count; i++) {
-        digitalWrite(LED_PIN, HIGH);
-        delay(ms / 2);
-        digitalWrite(LED_PIN, LOW);
-        delay(ms / 2);
-    }
-}
+static uint32_t threshold = 300;
 
 static void sendJSON(const String& json) {
     Serial.println(json);
 }
 
-static void sendTapJSON(uint8_t tap_num, const uint16_t* samples, uint16_t count) {
-    String msg;
-    msg.reserve(7 + 6 * count);
-    msg += "{\"tap\":";
-    msg += String(tap_num);
-    msg += ",\"samples\":[";
-    for (uint16_t i = 0; i < count; i++) {
-        if (i > 0) msg += ',';
-        msg += String(samples[i]);
+static String toBase64(const uint16_t* data, uint32_t count) {
+    static const char B64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    String out;
+    out.reserve(((count * 2 + 2) / 3) * 4);
+
+    const uint8_t* bytes = (const uint8_t*)data;
+    uint32_t byte_len = count * 2;
+
+    for (uint32_t i = 0; i < byte_len; i += 3) {
+        uint32_t n = (uint32_t)bytes[i] << 16;
+        if (i + 1 < byte_len) n |= (uint32_t)bytes[i + 1] << 8;
+        if (i + 2 < byte_len) n |= bytes[i + 2];
+        out += B64[(n >> 18) & 0x3F];
+        out += B64[(n >> 12) & 0x3F];
+        out += (i + 1 < byte_len) ? B64[(n >> 6) & 0x3F] : '=';
+        out += (i + 2 < byte_len) ? B64[n & 0x3F] : '=';
     }
-    msg += "]}";
-    sendJSON(msg);
+    return out;
+}
+
+static void scanI2C() {
+    Wire.begin(CAM_PIN_SIOD, CAM_PIN_SIOC);
+    Serial.println("{\"i2c_scan\":\"start\"}");
+    uint8_t found = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            Serial.println("{\"i2c_device\":" + String(addr) + "}");
+            found++;
+        }
+    }
+    Serial.println("{\"i2c_scan\":\"done\",\"count\":" + String(found) + "}");
 }
 
 static void handleCommand(const String& cmd) {
@@ -42,45 +51,92 @@ static void handleCommand(const String& cmd) {
         sendJSON("{\"status\":\"pong\"}");
 
     } else if (cmd == "ARM") {
-        tap.arm();
-        app_state = ARMED;
-        done_sent = false;
         digitalWrite(LED_PIN, HIGH);
         sendJSON("{\"status\":\"armed\"}");
 
-    } else if (cmd == "CAPTURE") {
-        if (app_state == WAIT_CAPTURE) {
-            String b64 = captureBase64();
-            if (b64.length() > 0) {
-                sendJSON("{\"photo\":\"" + b64 + "\"}");
-            } else {
-                sendJSON("{\"error\":\"capture_failed\"}");
+        uint16_t* buf = (uint16_t*)ps_malloc(SAMPLE_COUNT * sizeof(uint16_t));
+        if (!buf) {
+            sendJSON("{\"error\":\"alloc_failed\"}");
+            digitalWrite(LED_PIN, LOW);
+            return;
+        }
+
+        // Phase 1: monitor for rising-edge threshold crossing
+        uint16_t prev = (uint16_t)adc1_get_raw(PIEZO_CHANNEL);
+        bool triggered = false;
+        uint32_t timeout = SAMPLE_RATE_HZ * 10;  // 10s max wait
+        uint32_t elapsed = 0;
+
+        while (!triggered && elapsed < timeout) {
+            uint16_t cur = (uint16_t)adc1_get_raw(PIEZO_CHANNEL);
+            elapsed++;
+            if (prev < threshold && cur >= threshold) {
+                triggered = true;
+                buf[0] = cur;
             }
+            prev = cur;
+        }
+
+        if (!triggered) {
+            free(buf);
+            sendJSON("{\"error\":\"timeout\"}");
+            digitalWrite(LED_PIN, LOW);
+            return;
+        }
+
+        // Phase 2: capture remaining samples
+        uint32_t n = adc.capture(buf, SAMPLE_COUNT);
+        (void)n;
+
+        digitalWrite(LED_PIN, LOW);
+
+        String b64 = toBase64(buf, SAMPLE_COUNT);
+        float rate = adc.lastActualRate();
+        sendJSON("{\"samples_b64\":\"" + b64 + "\",\"actual_rate\":" + String(rate, 0) + "}");
+        free(buf);
+
+    } else if (cmd.startsWith("THRESHOLD ")) {
+        int32_t val = cmd.substring(10).toInt();
+        if (val > 0 && val < 4096) {
+            threshold = val;
+            sendJSON("{\"status\":\"threshold_set\",\"threshold\":" + String(threshold) + "}");
+        } else {
+            sendJSON("{\"error\":\"invalid_threshold\"}");
+        }
+
+    } else if (cmd == "CAPTURE") {
+        String b64 = captureBase64();
+        if (b64.length() > 0) {
+            sendJSON("{\"photo\":\"" + b64 + "\"}");
+        } else {
+            sendJSON("{\"error\":\"capture_failed\"}");
         }
     }
 }
 
-// ─── Setup / Loop ───────────────────────────────────────────────────
 void setup() {
-    Serial.begin(115200);
-    while (!Serial) { delay(10); }
+    Serial.begin(921600);
 
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
-    done_sent = false;
 
-    tap.begin();
+    if (!adc.begin()) {
+        sendJSON("{\"error\":\"adc_init_failed\"}");
+    }
+
+    scanI2C();
 
     if (!initCamera()) {
         sendJSON("{\"error\":\"camera_init_failed\"}");
     }
 
     sendJSON("{\"status\":\"ready\"}");
-    ledBlink(2, 80);
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
 }
 
 void loop() {
-    // ── Serial RX ──
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
@@ -92,25 +148,6 @@ void loop() {
         } else {
             serial_buf += c;
             if (serial_buf.length() > 64) serial_buf = "";
-        }
-    }
-
-    // ── Tap detection ──
-    if (app_state == ARMED) {
-        tap.update();
-
-        // Send each newly-completed tap immediately
-        while (tap.tapReady()) {
-            uint8_t idx = tap.getTapCount() - 1;
-            sendTapJSON(idx + 1, tap.getTap(idx), SAMPLE_COUNT);
-        }
-
-        // Once all taps are captured and sent, signal done
-        if (!done_sent && tap.getTapCount() >= MAX_TAPS) {
-            sendJSON("{\"status\":\"done\",\"tap_count\":" + String(MAX_TAPS) + "}");
-            app_state = WAIT_CAPTURE;
-            done_sent = true;
-            digitalWrite(LED_PIN, LOW);
         }
     }
 }

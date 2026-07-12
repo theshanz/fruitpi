@@ -49,7 +49,7 @@ bool initCamera() {
     config.fb_count     = 2;
 
     if (psramFound()) {
-        config.frame_size   = FRAMESIZE_QVGA;
+        config.frame_size   = FRAMESIZE_UXGA;
         config.jpeg_quality = 12;
         config.fb_count     = 2;
     } else {

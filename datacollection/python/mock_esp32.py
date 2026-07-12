@@ -1,9 +1,9 @@
 """
-mock_esp32.py — Simulates ESP32 raw ADC tap capture.
+mock_esp32.py — Simulates ESP32 button-triggered ADC capture.
 
 Generates realistic piezo waveforms (damped sinusoids + harmonics + ADC
-artefacts) and sends raw 1024-sample buffers over the mock Serial link.
-No FFT — that happens in Python post-processing.
+artefacts) and sends base64-encoded uint16 buffers over the mock Serial
+link. Matches the real firmware's 80 kHz / 4096-sample capture.
 """
 
 import base64
@@ -11,14 +11,15 @@ import io
 import json
 import queue
 import random
+import struct
 import threading
 import time
 
 import numpy as np
 from PIL import Image
 
-N_SAMPLES = 1024
-SAMPLE_RATE = 16000
+N_SAMPLES = 4096
+SAMPLE_RATE = 80000
 
 ACOUSTIC_PROTOTYPES = {
     "mango": {
@@ -52,12 +53,8 @@ def _jitter(val, pct=0.10):
     return val * random.uniform(1 - pct, 1 + pct)
 
 
-def _simulate_raw_tap(fruit, label):
-    """Generate one tap's raw ADC buffer (1024 floats).
-
-    Adds a 2nd harmonic, baseline drift, 1/f noise, and 12-bit ADC
-    quantisation to produce waveforms closer to real piezo captures.
-    """
+def _simulate_capture(fruit, label):
+    """Generate one 4096-sample ADC capture as uint16 numpy array."""
     proto = ACOUSTIC_PROTOTYPES.get(fruit, ACOUSTIC_PROTOTYPES["mango"])
     p = proto.get(label, proto["ripe"])
 
@@ -78,8 +75,8 @@ def _simulate_raw_tap(fruit, label):
     signal += np.random.normal(0, 0.012, N_SAMPLES)
 
     adc_f = ((signal + 1.65) / 3.3) * 4095
-    adc_i = np.clip(np.round(adc_f).astype(np.int32), 0, 4095)
-    return adc_i.astype(np.float32).tolist()
+    adc_u16 = np.clip(np.round(adc_f).astype(np.uint16), 0, 4095)
+    return adc_u16
 
 
 def _make_test_photo():
@@ -100,12 +97,9 @@ def _make_test_photo():
 
 
 class MockESP32:
-    def __init__(self, outgoing: queue.Queue, incoming: queue.Queue,
-                 n_taps=3, delay=0.5):
+    def __init__(self, outgoing: queue.Queue, incoming: queue.Queue):
         self.outgoing = outgoing
         self.incoming = incoming
-        self.n_taps = n_taps
-        self.delay = delay
         self.fruit = "mango"
         self.label = "unripe"
         self.running = False
@@ -138,24 +132,15 @@ class MockESP32:
 
             elif cmd == "ARM":
                 self._send({"status": "armed"})
-                time.sleep(0.2)
-
-                taps = []
-                for tap_num in range(1, self.n_taps + 1):
-                    if not self.running:
-                        break
-                    time.sleep(self.delay)
-                    raw = _simulate_raw_tap(self.fruit, self.label)
-                    taps.append(raw)
-                    self._send({"tap": tap_num, "samples": raw})
-
+                time.sleep(random.uniform(0.3, 1.5))
                 if not self.running:
                     break
+                data = _simulate_capture(self.fruit, self.label)
+                b64 = base64.b64encode(data.tobytes()).decode("ascii")
+                self._send({"samples_b64": b64})
 
-                self._send({
-                    "status": "done",
-                    "tap_count": len(taps),
-                })
+            elif cmd.startswith("THRESHOLD "):
+                pass  # ack silently (mock doesn't use threshold)
 
             elif cmd == "CAPTURE":
                 self._send({"photo": _make_test_photo()})

@@ -16,8 +16,8 @@ from mock_esp32 import MockESP32
 class SerialBridge:
     """Unified interface: send commands, receive JSON responses."""
 
-    def __init__(self, on_message, port="/dev/ttyUSB0", baud=115200,
-                 mock=False, n_taps=3):
+    def __init__(self, on_message, port="/dev/ttyUSB0", baud=921600,
+                 mock=False):
         self.on_message = on_message
         self.port = port
         self.baud = baud
@@ -35,7 +35,6 @@ class SerialBridge:
             self._mock = MockESP32(
                 outgoing=self._from_esp,
                 incoming=self._to_esp,
-                n_taps=n_taps,
             )
 
     def connect(self, fruit="mango", label="unripe"):
@@ -45,7 +44,7 @@ class SerialBridge:
             self._mock.start(fruit=fruit, label=label)
         else:
             import serial
-            self._serial = serial.Serial(self.port, self.baud, timeout=1)
+            self._serial = serial.Serial(self.port, self.baud, timeout=10)
             time.sleep(0.1)
 
         self._reader_thread = threading.Thread(
