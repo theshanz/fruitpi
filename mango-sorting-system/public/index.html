@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Mango Quality Dashboard</title>
+
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/css/bootstrap.min.css" rel="stylesheet">
+
+</head>
+
+<body class="bg-light">
+
+    <div class="container mt-5">
+
+        <h1 class="text-center mb-5">
+            🥭 Mango Quality Monitoring Dashboard
+        </h1>
+
+        <div class="row g-4">
+
+            <div class="col-md-4">
+                <div class="card shadow">
+                    <div class="card-body text-center">
+                        <h5>Total Mangoes</h5>
+                        <h1 id="total">0</h1>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-4">
+                <div class="card shadow">
+                    <div class="card-body text-center">
+                        <h5>Good Mangoes</h5>
+                        <h1 class="text-success" id="good">0</h1>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-4">
+                <div class="card shadow">
+                    <div class="card-body text-center">
+                        <h5>Bad Mangoes</h5>
+                        <h1 class="text-danger" id="bad">0</h1>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="row g-4 mt-2">
+
+            <div class="col-md-6">
+                <div class="card shadow">
+                    <div class="card-body text-center">
+                        <h5>Good Percentage</h5>
+                        <h1 class="text-success" id="goodPercentage">0%</h1>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-6">
+                <div class="card shadow">
+                    <div class="card-body text-center">
+                        <h5>Bad Percentage</h5>
+                        <h1 class="text-danger" id="badPercentage">0%</h1>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <div class="row mt-4">
+        <div class="col-lg-6 mx-auto">
+            <div class="card shadow">
+                <div class="card-header">
+                    <h4 class="text-center">Good vs Bad Mangoes</h4>
+                </div>
+
+                <div class="card-body">
+                    <canvas id="mangoChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="card shadow mt-4">
+        <div class="card-header">
+            <h4>Daily Report</h4>
+        </div>
+
+        <div class="card-body">
+
+            <table class="table table-bordered table-striped">
+
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Total</th>
+                        <th>Good</th>
+                        <th>Bad</th>
+                        <th>Good %</th>
+                        <th>Bad %</th>
+                    </tr>
+                </thead>
+
+                <tbody id="dailyTable">
+
+                </tbody>
+
+            </table>
+
+        </div>
+    </div>
+
+    <div class="card shadow mt-4">
+
+        <div class="card-header">
+            <h4>Weekly Report</h4>
+        </div>
+
+
+        <div class="card-body">
+
+            <table class="table table-bordered table-striped">
+
+                <thead>
+                    <tr>
+                        <th>Week</th>
+                        <th>Total</th>
+                        <th>Good</th>
+                        <th>Bad</th>
+                        <th>Good %</th>
+                        <th>Bad %</th>
+                    </tr>
+                </thead>
+
+
+                <tbody id="weeklyTable">
+
+                </tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <script>
+
+            let chart;
+
+            async function loadDashboard(){
+
+                const response = await fetch("/api/dashboard");
+                const data = await response.json();
+
+                document.getElementById("total").innerHTML = data.total;
+                document.getElementById("good").innerHTML = data.good;
+                document.getElementById("bad").innerHTML = data.bad;
+
+                document.getElementById("goodPercentage").innerHTML = data.goodPercentage + "%";
+                document.getElementById("badPercentage").innerHTML = data.badPercentage + "%";
+
+                if(chart){
+                    chart.destroy();
+                }
+
+                const ctx = document.getElementById("mangoChart");
+
+                chart = new Chart(ctx,{
+                    type:'pie',
+                    data:{
+                        labels:["Good","Bad"],
+                        datasets:[{
+                            data:[data.good,data.bad],
+                            backgroundColor:[
+                                "#28a745",
+                                "#dc3545"
+                            ]
+                        }]
+                    },
+                    options:{
+                        responsive:true
+                    }
+                });
+
+            }
+
+            loadDashboard();
+
+            setInterval(loadDashboard,30000);
+
+        async function loadDailyReport() {
+
+            const response = await fetch("/api/daily-report");
+            const data = await response.json();
+
+            let rows = "";
+
+            data.forEach(item => {
+
+                rows += `
+                    <tr>
+                        <td>${item.date}</td>
+                        <td>${item.total}</td>
+                        <td>${item.good}</td>
+                        <td>${item.bad}</td>
+                        <td>${item.goodPercentage}%</td>
+                        <td>${item.badPercentage}%</td>
+                    </tr>
+                `;
+
+            });
+
+            document.getElementById("dailyTable").innerHTML = rows;
+        }
+
+        loadDailyReport();
+        setInterval(loadDailyReport, 30000);
+
+        async function loadWeeklyReport(){
+
+            const response = await fetch("/api/weekly-report");
+
+            const data = await response.json();
+
+
+            let rows = "";
+
+
+            data.forEach(item => {
+
+                rows += `
+                <tr>
+                    <td>${item.week}</td>
+                    <td>${item.total}</td>
+                    <td>${item.good}</td>
+                    <td>${item.bad}</td>
+                    <td>${item.goodPercentage}%</td>
+                    <td>${item.badPercentage}%</td>
+                </tr>
+                `;
+
+            });
+
+
+            document.getElementById("weeklyTable").innerHTML = rows;
+
+        }
+
+
+        loadWeeklyReport();
+
+        setInterval(loadWeeklyReport,30000);
+
+    </script>
+
+</body>
+
+</html>
