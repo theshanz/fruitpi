@@ -112,57 +112,33 @@
     </div>
 
 
-    <section id="upload-container" style="margin: 100px; border-radius: 40px; ">
 
 
+    <div style="margin: 50px;align-items: center; justify-content: center; text-align: center; width:100vw;">
+        <section id="signal-input">
+            <h2>Tap Signal Input</h2>
 
-        <div class="row">
-            <div class="col-sm-6 mb-3 mb-sm-0">
-                <div class="card" id="card">
-                    <form class="form" id="form">
-                        <span class="form-title">Upload your file</span>
-                        <p class="form-paragraph">
-                            File should be an image
-                        </p>
-                        <label for="file-input" class="drop-container">
-                            <span class="drop-title">Drop Image here</span>
-                            or
-                            <input type="file" accept="image/*" required="" id="file-input">
-                            <button type="submit">Analyze</button>
-                        </label>
-                    </form>
+            <!-- Upload option -->
+            <p>Upload fruit tap data (CSV/JSON):</p>
+            <input type="file" id="signalFile" accept=".csv,.json">
 
+            <!-- Live stream option -->
+            <p>Or stream live sensor data:</p>
+            <button id="startStream">Start Stream</button>
 
-                </div>
-            </div>
-            <div id="output"></div>
-
-            <div class="col-sm-6">
-                <div class="card" id="card">
-
-                    <form class="form">
-                        <span class="form-title">Upload your file</span>
-                        <p class="form-paragraph">
-                            File should be an image
-                        </p>
-                        <label for="file-input" class="drop-container">
-                            <span class="drop-title">Drop Image here</span>
-                            or
-                            <input type="file" accept="image/*" required="" id="file-input">
-                            <button type="submit">Analyze</button>
-                        </label>
-                    </form>
-
-                </div>
-            </div>
-        </div>
+            <!-- Visualization -->
+            <canvas id="waveform"></canvas>
 
 
 
 
 
+        </section>
 
-    </section>
+    </div>
+
+    
+
 
 
 
