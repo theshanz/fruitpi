@@ -31,6 +31,12 @@ CHAR_RAW_STREAM_UUID     = "4fa10005-2241-4cf5-9988-34824317f012"
 
 PKT_TYPE_JPEG = 0x01
 PKT_TYPE_RAW_WAVEFORM = 0x02
+PKT_TYPE_HEADER = 0x03
+PKT_TYPE_MODEL = 0x04
+PKT_TYPE_PASS_DONE = 0x05
+
+CHUNK_SIZE = 500
+MAX_RETRANSMIT_ROUNDS = 4
 
 NUM_CLASSES = 5
 VECTOR_DIMENSIONS = 28
@@ -50,10 +56,15 @@ class BLEWorker(threading.Thread):
         self.loop = None
         self.client = None
         self.cmd_queue = asyncio.Queue()
-        self.rx_jpeg_bytes = bytearray()
-        self.rx_waveform_bytes = bytearray()
-        self.rx_jpeg_expected_seq = None
-        self.rx_jpeg_drops = 0
+
+        # Receiver state (downloads: JPEG / waveform)
+        self.rx_id = None
+        self.rx_type = None
+        self.rx_total = 0
+        self.rx_buf = None            # bytearray(total)
+        self.rx_received = set()      # received seqs
+        self.rx_retransmits = 0
+        self.rx_drops = 0
 
     def run(self):
         self.loop = asyncio.new_event_loop()
@@ -68,7 +79,7 @@ class BLEWorker(threading.Thread):
         )
 
         if not device:
-            self.post_gui("log", "❌ Error: ESP32-S3 Scanner not found.")
+            self.post_gui("log", "Error: Device not found.")
             self.post_gui("connection", False)
             return
 
@@ -76,7 +87,7 @@ class BLEWorker(threading.Thread):
         try:
             async with BleakClient(device) as client:
                 self.client = client
-                self.post_gui("log", "✓ Connected to ESP32-S3 over BLE!")
+                self.post_gui("log", "Connected to device over BLE!")
                 self.post_gui("connection", True)
 
                 await client.start_notify(CHAR_RAW_STREAM_UUID, self.notification_handler)
@@ -96,62 +107,132 @@ class BLEWorker(threading.Thread):
                     except asyncio.TimeoutError:
                         pass
         except Exception as e:
-            self.post_gui("log", f"❌ Disconnected: {e}")
+            self.post_gui("log", f"Disconnected: {e}")
             self.post_gui("connection", False)
 
+    # ─── Upload (laptop -> ESP), same framing as downloads ───────────
     async def upload_model_binary(self, model_bytes):
         total_len = len(model_bytes)
-        chunk_size = 100
-        offset = 0
-
+        fid = 1
         self.post_gui("log", f"Starting model upload ({total_len} bytes)...")
 
+        # Header
+        header = struct.pack(">BHI B", PKT_TYPE_HEADER, fid, total_len, PKT_TYPE_MODEL)
+        await self.client.write_gatt_char(CHAR_MODEL_TRANSFER_UUID, header, response=True)
+
+        # Chunks
+        seq = 0
+        offset = 0
         while offset < total_len:
-            chunk = model_bytes[offset:offset + chunk_size]
-            await self.client.write_gatt_char(CHAR_MODEL_TRANSFER_UUID, chunk, response=True)
+            chunk = model_bytes[offset:offset + CHUNK_SIZE]
+            end_flag = 0x01 if offset + len(chunk) >= total_len else 0x00
+            pkt = struct.pack(">BHH B", PKT_TYPE_MODEL, fid, seq, end_flag) + chunk
+            try:
+                await self.client.write_gatt_char(CHAR_MODEL_TRANSFER_UUID, pkt, response=True)
+            except Exception:
+                await asyncio.sleep(0.05)
+                await self.client.write_gatt_char(CHAR_MODEL_TRANSFER_UUID, pkt, response=True)
             offset += len(chunk)
+            seq += 1
 
             progress = int((offset / total_len) * 100)
             self.post_gui("upload_progress", progress)
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.01)
 
-        self.post_gui("log", "✓ Model binary uploaded! ESP32 writing to NVS...")
+        self.post_gui("log", "Calibration uploaded! Saving to device flash...")
 
+    # ─── Receiver (downloads: JPEG / waveform) ───────────────────────
     def notification_handler(self, sender, data):
-        if len(data) < 4: return
+        if len(data) < 3:
+            return
+
         pkt_type = data[0]
-        is_end = data[3]
-        payload = data[4:]
 
-        if pkt_type == PKT_TYPE_JPEG:
-            seq = (data[1] << 8) | data[2]
+        if pkt_type == PKT_TYPE_HEADER and len(data) >= 8:
+            self.rx_id = (data[1] << 8) | data[2]
+            self.rx_total = int.from_bytes(data[3:7], "big")
+            self.rx_type = data[7]
+            self.rx_buf = bytearray(self.rx_total)
+            self.rx_received = set()
+            self.rx_retransmits = 0
+            self.rx_drops = 0
+            self.post_gui("capture_progress", 0)
+            self.post_gui("log", f"[stream] Frame {self.rx_id} start: {self.rx_total} bytes, type 0x{self.rx_type:02x}")
+            return
 
-            if self.rx_jpeg_expected_seq is None:
-                self.rx_jpeg_expected_seq = seq
-            elif seq != self.rx_jpeg_expected_seq:
-                dropped = (seq - self.rx_jpeg_expected_seq) & 0xFFFF
-                self.rx_jpeg_drops += dropped
-                self.post_gui("log", f"[stream] DROPPED {dropped} chunk(s) (expected seq {self.rx_jpeg_expected_seq}, got {seq})")
-            self.rx_jpeg_expected_seq = (seq + 1) & 0xFFFF
+        if pkt_type == PKT_TYPE_PASS_DONE:
+            self.check_complete(self.rx_id)
+            return
 
-            self.rx_jpeg_bytes.extend(payload)
-            if is_end == 0x01:
-                img_data = bytes(self.rx_jpeg_bytes)
-                total = len(img_data)
-                soi = img_data[:2] == b"\xff\xd8"
-                eoi = img_data[-2:] == b"\xff\xd9"
-                self.post_gui("log", f"[stream] JPEG complete: {total} bytes, drops: {self.rx_jpeg_drops}, SOI: {soi}, EOI: {eoi}")
-                self.rx_jpeg_bytes.clear()
-                self.rx_jpeg_expected_seq = None
-                self.rx_jpeg_drops = 0
-                self.post_gui("jpeg", img_data)
+        if pkt_type not in (PKT_TYPE_JPEG, PKT_TYPE_RAW_WAVEFORM) or len(data) < 6:
+            return
 
-        elif pkt_type == PKT_TYPE_RAW_WAVEFORM:
-            self.rx_waveform_bytes.extend(payload)
-            if is_end == 0x01:
-                waveform = np.frombuffer(self.rx_waveform_bytes, dtype=np.uint16).copy()
-                self.rx_waveform_bytes.clear()
-                self.post_gui("waveform", waveform)
+        fid = (data[1] << 8) | data[2]
+        seq = (data[3] << 8) | data[4]
+        end_flag = data[5]
+        payload = data[6:]
+
+        if fid != self.rx_id or self.rx_buf is None:
+            return  # stale/leaked chunk from another frame
+
+        if seq not in self.rx_received:
+            offset = seq * CHUNK_SIZE
+            if offset + len(payload) <= len(self.rx_buf):
+                self.rx_buf[offset:offset + len(payload)] = payload
+                self.rx_received.add(seq)
+                received = min(len(self.rx_received) * CHUNK_SIZE, self.rx_total)
+                self.post_gui("capture_progress", int(received * 100 / self.rx_total))
+
+        if end_flag == 0x01:
+            self.check_complete(self.rx_id)
+
+    def check_complete(self, fid):
+        if fid != self.rx_id or self.rx_buf is None:
+            return
+        total_chunks = (self.rx_total + CHUNK_SIZE - 1) // CHUNK_SIZE
+        missing = sorted(s for s in range(total_chunks) if s not in self.rx_received)
+
+        if missing:
+            self.rx_drops += len(missing)
+            if self.rx_retransmits < MAX_RETRANSMIT_ROUNDS:
+                ranges = []
+                start = prev = missing[0]
+                for s in missing[1:]:
+                    if s == prev + 1:
+                        prev = s
+                    else:
+                        ranges.append([start, prev])
+                        start = prev = s
+                ranges.append([start, prev])
+                self.rx_retransmits += 1
+                self.post_gui("log",
+                    f"[stream] Requesting resend round {self.rx_retransmits}: missing {len(missing)} chunks -> {ranges}")
+                self.send_config({"command": "resend", "id": self.rx_id, "ranges": ranges})
+            else:
+                self.post_gui("log", f"[stream] GAVE UP: still missing {missing}")
+            return
+
+        # Complete
+        img_data = bytes(self.rx_buf)
+        total = self.rx_total
+        fid_done = self.rx_id
+        type_done = self.rx_type
+        drops = self.rx_drops
+        self.rx_id = None
+        self.rx_buf = None
+        self.rx_received = set()
+        self.rx_drops = 0
+        self.rx_retransmits = 0
+        self.send_config({"command": "transfer_done", "id": fid_done})
+
+        if type_done == PKT_TYPE_JPEG:
+            soi = img_data[:2] == b"\xff\xd8"
+            eoi = img_data[-2:] == b"\xff\xd9"
+            self.post_gui("log", f"[stream] JPEG complete: {total} bytes, drops: {drops}, SOI: {soi}, EOI: {eoi}")
+            self.post_gui("jpeg", img_data)
+        elif type_done == PKT_TYPE_RAW_WAVEFORM:
+            waveform = np.frombuffer(img_data, dtype=np.uint16).copy()
+            self.post_gui("waveform", waveform)
 
     def results_handler(self, sender, data):
         try:
@@ -176,7 +257,7 @@ class BLEWorker(threading.Thread):
 class FruitStudioGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("SciML Edge AI Fruit Studio")
+        self.root.title("Fruit Ripeness Calibration Studio")
         self.root.geometry("1150x800")
 
         self.gui_queue = queue.Queue()
@@ -185,6 +266,7 @@ class FruitStudioGUI:
         self.captured_images = []
         self.captured_waveforms = []
         self.latest_trained_binary = None
+        self._last_img = None
 
         self.setup_ui()
         self.root.after(100, self.process_queue)
@@ -197,10 +279,10 @@ class FruitStudioGUI:
         top_frame = ttk.Frame(self.root, padding=10)
         top_frame.pack(fill=tk.X)
 
-        self.lbl_status = ttk.Label(top_frame, text="Status: Disconnected 🔴", font=("Arial", 12, "bold"))
+        self.lbl_status = ttk.Label(top_frame, text="Status: Disconnected", font=("Arial", 12, "bold"))
         self.lbl_status.pack(side=tk.LEFT, padx=10)
 
-        self.btn_connect = ttk.Button(top_frame, text="Connect BLE Scanner", command=self.start_ble)
+        self.btn_connect = ttk.Button(top_frame, text="Connect Device", command=self.start_ble)
         self.btn_connect.pack(side=tk.LEFT, padx=10)
 
         # Tabbed Layout
@@ -211,9 +293,9 @@ class FruitStudioGUI:
         self.tab_trainer = ttk.Frame(self.notebook)
         self.tab_ble_mgr = ttk.Frame(self.notebook)
 
-        self.notebook.add(self.tab_collector, text="📸 Data Collector & Live Preview")
-        self.notebook.add(self.tab_trainer, text="🧠 Model Trainer")
-        self.notebook.add(self.tab_ble_mgr, text="📡 BLE & Model Manager")
+        self.notebook.add(self.tab_collector, text="Data Collection & Live Preview")
+        self.notebook.add(self.tab_trainer, text="Calibration")
+        self.notebook.add(self.tab_ble_mgr, text="Calibration Manager")
 
         self.setup_collector_tab()
         self.setup_trainer_tab()
@@ -256,17 +338,21 @@ class FruitStudioGUI:
 
         ttk.Separator(left, orient=tk.HORIZONTAL).grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=10) # FIXED
 
-        ttk.Button(left, text="📸 Capture Picture", command=self.capture_image).grid(row=11, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
-        ttk.Button(left, text="🔊 Arm & Record Acoustic Tap", command=self.arm_tap).grid(row=12, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
-        ttk.Button(left, text="❌ Cancel Arming", command=self.cancel_arm).grid(row=13, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Capture Picture", command=self.capture_image).grid(row=11, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        self.progress_capture = ttk.Progressbar(left, orient=tk.HORIZONTAL, mode='determinate')
+        self.progress_capture.grid(row=12, column=0, columnspan=2, sticky=tk.EW, pady=2)
+        self.lbl_capture_pct = ttk.Label(left, text="Image transfer: 0%")
+        self.lbl_capture_pct.grid(row=13, column=0, columnspan=2, pady=2)
+        ttk.Button(left, text="Arm & Record Acoustic Tap", command=self.arm_tap).grid(row=14, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Cancel Arming", command=self.cancel_arm).grid(row=15, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
 
-        ttk.Separator(left, orient=tk.HORIZONTAL).grid(row=14, column=0, columnspan=2, sticky=tk.EW, pady=10) # FIXED
+        ttk.Separator(left, orient=tk.HORIZONTAL).grid(row=16, column=0, columnspan=2, sticky=tk.EW, pady=10) # FIXED
 
         self.lbl_counts = ttk.Label(left, text="Pictures: 0 | Taps: 0", font=("Arial", 10, "bold"))
-        self.lbl_counts.grid(row=15, column=0, columnspan=2, pady=4)
+        self.lbl_counts.grid(row=17, column=0, columnspan=2, pady=4)
 
-        ttk.Button(left, text="💾 Save Sample Session", command=self.save_session).grid(row=16, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
-        ttk.Button(left, text="🧹 Clear Session", command=self.clear_session).grid(row=17, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Save Sample Session", command=self.save_session).grid(row=18, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Clear Session", command=self.clear_session).grid(row=19, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
 
         # Right Previews
         right = ttk.Frame(pane)
@@ -276,6 +362,7 @@ class FruitStudioGUI:
         card_img.pack(fill=tk.BOTH, expand=True, side=tk.TOP, pady=5)
         self.canvas_img = tk.Canvas(card_img, bg="#222222", height=220)
         self.canvas_img.pack(fill=tk.BOTH, expand=True)
+        self.canvas_img.bind("<Configure>", self._on_preview_resize)
 
         card_graph = ttk.LabelFrame(right, text=" Acoustic Impact Waveform ", padding=5)
         card_graph.pack(fill=tk.BOTH, expand=True, side=tk.BOTTOM, pady=5)
@@ -287,12 +374,12 @@ class FruitStudioGUI:
         self.canvas_graph = FigureCanvasTkAgg(self.fig, master=card_graph)
         self.canvas_graph.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    # ─── TAB 2: MODEL TRAINER ───────────────────────────────────────
+    # ─── TAB 2: CALIBRATION ─────────────────────────────────────────
     def setup_trainer_tab(self):
         frame = ttk.Frame(self.tab_trainer, padding=15)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text="SciML Physics-Informed Trainer", font=("Arial", 14, "bold")).pack(anchor=tk.W, pady=5)
+        ttk.Label(frame, text="Physics-Informed Calibration", font=("Arial", 14, "bold")).pack(anchor=tk.W, pady=5)
 
         f_dir = ttk.Frame(frame)
         f_dir.pack(fill=tk.X, pady=5)
@@ -320,7 +407,7 @@ class FruitStudioGUI:
         self.entry_ent.insert(0, "100.0")
         self.entry_ent.grid(row=0, column=5, padx=10, pady=5)
 
-        ttk.Button(frame, text="🚀 Train SciML Model (2-Phase Optimization)", command=self.run_trainer).pack(fill=tk.X, pady=10)
+        ttk.Button(frame, text="Run Calibration (2-Phase Optimization)", command=self.run_trainer).pack(fill=tk.X, pady=10)
 
         self.txt_train_log = tk.Text(frame, height=18, bg="#111111", fg="#00FF00", font=("Consolas", 10))
         self.txt_train_log.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -341,20 +428,20 @@ class FruitStudioGUI:
 
         X, Y = self.load_dataset_features(d_dir, fruit_name)
         if len(X) == 0:
-            self.log_train("❌ Error: No samples found in dataset directory!")
+            self.log_train("Error: No samples found in dataset directory!")
             return
 
         self.log_train(f"Loaded {len(X)} samples. Phase 1: Projected Gradient Descent (2000 epochs)...")
         W, b = self.train_pgd_lbfgs(X, Y)
 
-        self.log_train("✓ Phase 2 L-BFGS-B Polish Complete. Packing 612-byte SIMD Struct...")
+        self.log_train("Phase 2 L-BFGS-B polish complete. Packing 612-byte calibration structure...")
         self.latest_trained_binary = self.pack_model_binary(fruit_name, W, b)
 
         with open(f"{fruit_name}_model.bin", "wb") as f:
             f.write(self.latest_trained_binary)
 
-        self.log_train(f"✓ Saved binary model to: {fruit_name}_model.bin")
-        self.log_train("Ready to upload model to ESP32 Flash via 'BLE & Model Manager' tab!")
+        self.log_train(f"Saved calibration to: {fruit_name}_model.bin")
+        self.log_train("Ready to upload the calibration to the device via the 'Calibration Manager' tab!")
 
     def load_dataset_features(self, d_dir, fruit_filter):
         X, Y = [], []
@@ -427,28 +514,28 @@ class FruitStudioGUI:
         self.txt_train_log.insert(tk.END, f"{text}\n")
         self.txt_train_log.see(tk.END)
 
-    # ─── TAB 3: BLE & MODEL MANAGER ─────────────────────────────────
+    # ─── TAB 3: CALIBRATION MANAGER ─────────────────────────────────
     def setup_ble_mgr_tab(self):
         frame = ttk.Frame(self.tab_ble_mgr, padding=15)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        card_upload = ttk.LabelFrame(frame, text=" Reliable Model Binary Upload ", padding=10)
+        card_upload = ttk.LabelFrame(frame, text=" Calibration Upload ", padding=10)
         card_upload.pack(fill=tk.X, pady=10)
 
-        ttk.Button(card_upload, text="Select & Upload Binary Model (.bin)", command=self.upload_selected_model).pack(fill=tk.X, pady=5)
+        ttk.Button(card_upload, text="Upload Calibration File (.bin)", command=self.upload_selected_model).pack(fill=tk.X, pady=5)
 
         self.progress_bar = ttk.Progressbar(card_upload, orient=tk.HORIZONTAL, mode='determinate')
         self.progress_bar.pack(fill=tk.X, pady=5)
         self.lbl_upload_pct = ttk.Label(card_upload, text="Progress: 0%")
         self.lbl_upload_pct.pack()
 
-        card_flash = ttk.LabelFrame(frame, text=" ESP32 Flash Installed Models ", padding=10)
+        card_flash = ttk.LabelFrame(frame, text=" Calibrations Stored on Device ", padding=10)
         card_flash.pack(fill=tk.BOTH, expand=True, pady=10)
 
         f_btn = ttk.Frame(card_flash)
         f_btn.pack(fill=tk.X, pady=5)
-        ttk.Button(f_btn, text="Fetch Installed Models", command=self.fetch_installed_models).pack(side=tk.LEFT, padx=5)
-        ttk.Button(f_btn, text="Delete Selected Model", command=self.delete_selected_model).pack(side=tk.LEFT, padx=5)
+        ttk.Button(f_btn, text="Fetch Stored Calibrations", command=self.fetch_installed_models).pack(side=tk.LEFT, padx=5)
+        ttk.Button(f_btn, text="Delete Selected Calibration", command=self.delete_selected_model).pack(side=tk.LEFT, padx=5)
 
         self.listbox_models = tk.Listbox(card_flash, height=8, font=("Arial", 11))
         self.listbox_models.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -458,26 +545,26 @@ class FruitStudioGUI:
             messagebox.showerror("Error", "Connect to ESP32 over BLE first!")
             return
 
-        path = filedialog.askopenfilename(filetypes=[("Binary Model", "*.bin")])
+        path = filedialog.askopenfilename(filetypes=[("Calibration File", "*.bin")])
         if path:
             with open(path, "rb") as f:
                 data = f.read()
             if len(data) == 612:
                 self.ble_worker.upload_model(data)
-                self.log("Uploading model binary...")
+                self.log("Uploading calibration...")
             else:
-                messagebox.showerror("Error", f"Invalid model size: {len(data)} bytes (Expected 612 bytes)")
+                messagebox.showerror("Error", f"Invalid calibration size: {len(data)} bytes (expected 612 bytes)")
 
     def fetch_installed_models(self):
         if self.ble_worker:
             self.ble_worker.send_config({"command": "list_models"})
-            self.log("Fetching installed models from ESP32...")
+            self.log("Fetching stored calibrations...")
 
     def delete_selected_model(self):
         sel = self.listbox_models.curselection()
         if sel and self.ble_worker:
             fruit = self.listbox_models.get(sel[0])
-            if messagebox.askyesno("Confirm Delete", f"Delete model '{fruit}' from ESP32 Flash?"):
+            if messagebox.askyesno("Confirm Delete", f"Delete calibration '{fruit}' from device flash?"):
                 self.ble_worker.send_config({"command": "delete_model", "fruit": fruit})
                 self.log(f"Requesting delete of '{fruit}'...")
 
@@ -489,6 +576,8 @@ class FruitStudioGUI:
 
     def capture_image(self):
         if self.ble_worker:
+            self.progress_capture['value'] = 0
+            self.lbl_capture_pct.config(text="Image transfer: 0%")
             self.ble_worker.send_config({"command": "capture_image", "mode": "data_collection"})
             self.log("Requesting picture...")
 
@@ -536,9 +625,30 @@ class FruitStudioGUI:
         messagebox.showinfo("Success", f"Saved sample session to:\n{out_dir}")
         self.clear_session()
 
+    def _fit_preview_to_canvas(self):
+        img = self._last_img
+        if img is None:
+            return
+        self.canvas_img.update_idletasks()
+        w = self.canvas_img.winfo_width()
+        h = self.canvas_img.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        scale = min(w / img.width, h / img.height, 1.0)
+        new_w = max(1, int(img.width * scale))
+        new_h = max(1, int(img.height * scale))
+        d_img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        self.tk_photo = ImageTk.PhotoImage(d_img)
+        self.canvas_img.delete("all")
+        self.canvas_img.create_image(w // 2, h // 2, anchor=tk.CENTER, image=self.tk_photo)
+
+    def _on_preview_resize(self, event):
+        self._fit_preview_to_canvas()
+
     def clear_session(self):
         self.captured_images.clear()
         self.captured_waveforms.clear()
+        self._last_img = None
         self.lbl_counts.config(text="Pictures: 0 | Taps: 0")
         self.canvas_img.delete("all")
         self.ax.clear()
@@ -555,17 +665,19 @@ class FruitStudioGUI:
 
             if msg_type == "log": self.log(payload)
             elif msg_type == "connection":
-                self.lbl_status.config(text="Status: Connected 🟢" if payload else "Status: Disconnected 🔴")
+                self.lbl_status.config(text="Status: Connected" if payload else "Status: Disconnected")
             elif msg_type == "upload_progress":
                 self.progress_bar['value'] = payload
                 self.lbl_upload_pct.config(text=f"Progress: {payload}%")
+            elif msg_type == "capture_progress":
+                self.progress_capture['value'] = payload
+                self.lbl_capture_pct.config(text=f"Image transfer: {payload}%")
             elif msg_type == "jpeg":
                 img = Image.open(io.BytesIO(payload))
                 self.captured_images.append(img)
                 self.lbl_counts.config(text=f"Pictures: {len(self.captured_images)} | Taps: {len(self.captured_waveforms)}")
-                d_img = img.resize((320, 220), Image.Resampling.LANCZOS)
-                self.tk_photo = ImageTk.PhotoImage(d_img)
-                self.canvas_img.create_image(0, 0, anchor=tk.NW, image=self.tk_photo)
+                self._last_img = img
+                self._fit_preview_to_canvas()
             elif msg_type == "waveform":
                 self.captured_waveforms.append(payload)
                 self.lbl_counts.config(text=f"Pictures: {len(self.captured_images)} | Taps: {len(self.captured_waveforms)}")

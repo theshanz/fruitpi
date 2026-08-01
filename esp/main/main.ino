@@ -54,6 +54,9 @@ void setup() {
 void loop() {
     uint32_t current_time = millis();
 
+    // ─── 0. DRIVE RELIABLE TRANSFER ENGINE (resends / timeouts) ────
+    bt.service_transfer();
+
     // ─── 1. HANDLE COMMANDS OVER BLE ─────────────────────────────
     if (bt.check_capture_image_request()) {
         handle_laptop_capture_image_only();

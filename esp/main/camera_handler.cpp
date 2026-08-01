@@ -1,6 +1,11 @@
 #include "camera_handler.h"
 
 static bool camera_hardware_ok = false;
+static framesize_t s_working_size = FRAMESIZE_VGA;
+
+static framesize_t apply_sensor_tuning(sensor_t* s, framesize_t frame_size);
+static bool capture_boot_frame(framesize_t start);
+static constexpr int CAMERA_WARMUP_DELAY_MS = 2000;
 
 static camera_config_t build_camera_config() {
     camera_config_t config;
@@ -27,24 +32,53 @@ static camera_config_t build_camera_config() {
 
     config.pin_pwdn     = CAM_PIN_PWDN;
     config.pin_reset    = CAM_PIN_RESET;
-    config.xclk_freq_hz = 20000000;
+    config.xclk_freq_hz = 20000000;  // 24MHz bit-slipped the bus; 16MHz gave no frames
     config.pixel_format = PIXFORMAT_JPEG;
-    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    config.grab_mode    = CAMERA_GRAB_LATEST;  // discard stale pending frames, return the newest
 
     if (psramFound()) {
-        // VGA (640x480) is optimal for fast Bluetooth transmission
-        config.frame_size   = FRAMESIZE_VGA;
+        // SXGA is the reliable max for the OV3660 on this unit (UXGA/QXGA
+        // overrun the DMA/PSRAM margin). Programmed once at init: never change
+        // framesize at runtime (desyncs the S3 JPEG/DMA pipeline) and never
+        // re-init after de-init (GDMA channel is not rebound).
+        config.frame_size   = FRAMESIZE_SXGA;
         config.jpeg_quality = 12;
-        config.fb_count     = 2;
+        config.fb_count     = 1;  // no ring: every fb_get waits for a fresh frame
         config.fb_location  = CAMERA_FB_IN_PSRAM;
     } else {
         config.frame_size   = FRAMESIZE_QVGA;
-        config.jpeg_quality = 15;
+        config.jpeg_quality = 12;
         config.fb_count     = 1;
         config.fb_location  = CAMERA_FB_IN_DRAM;
     }
 
     return config;
+}
+
+static framesize_t apply_sensor_tuning(sensor_t* s, framesize_t frame_size) {
+    if (!s) return FRAMESIZE_VGA;
+
+    sensor_id_t* id = &s->id;
+    camera_sensor_info_t* info = esp_camera_sensor_get_info(id);
+    const char* name = info ? info->name : "UNKNOWN";
+
+    // Resolution was already set at init; this is a no-op that keeps the size
+    // in sync with s_working_size without touching the live pipeline.
+    s->set_framesize(s, frame_size);
+    s->set_quality(s, 12);
+    s->set_saturation(s, 0);      // saturation >0 clipped channels -> magenta bands
+    s->set_contrast(s, 0);
+    s->set_brightness(s, 0);
+    s->set_whitebal(s, 1);        // auto white balance on
+    s->set_awb_gain(s, 1);        // AWB gain correction on
+    s->set_gain_ctrl(s, 1);       // auto gain control on
+    s->set_exposure_ctrl(s, 1);   // auto exposure control on
+    s->set_vflip(s, 0);
+    s->set_hmirror(s, 0);
+
+    Serial.printf("[CameraHandler] Sensor: %s (PID 0x%04X), frame %d.\n",
+                  name, id ? id->PID : 0, (int)frame_size);
+    return frame_size;
 }
 
 bool init_camera_subsystem() {
@@ -58,21 +92,29 @@ bool init_camera_subsystem() {
     }
 
     sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        s->set_vflip(s, 0);
-        s->set_hmirror(s, 0);
+    if (!s) {
+        Serial.println("[CameraHandler] ❌ No sensor handle after init.");
+        esp_camera_deinit();
+        camera_hardware_ok = false;
+        return false;
     }
 
-    // Perform 1 Boot Test Capture to verify hardware bus stability
-    camera_fb_t* test_fb = esp_camera_fb_get();
-    if (test_fb) {
-        Serial.printf("[CameraHandler] ✓ Boot Frame Success (%d bytes JPEG).\n", test_fb->len);
-        esp_camera_fb_return(test_fb);
-        camera_hardware_ok = true;
-    } else {
-        Serial.println("[CameraHandler] ❌ Boot Frame Capture Failed!");
-        camera_hardware_ok = false;
+    s_working_size = FRAMESIZE_SXGA;
+
+    // Single init at the working resolution. No set_framesize() at runtime
+    // (desyncs the S3 JPEG/DMA pipeline -> striped magenta) and no de-init /
+    // re-init (GDMA channel is not rebound -> fb_get() NULL forever).
+    if (s) {
+        apply_sensor_tuning(s, s_working_size);
     }
+
+    // Let AEC/AGC/AWB converge passively while the sensor streams. The single
+    // frame buffer is overwritten continuously, so by the time the first frame
+    // is requested the sensor has settled. No ring exists to serve stale frames.
+    delay(CAMERA_WARMUP_DELAY_MS);
+
+    // 1 Boot Test Capture with automatic step-down until a frame succeeds.
+    camera_hardware_ok = capture_boot_frame(s_working_size);
 
     return camera_hardware_ok;
 }
@@ -86,13 +128,30 @@ static bool jpeg_has_valid_markers(const camera_fb_t* fb) {
            fb->buf[fb->len - 2] == 0xFF && fb->buf[fb->len - 1] == 0xD9;
 }
 
-static uint32_t fast_hash(const uint8_t* buf, size_t len) {
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= buf[i];
-        h *= 16777619u;
+static bool capture_boot_frame(framesize_t start) {
+    // Simple retry loop at the init size. No step-down: changing framesize or
+    // re-initializing at runtime breaks this driver's JPEG/DMA pipeline.
+    for (int attempt = 1; attempt <= CAPTURE_RETRY_ATTEMPTS; ++attempt) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (fb && jpeg_has_valid_markers(fb)) {
+            Serial.printf("[CameraHandler] ✓ Boot Frame Success (%d bytes JPEG @ frame %d).\n",
+                          fb->len, (int)start);
+            esp_camera_fb_return(fb);
+            s_working_size = start;
+            return true;
+        }
+        if (fb) {
+            Serial.printf("[CameraHandler] Boot frame had invalid markers (%d bytes, attempt %d/%d).\n",
+                          fb->len, attempt, CAPTURE_RETRY_ATTEMPTS);
+            esp_camera_fb_return(fb);
+        } else {
+            Serial.printf("[CameraHandler] esp_camera_fb_get() NULL at frame %d (attempt %d/%d).\n",
+                          (int)start, attempt, CAPTURE_RETRY_ATTEMPTS);
+        }
+        delay(CAPTURE_RETRY_DELAY_MS);
     }
-    return h;
+    Serial.println("[CameraHandler] ❌ Boot Frame Capture Failed!");
+    return false;
 }
 
 camera_fb_t* capture_camera_frame() {
@@ -101,30 +160,23 @@ camera_fb_t* capture_camera_frame() {
         return nullptr;
     }
 
-    // Detect the S3 DMA stall that returns the SAME buffer/content repeatedly
-    // instead of NULL: identical buffer pointer + length + content hash == stale.
-    static camera_fb_t* last_fb = nullptr;
-    static uint32_t last_len = 0;
-    static uint32_t last_hash = 0;
+    // Single-buffer camera: fb_get() waits for a freshly captured frame. Reset
+    // the buffer first by consuming whatever stale frame may be sitting in it
+    // (one grab only — a tight drain loop wedges the S3 DMA), so the returned
+    // frame is guaranteed to be a brand-new capture.
+    camera_fb_t* w = esp_camera_fb_get();
+    if (w) {
+        esp_camera_fb_return(w);
+    }
 
     camera_fb_t* fb = nullptr;
     for (int attempt = 1; attempt <= CAPTURE_RETRY_ATTEMPTS; ++attempt) {
         fb = esp_camera_fb_get();
         if (fb) {
-            if (fb == last_fb && fb->len == last_len && fast_hash(fb->buf, fb->len) == last_hash) {
-                Serial.printf("[CameraHandler] Stale frame detected (%d bytes, identical to previous). Restarting camera...\n",
-                              fb->len);
-                esp_camera_fb_return(fb);
-                fb = nullptr;
-                break;  // pipeline is stuck returning old data; retries won't help
-            }
             if (jpeg_has_valid_markers(fb)) {
                 if (attempt > 1) {
                     Serial.printf("[CameraHandler] Captured on attempt %d.\n", attempt);
                 }
-                last_fb = fb;
-                last_len = fb->len;
-                last_hash = fast_hash(fb->buf, fb->len);
                 Serial.printf("[CameraHandler] JPEG markers OK (%d bytes).\n", fb->len);
                 return fb;
             }
@@ -139,32 +191,11 @@ camera_fb_t* capture_camera_frame() {
         delay(CAPTURE_RETRY_DELAY_MS);
     }
 
-    // Hard-wedged/stale DMA pipeline: full re-init to restart the sensor + DMA chain.
-    Serial.println("[CameraHandler] All retries failed, re-initializing camera...");
-    esp_camera_deinit();
-    camera_config_t config = build_camera_config();
-    esp_err_t err = esp_camera_init(&config);
-    if (err == ESP_OK) {
-        sensor_t* s = esp_camera_sensor_get();
-        if (s) {
-            s->set_vflip(s, 0);
-            s->set_hmirror(s, 0);
-        }
-        fb = esp_camera_fb_get();
-        if (fb && jpeg_has_valid_markers(fb)) {
-            last_fb = fb;
-            last_len = fb->len;
-            last_hash = fast_hash(fb->buf, fb->len);
-            Serial.printf("[CameraHandler] Recovered after re-init (%d bytes JPEG).\n", fb->len);
-            return fb;
-        }
-        if (fb) {
-            Serial.println("[CameraHandler] Recovered frame had invalid JPEG markers, discarding.");
-            esp_camera_fb_return(fb);
-        }
-    }
-    Serial.printf("[CameraHandler] Camera re-init failed: 0x%x\n", err);
-    camera_hardware_ok = false;
+    // Do NOT de-init/re-init here: this driver never rebinds the GDMA channel
+    // after esp_camera_deinit() (gdma_disconnect error, fb_get() NULL forever),
+    // which would brick the camera for the whole session. Report the error
+    // instead; the boot self-test already validated the hardware.
+    Serial.println("[CameraHandler] All capture retries failed.");
     return nullptr;
 }
 

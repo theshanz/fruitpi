@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
+#include <vector>
+
 #include "sci_28d.h"
 #include "fruit_store.h"
 
@@ -21,6 +23,30 @@ struct ScanConfig {
     char target_fruit[32];
     float override_volume_cm3;
     bool use_volume_override;
+};
+
+// ─── Generalized reliable-transfer protocol (mirrored by the collector) ───
+// Both directions (download = ESP->laptop notify, upload = laptop->ESP write)
+// use identical framing:
+//   HEADER  [0]=0x03  id BE16 | total_len BE32 | payload_type
+//   CHUNK   [payload_type] id BE16 | seq BE16 | end_flag | payload(<=CHUNK_SIZE)
+//   PASS_DONE [0]=0x05  id BE16   (marks end of a send/retransmit pass)
+// Receiver requests retransmission via config command:
+//   {"command":"resend","id":N,"ranges":[[s,e],...]}
+//   {"command":"transfer_done","id":N}
+constexpr uint8_t PKT_TYPE_HEADER       = 0x03;
+constexpr uint8_t PKT_TYPE_JPEG         = 0x01;
+constexpr uint8_t PKT_TYPE_RAW_WAVEFORM = 0x02;
+constexpr uint8_t PKT_TYPE_MODEL        = 0x04;
+constexpr uint8_t PKT_TYPE_PASS_DONE    = 0x05;
+
+constexpr size_t  CHUNK_SIZE            = 500;
+constexpr uint32_t TRANSFER_TIMEOUT_MS  = 20000;
+constexpr uint32_t PROGRESS_NOTIFY_BYTES = 2000;
+
+struct TransferRange {
+    uint16_t start;
+    uint16_t end;
 };
 
 class BTManager : public NimBLEServerCallbacks, public NimBLECharacteristicCallbacks {
@@ -43,24 +69,65 @@ private:
     bool threshold_updated;
     float new_threshold_val;
 
+    // Destination buffer for received MODEL transfers
     uint8_t model_rx_buffer[sizeof(Fruit28D)];
-    size_t model_rx_bytes;
+
+    // ─── TransferEngine: Sender state (downloads) ───
+    uint8_t*  tx_buf;
+    size_t    tx_len;
+    uint16_t  tx_id;
+    uint8_t   tx_type;
+    size_t    tx_chunks;
+    bool      tx_active;
+    uint32_t  tx_last_activity_ms;
+    std::vector<TransferRange> tx_pending_resend;
+
+    // ─── TransferEngine: Receiver state (uploads) ───
+    uint8_t*  rx_buf;
+    size_t    rx_len;
+    uint16_t  rx_id;
+    uint8_t   rx_type;
+    size_t    rx_chunks;
+    size_t    rx_received_count;
+    bool      rx_active;
+    uint32_t  rx_last_activity_ms;
+    uint32_t  rx_next_progress_bytes;
+    std::vector<bool> rx_received;
+
+    uint16_t next_transfer_id();
+
+    // Sender
+    void send_chunk(uint16_t seq, bool end_flag);
+    void send_pass_done();
+    bool begin_transfer(uint8_t payload_type, const uint8_t* data, size_t len);
+    void handle_resend(uint16_t id, const std::vector<TransferRange>& ranges);
+    void handle_transfer_done(uint16_t id);
+    void free_tx();
+
+    // Receiver
+    void start_rx(uint16_t id, size_t total, uint8_t type);
+    void on_rx_chunk(uint16_t id, uint16_t seq, bool end_flag,
+                     const uint8_t* payload, size_t len);
+    void notify_rx_progress();
+    void free_rx();
+
+    uint32_t inter_chunk_delay_ms();
 
     void process_incoming_model();
-    void send_chunked_data(const uint8_t* data, size_t len, uint8_t packet_type);
 
 public:
     BTManager();
     bool init(const char* device_name, FruitStore* store);
 
-    void onConnect(NimBLEServer* pServer) override;
-    void onDisconnect(NimBLEServer* pServer) override;
+    void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override;
+    void onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override;
     void onWrite(NimBLECharacteristic* pCharacteristic) override;
 
     void notify_scan_result(const BiologicalStatus& result);
     void notify_status_change(const char* status_msg);
     void send_raw_jpeg_stream(const uint8_t* jpeg_buf, size_t jpeg_len);
     void send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc);
+    void service_transfer();
 
     bool check_capture_image_request() {
         if (capture_image_requested) { capture_image_requested = false; return true; }
