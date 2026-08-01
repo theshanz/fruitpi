@@ -41,3 +41,8 @@ datacollection/python/samples/scan_002/
 datacollection/esp/platformio.ini
 datacollection/python/samples/
 mango-sorting-system/node_modules/
+esp/main/extract_hues.h
+esp/main/extract_hues.cpp
+datacollection/dataset/Mango/Mango_1785608456/
+datacollection/__pycache__/
+.jcodeignore
