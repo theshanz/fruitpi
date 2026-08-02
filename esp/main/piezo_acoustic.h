@@ -17,6 +17,7 @@
 #define FFT_CLAMP_MIN -10.0f
 #define PRE_TRIGGER_SAMPLES 64
 #define RING_BUFFER_SIZE 1024 // Double FFT_SIZE for ring cache
+#define ARM_TIMEOUT_US 3000000 // 3s
 
 struct AcousticFeatures {
     float hertzian_adc; //Peak impact voltage
@@ -57,6 +58,7 @@ class PiezoAcoustic {
         std::atomic<SamplingState> state{STATE_DISARMED};
         float trigger_threshold_adc = 0.15f;
         uint16_t post_trigger_counter = 0;
+        uint32_t armed_start_us = 0;
 
         TaskHandle_t sampler_task_handle = nullptr;
         SemaphoreHandle_t data_mutex = nullptr;

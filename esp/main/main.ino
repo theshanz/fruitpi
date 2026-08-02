@@ -24,6 +24,7 @@ float dynamic_adc_threshold = 0.15f;
 bool is_acoustic_armed = false;
 uint32_t arm_start_time = 0;
 bool capture_button_pressed = false;
+bool are_we_in_middle_of_capture = false;
 
 void handle_laptop_capture_image_only() {
   Serial.println("[Laptop] Direct Camera Image Request...");
@@ -58,14 +59,12 @@ void setup() {
       ;
   }
   store.init();
-  acoustic_sensor.init();
   bt.init("Fruitipi", &store);
 }
 
 void loop() {
   uint32_t current_time = millis();
   SystemMode mode = bt.get_mode();
-  bool are_we_in_middle_of_capture = false;
 
   float trigger_threshold = 0.15f;
   if (bt.has_threshold_update()) {
@@ -89,16 +88,26 @@ void loop() {
 
   bt.service_transfer();
 
+//disarming from bluetooth
+  if (bt.check_and_clear_cancel_request()) {
+    is_acoustic_armed = false;
+    acoustic_sensor.disarm();
+    are_we_in_middle_of_capture = false;    // clear in-flight inference state
+    capture_button_pressed = false;
+    bt.notify_status_change("disarmed");
+  }
+
 
   if (capture_button_pressed && mode == MODE_INFERENCE) {
 
     const Fruit28D *model = store.get_active_model_ptr();
     if (model) {
-      ColorFeatures c_f;
+      static ColorFeatures c_f;
       if (is_camera_ready() && !are_we_in_middle_of_capture) {
         // Taking the visual data
         camera_fb_t *fb = capture_camera_frame();
         c_f = HueExtractor::process_frame(fb);
+        release_camera_frame(fb);
         acoustic_sensor.arm(trigger_threshold);
         are_we_in_middle_of_capture = true;
       }
@@ -130,11 +139,6 @@ void loop() {
     dynamic_adc_threshold = bt.get_updated_threshold();
     Serial.printf("[Laptop] Acoustic Threshold updated to: %.2f\n",
                   dynamic_adc_threshold);
-  }
-
-  if (bt.check_and_clear_cancel_request()) {
-    is_acoustic_armed = false;
-    bt.notify_status_change("disarmed");
   }
 
   if (is_acoustic_armed) {

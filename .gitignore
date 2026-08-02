@@ -46,3 +46,7 @@ esp/main/extract_hues.cpp
 datacollection/dataset/Mango/Mango_1785608456/
 datacollection/__pycache__/
 .jcodeignore
+
+# Notes (local dev notes, not shared)
+notes/
+tests/

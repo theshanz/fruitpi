@@ -1,16 +1,20 @@
 #include "piezo_acoustic.h"
 #include "driver/adc.h"
 #include "dsps_fft2r.h"
+#include "esp_err.h"
 #include "hal/adc_types.h"
 #include "sdkconfig.h"
 #include <cstdint>
 #include <cstring>
 #include <esp32-hal-adc.h>
+#include <esp32-hal.h>
 #include <pgmspace.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_timer.h"
+#include "esp_task.h"
+
 
 PiezoAcoustic::PiezoAcoustic(adc1_channel_t channel) : adc_channel(channel){}
 
@@ -195,8 +199,12 @@ void PiezoAcoustic::arm(float trigger_threshold) {
         memset(ring_buffer, 0, sizeof(ring_buffer));
         ring_head = 0;
 
+        armed_start_us = micros();
         state.store(STATE_ARMED);
         xSemaphoreGive(data_mutex);
+    }
+    if (sampler_task_handle != nullptr) {
+        xTaskNotifyGive(sampler_task_handle);   // wake sampler immediately
     }
 }
 
@@ -228,6 +236,8 @@ void PiezoAcoustic::sampler_task_code(void* parameter) {
     uint32_t sample_period_us = 1000000 / SAMPLING_FREQ_HZ; // ~113 us
 
     while (true) {
+        while (self->state.load() == STATE_DISARMED)     // sleep until armed
+          ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         uint32_t t_start = micros();
 
         // 1. Always continuously sample into circular ring buffer
@@ -246,6 +256,10 @@ void PiezoAcoustic::sampler_task_code(void* parameter) {
             if (normalized_val >= self->trigger_threshold_adc) {
                 self->post_trigger_counter = 0;
                 self->state.store(STATE_CAPTURING);
+            }
+            // Auto-disarm if no tap within timeout (bounds busy window)
+            else if (micros() - self->armed_start_us >= ARM_TIMEOUT_US) {
+                self->state.store(STATE_DISARMED);
             }
         }
         else if (cur_state == STATE_CAPTURING) {
