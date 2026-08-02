@@ -1,5 +1,6 @@
 #include "bt_manager.h"
 #include <ArduinoJson.h>
+#include <cmath>
 
 #include "esp_heap_caps.h"
 
@@ -11,7 +12,7 @@ BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharSca
                          tx_buf(nullptr), tx_len(0), tx_id(0), tx_type(0), tx_chunks(0), tx_active(false),
                          tx_last_activity_ms(0), rx_buf(nullptr), rx_len(0), rx_id(0), rx_type(0),
                          rx_chunks(0), rx_received_count(0), rx_active(false), rx_last_activity_ms(0),
-                         rx_next_progress_bytes(0)
+                         rx_next_progress_bytes(0), inference_requested(false)
 {
     memset(&current_config, 0, sizeof(ScanConfig));
     strncpy(current_config.target_fruit, "Mango", sizeof(current_config.target_fruit) - 1);
@@ -186,10 +187,9 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 {
                     arm_acoustic_requested = true;
                 }
-                else if (strcmp(cmd, "arm_full") == 0)
+                else if (strcmp(cmd, "inference_request") == 0)
                 {
-                    capture_image_requested = true;
-                    arm_acoustic_requested = true;
+                    inference_requested = true;
                 }
                 else if (strcmp(cmd, "cancel") == 0)
                 {
@@ -570,4 +570,10 @@ void BTManager::send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t
         return;
     Serial.println("[BTManager] Streaming Raw Acoustic Impact Waveform over BLE...");
     begin_transfer(PKT_TYPE_RAW_WAVEFORM, (const uint8_t *)raw_adc, 512 * sizeof(uint16_t));
+}
+
+bool BTManager::check_inference_request()
+{
+    if(inference_requested){ inference_requested = false; return true; }
+    return false;
 }
