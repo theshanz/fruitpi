@@ -1,47 +1,48 @@
 #pacifico-regular {
-    font-family: "Pacifico", cursive;
-    font-weight: 400;
-    font-style: normal;
+  font-family: "Pacifico", cursive;
+  font-weight: 400;
+  font-style: normal;
 }
 
 .card-img-top {
 
-    height: 500px;
-    width: 500px;
-    border-radius: 100px;
+  height: 500px;
+  width: 500px;
+  border-radius: 100px;
 }
 
 
 #quicksand-regular {
-    font-family: "Quicksand", sans-serif;
-    font-optical-sizing: auto;
-    font-weight: 300;
-    font-style: normal;
+  font-family: "Quicksand", sans-serif;
+  font-optical-sizing: auto;
+  font-weight: 300;
+  font-style: normal;
 }
 
 #quicksand-bold {
-    font-family: "Quicksand", sans-serif;
-    font-optical-sizing: auto;
-    font-weight: 700;
-    font-style: normal;
+  font-family: "Quicksand", sans-serif;
+  font-optical-sizing: auto;
+  font-weight: 700;
+  font-style: normal;
 }
 
 .bdy {
-    background-image: linear-gradient(to right, rgba(11, 101, 53, 0.8), rgba(27, 226, 83, 0.8), rgba(44, 231, 19, 0.8));
+  background-image: linear-gradient(to right, rgba(11, 101, 53, 0.8), rgba(27, 226, 83, 0.8), rgba(44, 231, 19, 0.8));
+  width: 100%;
 
 }
 
 #readme-container {
-    height: 80vh;
-    /* makes it scrollable */
-    overflow-y: scroll;
-    /* vertical scrolling */
-    padding: 20px;
-    border: 1px solid #ccc;
-    background: #f9f9f9;
+  height: 80vh;
+  /* makes it scrollable */
+  overflow-y: scroll;
+  /* vertical scrolling */
+  padding: 20px;
+  border: 1px solid #ccc;
+  background: #f9f9f9;
 }
 
-/* From Uiverse.io by Yaya12085 */ 
+/* From Uiverse.io by Yaya12085 */
 .form {
   background-color: #fff;
   box-shadow: 0 10px 60px rgb(218, 229, 255);
@@ -124,11 +125,12 @@
   background: #0d45a5;
 }
 
-#card{
-    max-width: 320px;
+#card {
+  max-width: 320px;
 }
-.card{
-    align-items: center;
+
+.card {
+  align-items: center;
 }
 
 #signal-input {
@@ -153,3 +155,4 @@
   margin-top: 15px;
 }
 
+@import 'bootstrap/dist/css/bootstrap.min.css';
