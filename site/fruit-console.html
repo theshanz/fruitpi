@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tap &amp; Tell — Fruit Freshness Console</title>
+<style>
+  :root{
+    --bg: #12151A;
+    --panel: #1B2027;
+    --panel-2: #20262E;
+    --line: #2B323C;
+    --text: #E8E6E0;
+    --muted: #8A9099;
+    --good: #8FBF5C;
+    --bad: #D9643A;
+    --amber: #E8B54A;
+    --focus: #6FB3E0;
+    --radius: 10px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:
+      radial-gradient(circle at 15% -10%, rgba(143,191,92,0.06), transparent 40%),
+      radial-gradient(circle at 90% 0%, rgba(217,100,58,0.06), transparent 40%),
+      var(--bg);
+    color:var(--text);
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    min-height:100vh;
+  }
+  h1,h2,h3{font-family:'Space Grotesk','Inter',sans-serif; margin:0;}
+  .mono{font-family:'IBM Plex Mono','SFMono-Regular',Consolas,monospace;}
+  a{color:var(--focus);}
+  button, select, input{font-family:inherit;}
+  :focus-visible{outline:2px solid var(--focus); outline-offset:2px;}
+
+  .topbar{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:16px 24px; border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+  }
+  .brand{display:flex; align-items:center; gap:12px;}
+  .brand-mark{
+    width:34px; height:34px; border-radius:50%;
+    background:conic-gradient(from 200deg, var(--good), var(--amber), var(--bad), var(--good));
+    box-shadow: inset 0 0 0 3px var(--bg), 0 0 0 1px var(--line);
+  }
+  .brand-text .eyebrow{font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted);}
+  .brand-text h1{font-size:20px; font-weight:600;}
+
+  .conn-group{display:flex; align-items:center; gap:12px;}
+  .status-pill{
+    display:flex; align-items:center; gap:8px;
+    font-size:13px; padding:6px 12px; border-radius:999px;
+    border:1px solid var(--line); color:var(--muted);
+  }
+  .status-dot{width:8px; height:8px; border-radius:50%; background:var(--muted); transition:background .2s;}
+  .status-pill.on .status-dot{background:var(--good); box-shadow:0 0 8px var(--good);}
+  .status-pill.on{color:var(--good); border-color:rgba(143,191,92,0.4);}
+
+  button.btn{
+    background:var(--panel-2); color:var(--text); border:1px solid var(--line);
+    padding:9px 16px; border-radius:8px; font-size:13.5px; font-weight:500;
+    cursor:pointer; transition:border-color .15s, transform .05s;
+  }
+  button.btn:hover{border-color:var(--focus);}
+  button.btn:active{transform:translateY(1px);}
+  button.btn.primary{background:var(--good); color:#10130D; border-color:var(--good); font-weight:600;}
+  button.btn.danger{background:transparent; color:var(--bad); border-color:rgba(217,100,58,0.5);}
+  button.btn.danger:hover{background:rgba(217,100,58,0.1);}
+  button.btn:disabled{opacity:.4; cursor:not-allowed;}
+
+  .layout{
+    display:grid; grid-template-columns: 320px 1fr; gap:20px;
+    padding:24px; max-width:1360px; margin:0 auto;
+  }
+  @media (max-width: 880px){ .layout{grid-template-columns:1fr;} }
+
+  .panel{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:18px;
+  }
+  .panel + .panel{margin-top:20px;}
+  .panel h2{font-size:13px; text-transform:uppercase; letter-spacing:.1em; color:var(--muted); margin-bottom:14px;}
+
+  .field{margin-bottom:14px;}
+  .field label{display:block; font-size:12.5px; color:var(--muted); margin-bottom:6px;}
+  .field select, .field input[type=text]{
+    width:100%; background:var(--panel-2); border:1px solid var(--line); color:var(--text);
+    padding:8px 10px; border-radius:6px; font-size:13.5px;
+  }
+  .field-row{display:flex; gap:8px;}
+  .field-row .btn{flex-shrink:0;}
+
+  input[type=range]{width:100%; accent-color:var(--amber);}
+  .slider-value{font-size:12px; color:var(--amber);}
+
+  .action-grid{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:6px;}
+  .mode-toggle{display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden;}
+  .mode-toggle button{flex:1; padding:8px; background:var(--panel-2); border:none; color:var(--muted); font-size:13px; cursor:pointer;}
+  .mode-toggle button.active{background:var(--focus); color:#0D1A22; font-weight:600;}
+
+  /* --- Live readout / dial (signature element) --- */
+  .readout-grid{display:grid; grid-template-columns: 220px 1fr; gap:28px; align-items:center;}
+  @media (max-width:640px){ .readout-grid{grid-template-columns:1fr;} }
+
+  .dial-wrap{display:flex; flex-direction:column; align-items:center; gap:10px;}
+  .decision-tag{
+    font-family:'Space Grotesk',sans-serif; font-size:22px; font-weight:700; letter-spacing:.02em;
+    padding:6px 18px; border-radius:999px; border:1px solid var(--line); color:var(--muted);
+    transition:color .2s, border-color .2s;
+  }
+  .decision-tag.good{color:var(--good); border-color:rgba(143,191,92,0.5); box-shadow:0 0 16px rgba(143,191,92,0.15);}
+  .decision-tag.bad{color:var(--bad); border-color:rgba(217,100,58,0.5); box-shadow:0 0 16px rgba(217,100,58,0.15);}
+
+  .metrics-row{display:flex; gap:22px; flex-wrap:wrap;}
+  .metric{}
+  .metric .label{font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted);}
+  .metric .value{font-size:26px; font-weight:600; font-family:'IBM Plex Mono',monospace;}
+  .anomaly-badge{
+    display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:4px 10px;
+    border-radius:999px; border:1px solid var(--line); color:var(--muted); margin-top:4px;
+  }
+  .anomaly-badge.active{color:var(--bad); border-color:rgba(217,100,58,0.5); background:rgba(217,100,58,0.08);}
+
+  .prob-bars{margin-top:18px; display:flex; flex-direction:column; gap:10px;}
+  .prob-row{display:grid; grid-template-columns:150px 1fr 44px; align-items:center; gap:10px; font-size:12.5px;}
+  .prob-row .name{color:var(--muted); text-transform:capitalize;}
+  .prob-track{height:8px; background:var(--panel-2); border-radius:4px; overflow:hidden; border:1px solid var(--line);}
+  .prob-fill{height:100%; background:linear-gradient(90deg, var(--amber), var(--good)); width:0%; transition:width .3s ease;}
+  .prob-row .pct{text-align:right; font-family:'IBM Plex Mono',monospace; color:var(--text);}
+
+  /* --- History --- */
+  .history-header{display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;}
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  thead th{
+    text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+    padding:8px 10px; border-bottom:1px solid var(--line);
+  }
+  tbody td{padding:9px 10px; border-bottom:1px solid rgba(255,255,255,0.04); font-family:'IBM Plex Mono',monospace;}
+  tbody tr:hover{background:rgba(255,255,255,0.02);}
+  .tag-cell.good{color:var(--good);}
+  .tag-cell.bad{color:var(--bad);}
+  .empty-row td{text-align:center; color:var(--muted); font-family:'Inter',sans-serif; padding:28px 0;}
+
+  /* --- Log console --- */
+  .log-console{
+    background:#0D1013; border:1px solid var(--line); border-radius:8px; padding:12px;
+    height:150px; overflow-y:auto; font-size:12px; font-family:'IBM Plex Mono',monospace; color:#9FB0A8;
+  }
+  .log-console .line{margin-bottom:3px; white-space:pre-wrap; word-break:break-word;}
+  .log-console .line.error{color:var(--bad);}
+  .log-console .line.warn{color:var(--amber);}
+  .log-console .line.info{color:#6FB3E0;}
+
+  .config-warning{
+    background:rgba(217,100,58,0.08); border:1px solid rgba(217,100,58,0.4); color:#F0B69C;
+    border-radius:8px; padding:10px 14px; font-size:12.5px; margin:0 24px 0 24px;
+  }
+  .config-warning code{background:rgba(0,0,0,0.25); padding:1px 5px; border-radius:4px;}
+
+  @media (prefers-reduced-motion: reduce){
+    *{transition:none !important;}
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true"></div>
+    <div class="brand-text">
+      <div class="eyebrow">ESP32 &middot; Piezo Tap Sensor</div>
+      <h1>Tap &amp; Tell Console</h1>
+    </div>
+  </div>
+  <div class="conn-group">
+    <span class="status-pill" id="statusPill"><span class="status-dot"></span><span id="statusText">Disconnected</span></span>
+    <button class="btn primary" id="connectBtn">Connect device</button>
+    <button class="btn danger" id="disconnectBtn" style="display:none;">Disconnect</button>
+  </div>
+</div>
+
+<div class="config-warning" id="uuidWarning">
+  ⚠ Using placeholder Bluetooth UUIDs. Open <code>bt_manager.h</code> from your ESP32 project and paste the real
+  <code>SERVICE_UUID</code>, <code>CHAR_SCAN_CONFIG_UUID</code>, and <code>CHAR_SCAN_RESULTS_UUID</code> values into the
+  constants at the top of the <code>&lt;script&gt;</code> block in this file — search for <code>TODO_REPLACE</code>.
+</div>
+
+<div class="layout">
+
+  <!-- LEFT: CONTROLS -->
+  <div>
+    <div class="panel">
+      <h2>Model &amp; fruit</h2>
+      <div class="field">
+        <label for="fruitInput">Active fruit model</label>
+        <div class="field-row">
+          <input type="text" id="fruitInput" list="fruitOptions" placeholder="e.g. Mango" value="Mango">
+          <datalist id="fruitOptions"></datalist>
+          <button class="btn" id="loadFruitBtn">Load</button>
+        </div>
+      </div>
+      <div class="field-row">
+        <button class="btn" id="refreshModelsBtn" style="flex:1;">Refresh model list</button>
+        <button class="btn danger" id="deleteModelBtn">Delete</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Scan mode</h2>
+      <div class="mode-toggle" role="group" aria-label="Scan mode">
+        <button id="modeInference" class="active">Inference</button>
+        <button id="modeCollection">Data collection</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Tap controls</h2>
+      <div class="action-grid">
+        <button class="btn" id="captureBtn">Capture image</button>
+        <button class="btn" id="acousticBtn">Arm acoustic</button>
+        <button class="btn primary" id="armFullBtn" style="grid-column:1/3;">Arm full scan (image + tap)</button>
+      </div>
+      <button class="btn danger" id="cancelBtn" style="width:100%; margin-top:6px;">Cancel scan</button>
+    </div>
+
+    <div class="panel">
+      <h2>Detection threshold</h2>
+      <div class="field">
+        <label for="thresholdSlider">Anomaly / confidence threshold — <span class="slider-value mono" id="thresholdValue">0.15</span></label>
+        <input type="range" id="thresholdSlider" min="0" max="1" step="0.01" value="0.15">
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: LIVE READOUT + HISTORY -->
+  <div>
+    <div class="panel">
+      <h2>Latest tap result</h2>
+      <div class="readout-grid">
+        <div class="dial-wrap">
+          <svg viewBox="0 0 200 130" width="220" height="145" aria-hidden="true">
+            <path d="M 20 110 A 80 80 0 0 1 180 110" fill="none" stroke="#2B323C" stroke-width="14" stroke-linecap="round"/>
+            <path id="dialArc" d="M 20 110 A 80 80 0 0 1 180 110" fill="none" stroke="#E8B54A" stroke-width="14"
+                  stroke-linecap="round" stroke-dasharray="251" stroke-dashoffset="251"/>
+            <line id="dialNeedle" x1="100" y1="110" x2="100" y2="45" stroke="#E8E6E0" stroke-width="3" stroke-linecap="round" transform="rotate(-90 100 110)"/>
+            <circle cx="100" cy="110" r="6" fill="#E8E6E0"/>
+            <text x="100" y="128" text-anchor="middle" fill="#8A9099" font-size="10" font-family="Inter">ripeness index</text>
+          </svg>
+          <div class="decision-tag" id="decisionTag">— No scan yet —</div>
+          <div class="anomaly-badge" id="anomalyBadge">No anomaly flagged</div>
+        </div>
+        <div>
+          <div class="metrics-row">
+            <div class="metric"><div class="label">Ripeness index</div><div class="value" id="ripenessValue">—</div></div>
+            <div class="metric"><div class="label">Confidence</div><div class="value" id="confidenceValue">—</div></div>
+            <div class="metric"><div class="label">Entropy</div><div class="value" id="entropyValue">—</div></div>
+          </div>
+          <div class="prob-bars" id="probBars">
+            <!-- filled by JS -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="history-header">
+        <h2 style="margin:0;">Scan history</h2>
+        <div style="display:flex; gap:8px;">
+          <button class="btn" id="exportCsvBtn">Export CSV</button>
+          <button class="btn danger" id="clearHistoryBtn">Clear</button>
+        </div>
+      </div>
+      <div style="max-height:340px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Fruit</th><th>Decision</th><th>Ripeness</th><th>Confidence</th><th>Entropy</th><th>Anomaly</th></tr>
+          </thead>
+          <tbody id="historyBody">
+            <tr class="empty-row"><td colspan="7">No scans recorded yet. Connect the device and arm a scan to begin.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Device log</h2>
+      <div class="log-console" id="logConsole"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   BLE IDENTIFIERS
+   These MUST exactly match the UUIDs defined in bt_manager.h
+   (SERVICE_UUID, CHAR_SCAN_CONFIG_UUID, CHAR_SCAN_RESULTS_UUID).
+   Replace the placeholders below before use.
+   ============================================================ */
+const SERVICE_UUID            = "4fa10001-2241-4cf5-9988-34824317f012";
+const CHAR_SCAN_CONFIG_UUID   = "4fa10003-2241-4cf5-9988-34824317f012";
+const CHAR_SCAN_RESULTS_UUID  = "4fa10004-2241-4cf5-9988-34824317f012";
+// Not used by this dashboard directly, but declared for completeness / future use:
+const CHAR_MODEL_TRANSFER_UUID = "4fa10002-2241-4cf5-9988-34824317f012";
+const CHAR_RAW_STREAM_UUID     = "4fa10005-2241-4cf5-9988-34824317f012";
+
+let device = null, server = null, scanConfigChar = null, scanResultsChar = null;
+let currentFruit = "Mango";
+let currentMode = "inference";
+
+const PROB_LABELS = ["unripe", "ripe", "overripe", "rotten", "artificially_ripened"];
+const HISTORY_KEY = "fruitScanHistory";
+let history = loadHistory();
+
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const statusPill = $("statusPill"), statusText = $("statusText");
+const connectBtn = $("connectBtn"), disconnectBtn = $("disconnectBtn");
+const logConsole = $("logConsole");
+
+function log(msg, level = "info") {
+  const line = document.createElement("div");
+  line.className = "line " + level;
+  const t = new Date().toLocaleTimeString();
+  line.textContent = `[${t}] ${msg}`;
+  logConsole.appendChild(line);
+  logConsole.scrollTop = logConsole.scrollHeight;
+}
+
+function setConnected(isConnected) {
+  statusPill.classList.toggle("on", isConnected);
+  statusText.textContent = isConnected ? "Connected" : "Disconnected";
+  connectBtn.style.display = isConnected ? "none" : "inline-block";
+  disconnectBtn.style.display = isConnected ? "inline-block" : "none";
+  [ "captureBtn","acousticBtn","armFullBtn","cancelBtn","loadFruitBtn",
+    "refreshModelsBtn","deleteModelBtn","thresholdSlider","modeInference","modeCollection"
+  ].forEach(id => $(id).disabled = !isConnected);
+}
+setConnected(false);
+
+// ---------- Connection ----------
+async function connectDevice() {
+  if (!navigator.bluetooth) {
+    log("This browser doesn't support Web Bluetooth. Use desktop Chrome or Edge.", "error");
+    return;
+  }
+  try {
+    log("Requesting device...");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID]
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    log(`Connecting to ${device.name || "device"}...`);
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    scanConfigChar = await service.getCharacteristic(CHAR_SCAN_CONFIG_UUID);
+    scanResultsChar = await service.getCharacteristic(CHAR_SCAN_RESULTS_UUID);
+
+    await scanResultsChar.startNotifications();
+    scanResultsChar.addEventListener("characteristicvaluechanged", handleNotification);
+
+    setConnected(true);
+    log("Connected and subscribed to scan results.");
+    sendCommand({ command: "list_models" });
+  } catch (err) {
+    log(`Connection failed: ${err.message}`, "error");
+    setConnected(false);
+  }
+}
+
+function onDisconnected() {
+  setConnected(false);
+  log("Device disconnected.", "warn");
+}
+
+function disconnectDevice() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+connectBtn.addEventListener("click", connectDevice);
+disconnectBtn.addEventListener("click", disconnectDevice);
+
+// ---------- Sending commands ----------
+async function sendCommand(obj) {
+  if (!scanConfigChar) {
+    log("Not connected — command not sent.", "warn");
+    return;
+  }
+  try {
+    const json = JSON.stringify(obj);
+    await scanConfigChar.writeValue(new TextEncoder().encode(json));
+    log(`Sent: ${json}`);
+  } catch (err) {
+    log(`Write failed: ${err.message}`, "error");
+  }
+}
+
+// ---------- Receiving notifications ----------
+function handleNotification(event) {
+  const text = new TextDecoder().decode(event.target.value);
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) { log(`Unreadable message: ${text}`, "error"); return; }
+
+  if (data.decision !== undefined) {
+    renderScanResult(data);
+    addHistoryEntry(data);
+  } else if (data.models !== undefined) {
+    populateModelList(data.models);
+  } else if (data.status !== undefined) {
+    handleStatus(data);
+  } else {
+    log(`Message: ${text}`);
+  }
+}
+
+function handleStatus(data) {
+  switch (data.status) {
+    case "transfer_progress":
+      log(`Transfer ${data.id}: ${data.received}/${data.total} bytes`);
+      break;
+    case "model_saved":
+      log("Model saved to device flash.", "info");
+      sendCommand({ command: "list_models" });
+      break;
+    case "model_deleted":
+      log("Model deleted from device.", "warn");
+      sendCommand({ command: "list_models" });
+      break;
+    case "model_error":
+      log("Device reported a model error.", "error");
+      break;
+    default:
+      log(`Status: ${data.status}`);
+  }
+}
+
+function populateModelList(models) {
+  const list = $("fruitOptions");
+  list.innerHTML = "";
+  models.forEach(name => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    list.appendChild(opt);
+  });
+  log(`Models on device: ${models.join(", ") || "(none)"}`);
+}
+
+// ---------- Live readout ----------
+function renderScanResult(data) {
+  const decisionTag = $("decisionTag");
+  const decision = (data.decision || "unknown").toString();
+  decisionTag.textContent = decision.replace(/_/g, " ").toUpperCase();
+  const lower = decision.toLowerCase();
+  decisionTag.classList.remove("good", "bad");
+  if (lower.includes("rotten") || lower.includes("overripe") || lower.includes("artificial")) {
+    decisionTag.classList.add("bad");
+  } else if (lower.includes("ripe")) {
+    decisionTag.classList.add("good");
+  }
+
+  const ripeness = Number(data.ripeness_index) || 0;
+  const confidence = Number(data.confidence) || 0;
+  const entropy = Number(data.entropy) || 0;
+
+  $("ripenessValue").textContent = ripeness.toFixed(2);
+  $("confidenceValue").textContent = (confidence * 100).toFixed(0) + "%";
+  $("entropyValue").textContent = entropy.toFixed(2);
+
+  // Dial: map ripeness_index (assumed 0..1) to a 0..180deg arc + needle rotation
+  const clamped = Math.min(1, Math.max(0, ripeness));
+  const arcLength = 251;
+  $("dialArc").setAttribute("stroke-dashoffset", String(arcLength * (1 - clamped)));
+  $("dialNeedle").setAttribute("transform", `rotate(${-90 + clamped * 180} 100 110)`);
+
+  const anomalyBadge = $("anomalyBadge");
+  const isAnomaly = !!data.is_anomaly;
+  anomalyBadge.textContent = isAnomaly ? "⚠ Anomaly flagged" : "No anomaly flagged";
+  anomalyBadge.classList.toggle("active", isAnomaly);
+
+  const probs = data.probabilities || {};
+  const barsContainer = $("probBars");
+  barsContainer.innerHTML = "";
+  PROB_LABELS.forEach(label => {
+    const val = Number(probs[label]) || 0;
+    const pct = Math.round(val * 100);
+    const row = document.createElement("div");
+    row.className = "prob-row";
+    row.innerHTML = `
+      <div class="name">${label.replace(/_/g, " ")}</div>
+      <div class="prob-track"><div class="prob-fill" style="width:${pct}%"></div></div>
+      <div class="pct">${pct}%</div>`;
+    barsContainer.appendChild(row);
+  });
+}
+
+// ---------- History ----------
+function loadHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY)) || [];
+  } catch (e) { return []; }
+}
+
+function saveHistory() {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); }
+  catch (e) { log("Could not save history locally (storage unavailable).", "warn"); }
+}
+
+function addHistoryEntry(data) {
+  const entry = {
+    time: new Date().toLocaleString(),
+    fruit: currentFruit,
+    decision: data.decision,
+    ripeness: Number(data.ripeness_index) || 0,
+    confidence: Number(data.confidence) || 0,
+    entropy: Number(data.entropy) || 0,
+    anomaly: !!data.is_anomaly
+  };
+  history.unshift(entry);
+  if (history.length > 500) history.pop();
+  saveHistory();
+  renderHistory();
+}
+
+function renderHistory() {
+  const body = $("historyBody");
+  if (history.length === 0) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="7">No scans recorded yet. Connect the device and arm a scan to begin.</td></tr>`;
+    return;
+  }
+  body.innerHTML = history.map(e => {
+    const lower = (e.decision || "").toLowerCase();
+    const cls = (lower.includes("rotten") || lower.includes("overripe") || lower.includes("artificial")) ? "bad"
+              : (lower.includes("ripe") ? "good" : "");
+    return `<tr>
+      <td>${e.time}</td>
+      <td>${e.fruit}</td>
+      <td class="tag-cell ${cls}">${(e.decision||"").replace(/_/g," ")}</td>
+      <td>${e.ripeness.toFixed(2)}</td>
+      <td>${(e.confidence*100).toFixed(0)}%</td>
+      <td>${e.entropy.toFixed(2)}</td>
+      <td>${e.anomaly ? "yes" : "no"}</td>
+    </tr>`;
+  }).join("");
+}
+renderHistory();
+
+$("exportCsvBtn").addEventListener("click", () => {
+  if (history.length === 0) { log("No history to export.", "warn"); return; }
+  const header = "time,fruit,decision,ripeness_index,confidence,entropy,anomaly\n";
+  const rows = history.map(e =>
+    [e.time, e.fruit, e.decision, e.ripeness, e.confidence, e.entropy, e.anomaly].join(",")
+  ).join("\n");
+  const blob = new Blob([header + rows], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `fruit-scan-history-${Date.now()}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+$("clearHistoryBtn").addEventListener("click", () => {
+  if (history.length === 0) return;
+  if (!confirm("Clear all recorded scan history? This can't be undone.")) return;
+  history = [];
+  saveHistory();
+  renderHistory();
+  log("History cleared.", "warn");
+});
+
+// ---------- Controls ----------
+$("loadFruitBtn").addEventListener("click", () => {
+  const name = $("fruitInput").value.trim();
+  if (!name) return;
+  currentFruit = name;
+  sendCommand({ fruit: name });
+});
+
+$("refreshModelsBtn").addEventListener("click", () => sendCommand({ command: "list_models" }));
+$("deleteModelBtn").addEventListener("click", () => {
+  const name = $("fruitInput").value.trim();
+  if (!name) return;
+  if (!confirm(`Delete model "${name}" from the device?`)) return;
+  sendCommand({ command: "delete_model", fruit: name });
+});
+
+$("captureBtn").addEventListener("click", () => sendCommand({ command: "capture_image" }));
+$("acousticBtn").addEventListener("click", () => sendCommand({ command: "arm_acoustic" }));
+$("armFullBtn").addEventListener("click", () => sendCommand({ command: "arm_full" }));
+$("cancelBtn").addEventListener("click", () => sendCommand({ command: "cancel" }));
+
+$("modeInference").addEventListener("click", () => setMode("inference"));
+$("modeCollection").addEventListener("click", () => setMode("data_collection"));
+function setMode(mode) {
+  currentMode = mode;
+  $("modeInference").classList.toggle("active", mode === "inference");
+  $("modeCollection").classList.toggle("active", mode === "data_collection");
+  sendCommand({ mode: mode });
+}
+
+const thresholdSlider = $("thresholdSlider");
+thresholdSlider.addEventListener("input", () => {
+  $("thresholdValue").textContent = Number(thresholdSlider.value).toFixed(2);
+});
+thresholdSlider.addEventListener("change", () => {
+  sendCommand({ command: "set_threshold", threshold: Number(thresholdSlider.value) });
+});
+</script>
+</body>
+</html>

@@ -3,64 +3,62 @@
 
 #include "esp_heap_caps.h"
 
-BTManager::BTManager() :
-pServer(nullptr), pCharModelTransfer(nullptr), pCharScanConfig(nullptr),
-pCharScanResults(nullptr), pCharRawStream(nullptr), store_ref(nullptr),
-device_connected(false), current_mode(MODE_INFERENCE),
-capture_image_requested(false), arm_acoustic_requested(false),
-cancel_requested(false), threshold_updated(false), new_threshold_val(0.15f),
-tx_buf(nullptr), tx_len(0), tx_id(0), tx_type(0), tx_chunks(0), tx_active(false),
-tx_last_activity_ms(0), rx_buf(nullptr), rx_len(0), rx_id(0), rx_type(0),
-rx_chunks(0), rx_received_count(0), rx_active(false), rx_last_activity_ms(0),
-rx_next_progress_bytes(0)
+BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharScanConfig(nullptr),
+                         pCharScanResults(nullptr), pCharRawStream(nullptr), store_ref(nullptr),
+                         device_connected(false), current_mode(MODE_INFERENCE),
+                         capture_image_requested(false), arm_acoustic_requested(false),
+                         cancel_requested(false), threshold_updated(false), new_threshold_val(0.15f),
+                         tx_buf(nullptr), tx_len(0), tx_id(0), tx_type(0), tx_chunks(0), tx_active(false),
+                         tx_last_activity_ms(0), rx_buf(nullptr), rx_len(0), rx_id(0), rx_type(0),
+                         rx_chunks(0), rx_received_count(0), rx_active(false), rx_last_activity_ms(0),
+                         rx_next_progress_bytes(0)
 {
     memset(&current_config, 0, sizeof(ScanConfig));
     strncpy(current_config.target_fruit, "Mango", sizeof(current_config.target_fruit) - 1);
     memset(model_rx_buffer, 0, sizeof(model_rx_buffer));
 }
 
-uint16_t BTManager::next_transfer_id() {
+uint16_t BTManager::next_transfer_id()
+{
     static uint16_t counter = 0;
-    if (++counter == 0) counter = 1;
+    if (++counter == 0)
+        counter = 1;
     return counter;
 }
 
-bool BTManager::init(const char* device_name, FruitStore* store){
+bool BTManager::init(const char *device_name, FruitStore *store)
+{
     store_ref = store;
 
     NimBLEDevice::init(device_name);
     NimBLEDevice::setMTU(512);
 
     pServer = NimBLEDevice::createServer();
-    pServer -> setCallbacks(this);
+    pServer->setCallbacks(this);
 
-    NimBLEService* pService = pServer->createService(SERVICE_UUID);
+    NimBLEService *pService = pServer->createService(SERVICE_UUID);
 
     pCharModelTransfer = pService->createCharacteristic(
         CHAR_MODEL_TRANSFER_UUID,
-        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
-    );
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
     pCharModelTransfer->setCallbacks(this);
 
     pCharScanConfig = pService->createCharacteristic(
         CHAR_SCAN_CONFIG_UUID,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
-    );
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
     pCharScanConfig->setCallbacks(this);
 
     pCharScanResults = pService->createCharacteristic(
         CHAR_SCAN_RESULTS_UUID,
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
-    );
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
     pCharRawStream = pService->createCharacteristic(
         CHAR_RAW_STREAM_UUID,
-        NIMBLE_PROPERTY::NOTIFY
-    );
+        NIMBLE_PROPERTY::NOTIFY);
 
     pService->start();
 
-    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(true);
     pAdvertising->setMinPreferred(0x06); // iPhone connection optimization
@@ -72,10 +70,12 @@ bool BTManager::init(const char* device_name, FruitStore* store){
 }
 /////////////////////////// transfer stuff //////////////////////////
 // ─── BLE Connection Callbacks ─────────────────────────────────────────
-void BTManager::onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+void BTManager::onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc)
+{
     device_connected = true;
     Serial.println("[BTManager] Mobile App Connected.");
-    if (desc) {
+    if (desc)
+    {
         // Request a faster connection interval (min 15ms, max 30ms) and
         // larger data length for high-throughput image streaming.
         pServer->updateConnParams(desc->conn_handle, 12, 24, 0, 400);
@@ -83,7 +83,8 @@ void BTManager::onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
     }
 }
 
-void BTManager::onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+void BTManager::onDisconnect(NimBLEServer *pServer, ble_gap_conn_desc *desc)
+{
     device_connected = false;
     // Abort any in-flight transfer so stale data is never reused.
     free_tx();
@@ -93,101 +94,128 @@ void BTManager::onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
 }
 
 // ─── BLE Write Handlers (Model Upload & App Commands) ───────────────
-void BTManager::onWrite(NimBLECharacteristic* pCharacteristic) {
+void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
+{
     std::string rx_data = pCharacteristic->getValue();
-    const uint8_t* d = (const uint8_t*)rx_data.data();
+    const uint8_t *d = (const uint8_t *)rx_data.data();
     size_t len = rx_data.length();
 
-    if (len == 0) return;
+    if (len == 0)
+        return;
 
     // A. Incoming Transfer (upload direction: laptop -> ESP)
-    if (pCharacteristic == pCharModelTransfer) {
-        if (len >= 8 && d[0] == PKT_TYPE_HEADER) {
-            uint16_t id     = (d[1] << 8) | d[2];
-            size_t   total  = ((size_t)d[3] << 24) | ((size_t)d[4] << 16) |
-                              ((size_t)d[5] << 8) | d[6];
-            uint8_t  type   = d[7];
+    if (pCharacteristic == pCharModelTransfer)
+    {
+        if (len >= 8 && d[0] == PKT_TYPE_HEADER)
+        {
+            uint16_t id = (d[1] << 8) | d[2];
+            size_t total = ((size_t)d[3] << 24) | ((size_t)d[4] << 16) |
+                           ((size_t)d[5] << 8) | d[6];
+            uint8_t type = d[7];
             start_rx(id, total, type);
-        } else if (len >= 6) {
-            uint8_t  type = d[0];
-            uint16_t id   = (d[1] << 8) | d[2];
-            uint16_t seq  = (d[3] << 8) | d[4];
-            bool     end  = (d[5] == 0x01);
+        }
+        else if (len >= 6)
+        {
+            uint8_t type = d[0];
+            uint16_t id = (d[1] << 8) | d[2];
+            uint16_t seq = (d[3] << 8) | d[4];
+            bool end = (d[5] == 0x01);
             on_rx_chunk(id, seq, end, d + 6, len - 6);
         }
         return;
     }
 
     // B. Scan Config & Mode Selection (+ retransmission commands)
-    else if (pCharacteristic == pCharScanConfig) {
+    else if (pCharacteristic == pCharScanConfig)
+    {
         StaticJsonDocument<512> doc;
         DeserializationError err = deserializeJson(doc, rx_data.c_str());
 
-        if (!err) {
+        if (!err)
+        {
 
-            if (doc.containsKey("command")) {
-                const char* cmd = doc["command"];
-                if (strcmp(cmd, "list_models") == 0) {
+            if (doc.containsKey("command"))
+            {
+                const char *cmd = doc["command"];
+                if (strcmp(cmd, "list_models") == 0)
+                {
                     // Send list of installed models back to GUI
                     StaticJsonDocument<256> resp;
                     JsonArray arr = resp.createNestedArray("models");
 
                     // Query active model name or NVS Flash list
-                    if (store_ref->has_model()) {
+                    if (store_ref->has_model())
+                    {
                         arr.add(store_ref->get_loaded_fruit_name());
                     }
 
                     char output[256];
                     size_t len = serializeJson(resp, output);
-                    pCharScanResults->setValue((uint8_t*)output, len);
+                    pCharScanResults->setValue((uint8_t *)output, len);
                     pCharScanResults->notify();
                 }
-                else if (strcmp(cmd, "delete_model") == 0 && doc.containsKey("fruit")) {
-                    const char* target_fruit = doc["fruit"];
+                else if (strcmp(cmd, "delete_model") == 0 && doc.containsKey("fruit"))
+                {
+                    const char *target_fruit = doc["fruit"];
                     store_ref->delete_model_from_flash(target_fruit);
                     notify_status_change("model_deleted");
                 }
-                else if (strcmp(cmd, "resend") == 0 && doc.containsKey("id") && doc.containsKey("ranges")) {
+                else if (strcmp(cmd, "resend") == 0 && doc.containsKey("id") && doc.containsKey("ranges"))
+                {
                     uint16_t id = doc["id"];
                     std::vector<TransferRange> ranges;
                     JsonArray arr = doc["ranges"].as<JsonArray>();
-                    for (JsonVariant r : arr) {
+                    for (JsonVariant r : arr)
+                    {
                         TransferRange tr;
                         tr.start = r[0].as<uint16_t>();
-                        tr.end   = r[1].as<uint16_t>();
+                        tr.end = r[1].as<uint16_t>();
                         ranges.push_back(tr);
                     }
                     handle_resend(id, ranges);
                 }
-                else if (strcmp(cmd, "transfer_done") == 0 && doc.containsKey("id")) {
+                else if (strcmp(cmd, "transfer_done") == 0 && doc.containsKey("id"))
+                {
                     handle_transfer_done(doc["id"]);
                 }
-                else if (strcmp(cmd, "capture_image") == 0) {
+                else if (strcmp(cmd, "capture_image") == 0)
+                {
                     capture_image_requested = true;
-                } else if (strcmp(cmd, "arm_acoustic") == 0) {
+                }
+                else if (strcmp(cmd, "arm_acoustic") == 0)
+                {
                     arm_acoustic_requested = true;
-                } else if (strcmp(cmd, "arm_full") == 0) {
+                }
+                else if (strcmp(cmd, "arm_full") == 0)
+                {
                     capture_image_requested = true;
                     arm_acoustic_requested = true;
-                } else if (strcmp(cmd, "cancel") == 0) {
+                }
+                else if (strcmp(cmd, "cancel") == 0)
+                {
                     cancel_requested = true;
-                } else if (strcmp(cmd, "set_threshold") == 0 && doc.containsKey("threshold")) {
+                }
+                else if (strcmp(cmd, "set_threshold") == 0 && doc.containsKey("threshold"))
+                {
                     new_threshold_val = doc["threshold"];
                     threshold_updated = true;
                 }
             }
-            if (doc.containsKey("fruit")) {
+            if (doc.containsKey("fruit"))
+            {
                 strncpy(current_config.target_fruit, doc["fruit"], sizeof(current_config.target_fruit) - 1);
                 // Load model into RAM immediately upon switching fruit selection
                 store_ref->load_model_to_ram(current_config.target_fruit);
             }
 
-            if (doc.containsKey("volume_cm3")) {
+            if (doc.containsKey("volume_cm3"))
+            {
                 current_config.override_volume_cm3 = doc["volume_cm3"];
                 current_config.use_volume_override = true;
             }
 
-            if (doc.containsKey("mode")) {
+            if (doc.containsKey("mode"))
+            {
                 current_mode = (doc["mode"] == "data_collection") ? MODE_DATA_COLLECTION : MODE_INFERENCE;
                 Serial.printf("[BTManager] Mode set to: %s\n",
                               (current_mode == MODE_DATA_COLLECTION) ? "DATA COLLECTION" : "INFERENCE");
@@ -197,21 +225,25 @@ void BTManager::onWrite(NimBLECharacteristic* pCharacteristic) {
 }
 
 // ─── TransferEngine: Sender (downloads) ──────────────────────────────
-bool BTManager::begin_transfer(uint8_t payload_type, const uint8_t* data, size_t len) {
-    if (!device_connected) return false;
-    if (len == 0) return false;
+bool BTManager::begin_transfer(uint8_t payload_type, const uint8_t *data, size_t len)
+{
+    if (!device_connected)
+        return false;
+    if (len == 0)
+        return false;
 
     free_tx(); // never let a stale transfer buffer leak into a new one
 
-    tx_buf = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
-    if (!tx_buf) {
+    tx_buf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (!tx_buf)
+    {
         Serial.printf("[BTManager] OOM allocating %u byte transfer buffer!\n", (unsigned)len);
         return false;
     }
     memcpy(tx_buf, data, len);
-    tx_len   = len;
-    tx_id    = next_transfer_id();
-    tx_type  = payload_type;
+    tx_len = len;
+    tx_id = next_transfer_id();
+    tx_type = payload_type;
     tx_chunks = (len + CHUNK_SIZE - 1) / CHUNK_SIZE;
     tx_active = true;
     tx_last_activity_ms = millis();
@@ -230,9 +262,11 @@ bool BTManager::begin_transfer(uint8_t payload_type, const uint8_t* data, size_t
     pCharRawStream->notify();
 
     // First pass: stream every chunk at the paced rate.
-    for (uint16_t seq = 0; seq < tx_chunks; seq++) {
+    for (uint16_t seq = 0; seq < tx_chunks; seq++)
+    {
         send_chunk(seq, (seq == tx_chunks - 1));
-        if (tx_chunks >= 25 && ((seq + 1) % 25 == 0 || seq == tx_chunks - 1)) {
+        if (tx_chunks >= 25 && ((seq + 1) % 25 == 0 || seq == tx_chunks - 1))
+        {
             Serial.printf("[BTManager] TX id:%u %u/%u (%u%%)\n",
                           tx_id, (unsigned)(seq + 1), (unsigned)tx_chunks,
                           (unsigned)((seq + 1) * 100 / tx_chunks));
@@ -247,10 +281,13 @@ bool BTManager::begin_transfer(uint8_t payload_type, const uint8_t* data, size_t
     return true;
 }
 
-void BTManager::send_chunk(uint16_t seq, bool end_flag) {
-    if (!tx_active) return;
+void BTManager::send_chunk(uint16_t seq, bool end_flag)
+{
+    if (!tx_active)
+        return;
     size_t offset = (size_t)seq * CHUNK_SIZE;
-    if (offset >= tx_len) return;
+    if (offset >= tx_len)
+        return;
     size_t n = min(CHUNK_SIZE, tx_len - offset);
 
     uint8_t pkt[CHUNK_SIZE + 6];
@@ -266,15 +303,19 @@ void BTManager::send_chunk(uint16_t seq, bool end_flag) {
     pCharRawStream->notify();
 }
 
-void BTManager::send_pass_done() {
-    if (!tx_active) return;
-    uint8_t pkt[3] = { PKT_TYPE_PASS_DONE, (uint8_t)(tx_id >> 8), (uint8_t)(tx_id & 0xFF) };
+void BTManager::send_pass_done()
+{
+    if (!tx_active)
+        return;
+    uint8_t pkt[3] = {PKT_TYPE_PASS_DONE, (uint8_t)(tx_id >> 8), (uint8_t)(tx_id & 0xFF)};
     pCharRawStream->setValue(pkt, sizeof(pkt));
     pCharRawStream->notify();
 }
 
-void BTManager::handle_resend(uint16_t id, const std::vector<TransferRange>& ranges) {
-    if (!tx_active || id != tx_id) {
+void BTManager::handle_resend(uint16_t id, const std::vector<TransferRange> &ranges)
+{
+    if (!tx_active || id != tx_id)
+    {
         Serial.printf("[BTManager] Ignoring resend for inactive/stale id %u.\n", id);
         return;
     }
@@ -282,19 +323,25 @@ void BTManager::handle_resend(uint16_t id, const std::vector<TransferRange>& ran
     tx_last_activity_ms = millis();
 }
 
-void BTManager::handle_transfer_done(uint16_t id) {
-    if (!tx_active || id != tx_id) return;
+void BTManager::handle_transfer_done(uint16_t id)
+{
+    if (!tx_active || id != tx_id)
+        return;
     Serial.printf("[BTManager] TX id:%u acknowledged, releasing buffer.\n", id);
     free_tx();
 }
 
-void BTManager::service_transfer() {
+void BTManager::service_transfer()
+{
     uint32_t now = millis();
 
     // Resend requested ranges, then signal the end of the pass.
-    if (tx_active && !tx_pending_resend.empty()) {
-        for (const TransferRange& r : tx_pending_resend) {
-            for (uint16_t seq = r.start; seq <= r.end && seq < tx_chunks; seq++) {
+    if (tx_active && !tx_pending_resend.empty())
+    {
+        for (const TransferRange &r : tx_pending_resend)
+        {
+            for (uint16_t seq = r.start; seq <= r.end && seq < tx_chunks; seq++)
+            {
                 send_chunk(seq, (seq == tx_chunks - 1));
                 tx_last_activity_ms = now;
                 delay(inter_chunk_delay_ms());
@@ -306,20 +353,24 @@ void BTManager::service_transfer() {
     }
 
     // Sender timeout: receiver went away without acknowledging.
-    if (tx_active && (now - tx_last_activity_ms > TRANSFER_TIMEOUT_MS)) {
+    if (tx_active && (now - tx_last_activity_ms > TRANSFER_TIMEOUT_MS))
+    {
         Serial.println("[BTManager] TX transfer timed out, releasing buffer.");
         free_tx();
     }
 
     // Receiver timeout: upload stalled mid-way.
-    if (rx_active && (now - rx_last_activity_ms > TRANSFER_TIMEOUT_MS)) {
+    if (rx_active && (now - rx_last_activity_ms > TRANSFER_TIMEOUT_MS))
+    {
         Serial.println("[BTManager] RX transfer timed out, releasing buffer.");
         free_rx();
     }
 }
 
-void BTManager::free_tx() {
-    if (tx_buf) {
+void BTManager::free_tx()
+{
+    if (tx_buf)
+    {
         heap_caps_free(tx_buf);
         tx_buf = nullptr;
     }
@@ -332,9 +383,11 @@ void BTManager::free_tx() {
 }
 
 // ─── TransferEngine: Receiver (uploads) ──────────────────────────────
-void BTManager::start_rx(uint16_t id, size_t total, uint8_t type) {
+void BTManager::start_rx(uint16_t id, size_t total, uint8_t type)
+{
     free_rx();
-    if (total == 0 || total > sizeof(Fruit28D)) {
+    if (total == 0 || total > sizeof(Fruit28D))
+    {
         Serial.printf("[BTManager] RX reject: bad total %u.\n", (unsigned)total);
         return;
     }
@@ -354,37 +407,47 @@ void BTManager::start_rx(uint16_t id, size_t total, uint8_t type) {
 }
 
 void BTManager::on_rx_chunk(uint16_t id, uint16_t seq, bool end_flag,
-                            const uint8_t* payload, size_t len) {
-    if (!rx_active || id != rx_id) return;
-    if (seq >= rx_chunks) return;
+                            const uint8_t *payload, size_t len)
+{
+    if (!rx_active || id != rx_id)
+        return;
+    if (seq >= rx_chunks)
+        return;
 
     rx_last_activity_ms = millis();
 
-    if (!rx_received[seq]) {
+    if (!rx_received[seq])
+    {
         size_t offset = (size_t)seq * CHUNK_SIZE;
-        if (offset + len > rx_len) return;
+        if (offset + len > rx_len)
+            return;
         memcpy(rx_buf + offset, payload, len);
         rx_received[seq] = true;
         rx_received_count++;
 
         if (rx_received_count * CHUNK_SIZE >= rx_next_progress_bytes + PROGRESS_NOTIFY_BYTES ||
-            rx_received_count == rx_chunks) {
+            rx_received_count == rx_chunks)
+        {
             notify_rx_progress();
         }
     }
 
-    if (rx_received_count == rx_chunks) {
+    if (rx_received_count == rx_chunks)
+    {
         Serial.printf("[BTManager] RX id:%u complete (%u bytes).\n", id, (unsigned)rx_len);
-        if (rx_type == PKT_TYPE_MODEL) {
+        if (rx_type == PKT_TYPE_MODEL)
+        {
             process_incoming_model();
         }
         free_rx();
     }
 }
 
-void BTManager::notify_rx_progress() {
+void BTManager::notify_rx_progress()
+{
     size_t received = (rx_received_count > rx_chunks) ? rx_len : rx_received_count * CHUNK_SIZE;
-    if (received > rx_len) received = rx_len;
+    if (received > rx_len)
+        received = rx_len;
 
     StaticJsonDocument<128> doc;
     doc["status"] = "transfer_progress";
@@ -394,7 +457,7 @@ void BTManager::notify_rx_progress() {
 
     char output[128];
     size_t n = serializeJson(doc, output);
-    pCharScanResults->setValue((uint8_t*)output, n);
+    pCharScanResults->setValue((uint8_t *)output, n);
     pCharScanResults->notify();
 
     Serial.printf("[BTManager] RX id:%u %u/%u (%u%%)\n",
@@ -403,7 +466,8 @@ void BTManager::notify_rx_progress() {
     rx_next_progress_bytes = received;
 }
 
-void BTManager::free_rx() {
+void BTManager::free_rx()
+{
     rx_buf = nullptr;
     rx_len = 0;
     rx_id = 0;
@@ -414,38 +478,47 @@ void BTManager::free_rx() {
     rx_received.clear();
 }
 
-uint32_t BTManager::inter_chunk_delay_ms() {
+uint32_t BTManager::inter_chunk_delay_ms()
+{
     uint16_t conn_itvl = 0;
-    NimBLEServer* server = NimBLEDevice::getServer();
-    if (server && !server->getPeerDevices().empty()) {
+    NimBLEServer *server = NimBLEDevice::getServer();
+    if (server && !server->getPeerDevices().empty())
+    {
         conn_itvl = server->getPeerInfo(0).getConnInterval(); // units of 1.25 ms
     }
     uint32_t d = (conn_itvl > 0) ? (uint32_t)(conn_itvl * 1.25f * 1.2f) : 30;
-    if (d < 10) d = 10;
+    if (d < 10)
+        d = 10;
     return d;
 }
 
 // ─── Save Received Model to NVS ──────────────────────────────────────
-void BTManager::process_incoming_model() {
+void BTManager::process_incoming_model()
+{
     Fruit28D incoming_model;
     memcpy(&incoming_model, model_rx_buffer, sizeof(Fruit28D));
 
     Serial.printf("[BTManager] Completed Binary Model Upload: '%s'\n", incoming_model.fruit_name);
 
-    if (store_ref && store_ref->save_model(incoming_model)) {
+    if (store_ref && store_ref->save_model(incoming_model))
+    {
         // Automatically activate newly saved model into RAM
         store_ref->load_model_to_ram(incoming_model.fruit_name);
         notify_status_change("model_saved");
         Serial.println("[BTManager] New Model Saved to Flash & Loaded to RAM!");
-    } else {
+    }
+    else
+    {
         notify_status_change("model_error");
         Serial.println("[BTManager] Failed to save new model to NVS.");
     }
 }
 
 // ─── Send Inference Results to Mobile App ───────────────────────────
-void BTManager::notify_scan_result(const BiologicalStatus& result) {
-    if (!device_connected) return;
+void BTManager::notify_scan_result(const BiologicalStatus &result)
+{
+    if (!device_connected)
+        return;
 
     StaticJsonDocument<384> doc;
     doc["decision"] = result.primary_decision;
@@ -464,31 +537,37 @@ void BTManager::notify_scan_result(const BiologicalStatus& result) {
     char output[384];
     size_t len = serializeJson(doc, output);
 
-    pCharScanResults->setValue((uint8_t*)output, len);
+    pCharScanResults->setValue((uint8_t *)output, len);
     pCharScanResults->notify();
 }
 
-void BTManager::notify_status_change(const char* status_msg) {
-    if (!device_connected) return;
+void BTManager::notify_status_change(const char *status_msg)
+{
+    if (!device_connected)
+        return;
 
     StaticJsonDocument<128> doc;
     doc["status"] = status_msg;
 
     char output[128];
     size_t len = serializeJson(doc, output);
-    pCharScanResults->setValue((uint8_t*)output, len);
+    pCharScanResults->setValue((uint8_t *)output, len);
     pCharScanResults->notify();
 }
 
 // ─── Public stream entry points (thin wrappers over the engine) ──────
-void BTManager::send_raw_jpeg_stream(const uint8_t* jpeg_buf, size_t jpeg_len) {
-    if (current_mode != MODE_DATA_COLLECTION) return;
+void BTManager::send_raw_jpeg_stream(const uint8_t *jpeg_buf, size_t jpeg_len)
+{
+    if (current_mode != MODE_DATA_COLLECTION)
+        return;
     Serial.printf("[BTManager] Streaming %u byte High-Res JPEG over BLE...\n", (unsigned)jpeg_len);
     begin_transfer(PKT_TYPE_JPEG, jpeg_buf, jpeg_len);
 }
 
-void BTManager::send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc) {
-    if (current_mode != MODE_DATA_COLLECTION) return;
+void BTManager::send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc)
+{
+    if (current_mode != MODE_DATA_COLLECTION)
+        return;
     Serial.println("[BTManager] Streaming Raw Acoustic Impact Waveform over BLE...");
-    begin_transfer(PKT_TYPE_RAW_WAVEFORM, (const uint8_t*)raw_adc, 512 * sizeof(uint16_t));
+    begin_transfer(PKT_TYPE_RAW_WAVEFORM, (const uint8_t *)raw_adc, 512 * sizeof(uint16_t));
 }
