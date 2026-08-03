@@ -19,7 +19,7 @@ const float FFT_CENTERS[N_FFT_BINS] = {
 const char* const  CLASS_LABELS[NUM_CLASSES] = {
     "UNRIPE",
     "PERFECTLY_RIPE",
-    "OVERRIPE"
+    "OVERRIPE",
     "ROTTEN_OR_HOLLOW",
     "ARTIFICIALLY_RIPENED"
 };

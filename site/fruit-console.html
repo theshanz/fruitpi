@@ -223,7 +223,7 @@
       <div class="action-grid">
         <button class="btn" id="captureBtn">Capture image</button>
         <button class="btn" id="acousticBtn">Arm acoustic</button>
-        <button class="btn primary" id="armFullBtn" style="grid-column:1/3;">Arm full scan (image + tap)</button>
+        <button class="btn primary" id="armFullBtn" style="grid-column:1/3;">Run inference scan</button>
       </div>
       <button class="btn danger" id="cancelBtn" style="width:100%; margin-top:6px;">Cancel scan</button>
     </div>
@@ -593,7 +593,7 @@ $("deleteModelBtn").addEventListener("click", () => {
 
 $("captureBtn").addEventListener("click", () => sendCommand({ command: "capture_image" }));
 $("acousticBtn").addEventListener("click", () => sendCommand({ command: "arm_acoustic" }));
-$("armFullBtn").addEventListener("click", () => sendCommand({ command: "arm_full" }));
+$("armFullBtn").addEventListener("click", () => sendCommand({ command: "inference_request" }));
 $("cancelBtn").addEventListener("click", () => sendCommand({ command: "cancel" }));
 
 $("modeInference").addEventListener("click", () => setMode("inference"));

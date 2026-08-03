@@ -36,7 +36,7 @@ bool FruitStore::init() {
         return false;
     }
 
-    Serial.println("[FruitStore] NVS Multi-Model Storage Subsystem Ready.");
+    Serial.println("[FruitStore] NVS Multi-Fruit Storage Subsystem Ready.");
     return true;
 }
 

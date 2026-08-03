@@ -1,10 +1,20 @@
 #include "piezo_acoustic.h"
 #include "driver/adc.h"
 #include "dsps_fft2r.h"
+#include "esp_err.h"
 #include "hal/adc_types.h"
 #include "sdkconfig.h"
 #include <cstdint>
+#include <cstring>
 #include <esp32-hal-adc.h>
+#include <esp32-hal.h>
+#include <pgmspace.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
+#include "esp_task.h"
+
 
 PiezoAcoustic::PiezoAcoustic(adc1_channel_t channel) : adc_channel(channel){}
 
@@ -28,7 +38,25 @@ bool PiezoAcoustic::init(){
 
     generate_hanning_window();
 
-    Serial.println("[Piezo] Hardware FFT Subsystem Initialized.");
+    // Create mutex for thread-safe feature retrieval
+    data_mutex = xSemaphoreCreateMutex();
+    if (data_mutex == NULL) {
+        Serial.println("[Piezo] Error creating data mutex!");
+        return false;
+    }
+
+    // Spawn background continuous sampling task on Core 0
+    xTaskCreatePinnedToCore(
+        PiezoAcoustic::sampler_task_code,
+        "PiezoSamplerTask",
+        4096,
+        this,
+        10,                      // High priority
+        &sampler_task_handle,
+        0                        // Core 0
+    );
+
+    Serial.println("[Piezo] Hardware FFT & Background Sampler Subsystem Initialized.");
     return true;
 }
 
@@ -131,6 +159,7 @@ AcousticFeatures PiezoAcoustic::capture_and_process(){
     return result;
 
 }
+
 void PiezoAcoustic::capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_out){
     uint16_t max_peak = 0;
     uint32_t sample_period_us = 1000000 / SAMPLING_FREQ_HZ; // 113
@@ -150,5 +179,165 @@ void PiezoAcoustic::capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_o
 
     if(peak_out != nullptr) {
         *peak_out = max_peak;
+    }
+}
+
+//////////////////Continuous Background Recording Subsystem Methods /////////////////////////////////////
+
+bool PiezoAcoustic::start_arming() {
+    arm(0.15f);
+    return true;
+}
+
+void PiezoAcoustic::arm(float trigger_threshold) {
+    if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
+        trigger_threshold_adc = trigger_threshold;
+        new_data_available.store(false);
+        post_trigger_counter = 0;
+
+        //prevent old data on new arm sequence
+        memset(ring_buffer, 0, sizeof(ring_buffer));
+        ring_head = 0;
+
+        armed_start_us = micros();
+        state.store(STATE_ARMED);
+        xSemaphoreGive(data_mutex);
+    }
+    if (sampler_task_handle != nullptr) {
+        xTaskNotifyGive(sampler_task_handle);   // wake sampler immediately
+    }
+}
+
+void PiezoAcoustic::disarm() {
+    state.store(STATE_DISARMED);
+}
+
+bool PiezoAcoustic::is_data_ready() {
+    return new_data_available.load();
+}
+
+SamplingState PiezoAcoustic::get_state() {
+    return state.load();
+}
+
+AcousticFeatures PiezoAcoustic::get_latest_features() {
+    AcousticFeatures temp = {0};
+    if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
+        temp = latest_features;
+        new_data_available.store(false);
+        xSemaphoreGive(data_mutex);
+    }
+    return temp;
+}
+
+// FreeRTOS Task: High-priority background loop on Core 0
+void PiezoAcoustic::sampler_task_code(void* parameter) {
+    PiezoAcoustic* self = static_cast<PiezoAcoustic*>(parameter);
+    uint32_t sample_period_us = 1000000 / SAMPLING_FREQ_HZ; // ~113 us
+
+    while (true) {
+        while (self->state.load() == STATE_DISARMED)     // sleep until armed
+          ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint32_t t_start = micros();
+
+        // 1. Always continuously sample into circular ring buffer
+        int raw_adc = adc1_get_raw(self->adc_channel);
+        float normalized_val = (float)raw_adc / 4095.0f;
+
+        uint16_t current_head = self->ring_head;
+        self->ring_buffer[current_head] = normalized_val;
+        self->ring_head = (current_head + 1) % RING_BUFFER_SIZE;
+
+        // 2. State machine evaluation
+        SamplingState cur_state = self->state.load();
+
+        if (cur_state == STATE_ARMED) {
+            // Check for trigger impact threshold crossing
+            if (normalized_val >= self->trigger_threshold_adc) {
+                self->post_trigger_counter = 0;
+                self->state.store(STATE_CAPTURING);
+            }
+            // Auto-disarm if no tap within timeout (bounds busy window)
+            else if (micros() - self->armed_start_us >= ARM_TIMEOUT_US) {
+                self->state.store(STATE_DISARMED);
+            }
+        }
+        else if (cur_state == STATE_CAPTURING) {
+            self->post_trigger_counter++;
+            uint16_t required_post = FFT_SIZE - PRE_TRIGGER_SAMPLES;
+
+            if (self->post_trigger_counter >= required_post) {
+                self->state.store(STATE_PROCESSING);
+
+                // 3. Reconstruct full window containing 64 pre-trigger + 448 post-trigger samples
+                uint16_t start_idx = (self->ring_head + RING_BUFFER_SIZE - FFT_SIZE) % RING_BUFFER_SIZE;
+                for (int i = 0; i < FFT_SIZE; i++) {
+                    self->adc_buffer[i] = self->ring_buffer[(start_idx + i) % RING_BUFFER_SIZE];
+                }
+
+                // Run FFT DSP pipeline on background core
+                self->process_captured_buffer();
+
+                // Disarm after capture completion
+                self->state.store(STATE_DISARMED);
+            }
+        }
+
+        // Precise microsecond timing enforcement
+        while ((micros() - t_start) < sample_period_us);
+    }
+}
+
+// Background FFT processing execution
+void PiezoAcoustic::process_captured_buffer() {
+    AcousticFeatures result = {0};
+    float max_peak_adc = 0.0f;
+
+    for (int i = 0; i < FFT_SIZE; i++) {
+        if (adc_buffer[i] > max_peak_adc) {
+            max_peak_adc = adc_buffer[i];
+        }
+        fft_input[i * 2] = adc_buffer[i] * hanning_window[i];
+        fft_input[i * 2 + 1] = 0.0f;
+    }
+
+    result.hertzian_adc = max_peak_adc;
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    dsps_fft2r_fc32_ae32(fft_input, FFT_SIZE);
+#else
+    dsps_fft2r_fc32(fft_input, FFT_SIZE);
+#endif
+
+    dsps_bit_rev_fc32(fft_input, FFT_SIZE);
+
+    float bin_resolution = (float)SAMPLING_FREQ_HZ / (float)FFT_SIZE;
+    float raw_bin_power[N_FFT_BINS] = {0};
+
+    for (int b = 0; b < N_FFT_BINS; b++) {
+        float center_freq = FFT_CENTERS[b];
+
+        int target_fft_bin = (int)((center_freq / bin_resolution) + 0.5f);
+        if (target_fft_bin >= (FFT_SIZE / 2)) {
+            target_fft_bin = (FFT_SIZE / 2) - 1;
+        }
+
+        float real = fft_input[target_fft_bin * 2];
+        float imag = fft_input[target_fft_bin * 2 + 1];
+        float power = (real * real) + (imag * imag);
+
+        raw_bin_power[b] = power;
+
+        float conditioned = logf(power + EPS_LOG) * (center_freq * center_freq) / F2_NORM;
+        result.fft_bins[b] = (conditioned < FFT_CLAMP_MIN) ? FFT_CLAMP_MIN : conditioned;
+    }
+
+    result.spectral_entropy = compute_spectral_entropy(raw_bin_power);
+
+    // Lock mutex and present newly ready features to main application
+    if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
+        latest_features = result;
+        new_data_available.store(true);
+        xSemaphoreGive(data_mutex);
     }
 }

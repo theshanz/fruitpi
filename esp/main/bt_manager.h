@@ -25,15 +25,7 @@ struct ScanConfig {
     bool use_volume_override;
 };
 
-// ─── Generalized reliable-transfer protocol (mirrored by the collector) ───
-// Both directions (download = ESP->laptop notify, upload = laptop->ESP write)
-// use identical framing:
-//   HEADER  [0]=0x03  id BE16 | total_len BE32 | payload_type
-//   CHUNK   [payload_type] id BE16 | seq BE16 | end_flag | payload(<=CHUNK_SIZE)
-//   PASS_DONE [0]=0x05  id BE16   (marks end of a send/retransmit pass)
-// Receiver requests retransmission via config command:
-//   {"command":"resend","id":N,"ranges":[[s,e],...]}
-//   {"command":"transfer_done","id":N}
+
 constexpr uint8_t PKT_TYPE_HEADER       = 0x03;
 constexpr uint8_t PKT_TYPE_JPEG         = 0x01;
 constexpr uint8_t PKT_TYPE_RAW_WAVEFORM = 0x02;
@@ -68,6 +60,7 @@ private:
     bool cancel_requested;
     bool threshold_updated;
     float new_threshold_val;
+    bool inference_requested;
 
     // Destination buffer for received MODEL transfers
     uint8_t model_rx_buffer[sizeof(Fruit28D)];
@@ -128,6 +121,7 @@ public:
     void send_raw_jpeg_stream(const uint8_t* jpeg_buf, size_t jpeg_len);
     void send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc);
     void service_transfer();
+    bool check_inference_request();
 
     bool check_capture_image_request() {
         if (capture_image_requested) { capture_image_requested = false; return true; }
