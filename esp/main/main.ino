@@ -1,15 +1,14 @@
 #include "bt_manager.h"
 #include "camera_handler.h"
-#include "class/audio/audio.h"
 #include "esp_camera.h"
 #include "extract_hues.h"
 #include "fruit_store.h"
+#include "led_indicator.h"
 #include "piezo_acoustic.h"
 #include "sci_28d.h"
 #include <Arduino.h>
 #include <cstdint>
 #include <esp32-hal-gpio.h>
-#include <random>
 #include <sys/stat.h>
 
 constexpr uint8_t BOOT_BUTTON_PIN = 0;
@@ -39,14 +38,17 @@ void handle_laptop_capture_image_only() {
     bt.send_raw_jpeg_stream(fb->buf, fb->len);
     release_camera_frame(fb);
     bt.notify_status_change("image_captured");
+    led_pet_capturing();
   } else {
     bt.notify_status_change("camera_error");
+    led_pet_camera_error();
   }
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  led_indicator_init();
 
   if (init_camera_subsystem()) {
     Serial.println("[Main] Camera ready for captures.");
@@ -65,6 +67,15 @@ void setup() {
 void loop() {
   uint32_t current_time = millis();
   SystemMode mode = bt.get_mode();
+
+  static bool last_ble_connected = false;
+  bool now_connected = bt.is_connected();
+  if (now_connected && !last_ble_connected) {
+    led_pet_connected();
+  } else if (!now_connected && last_ble_connected) {
+    led_pet_disconnected();
+  }
+  last_ble_connected = now_connected;
 
   float trigger_threshold = 0.15f;
   if (bt.has_threshold_update()) {
@@ -95,6 +106,7 @@ void loop() {
     are_we_in_middle_of_capture = false;    // clear in-flight inference state
     capture_button_pressed = false;
     bt.notify_status_change("disarmed");
+    led_pet_disarmed();
   }
 
 
@@ -105,11 +117,13 @@ void loop() {
       static ColorFeatures c_f;
       if (is_camera_ready() && !are_we_in_middle_of_capture) {
         // Taking the visual data
+        led_pet_capturing();
         camera_fb_t *fb = capture_camera_frame();
         c_f = HueExtractor::process_frame(fb);
         release_camera_frame(fb);
         acoustic_sensor.arm(trigger_threshold);
         are_we_in_middle_of_capture = true;
+        led_pet_armed();
       }
       if (acoustic_sensor.is_data_ready() && are_we_in_middle_of_capture) {
         AcousticFeatures features = acoustic_sensor.get_latest_features();
@@ -117,6 +131,7 @@ void loop() {
         assemble_state_28d(state, c_f, features);
         BiologicalStatus status = evaluate_fruit_single(state, *model);
         bt.notify_scan_result(status);
+        led_pet_result(status.primary_decision, status.is_anomaly);
 
         //reset state
         are_we_in_middle_of_capture = false;
@@ -157,14 +172,17 @@ void loop() {
       // Auto-disarm after capturing tap
       is_acoustic_armed = false;
       bt.notify_status_change("acoustic_captured");
+      led_pet_disarmed();
 
     }
     // 3-Second Timeout
     else if (current_time - arm_start_time >= ARM_TIMEOUT_MS) {
       is_acoustic_armed = false;
       bt.notify_status_change("timeout_disarmed");
+      led_pet_timeout();
     }
   }
 
+  led_indicator_update();
   delay(10);
 }
