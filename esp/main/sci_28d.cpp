@@ -36,25 +36,11 @@ static inline float normalize_range(float val,float low,float high){
     return (val - low) / (high - low);
 }
 
-// ─── ESP32-S3 Hardware Vector SIMD Execution ──────────────────────
+// ─── Vector Dot Product ─────────────────────────────────────────────
 static inline float compute_dot_product(const float* a, const float* b, int len) {
-#if defined(CONFIG_IDF_TARGET_ESP32S3)
     float out = 0.0f;
-
-    // Calls Xtensa LX7 AE32 128-bit SIMD Assembly Kernel directly
-    dsps_dotprod_f32_ae32(a, b, &out, len);
-
+    dsps_dotprod_f32(a, b, &out, len);
     return out;
-#elif defined(ESP_PLATFORM)
-    float out = 0.0f;
-    dsps_dotprod_f32(a, b, &out, len); // Generic ESP32 DSP call
-    return out;
-#else
-    // Portable fallback for non-ESP targets
-    float sum = 0.0f;
-    for (int i = 0; i < len; i++) sum += a[i] * b[i];
-    return sum;
-#endif
 }
 
 void assemble_state_28d(

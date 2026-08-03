@@ -123,12 +123,7 @@ AcousticFeatures PiezoAcoustic::capture_and_process(){
         fft_input[i * 2] = adc_buffer[i] * hanning_window [i]; //real (Windowed)
         fft_input[i * 2 + 1] = 0.0f; //imginary
     }
-    #if defined(CONFIG_IDF_TARGET_ESP32S3)
-        dsps_fft2r_fc32_ae32(fft_input, FFT_SIZE); // ESP32-S3 SIMD
-    #else
-        dsps_fft2r_fc32(fft_input, FFT_SIZE);      // Generic ESP32 fallback
-    #endif
-
+    dsps_fft2r_fc32(fft_input, FFT_SIZE);
     dsps_bit_rev_fc32(fft_input, FFT_SIZE);
 
     float bin_resolution = (float)SAMPLING_FREQ_HZ / (float)FFT_SIZE;
@@ -303,11 +298,7 @@ void PiezoAcoustic::process_captured_buffer() {
 
     result.hertzian_adc = max_peak_adc;
 
-#if defined(CONFIG_IDF_TARGET_ESP32S3)
-    dsps_fft2r_fc32_ae32(fft_input, FFT_SIZE);
-#else
     dsps_fft2r_fc32(fft_input, FFT_SIZE);
-#endif
 
     dsps_bit_rev_fc32(fft_input, FFT_SIZE);
 

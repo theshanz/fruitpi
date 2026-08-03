@@ -1,6 +1,5 @@
 #include "bt_manager.h"
 #include "camera_handler.h"
-#include "class/audio/audio.h"
 #include "esp_camera.h"
 #include "extract_hues.h"
 #include "fruit_store.h"
@@ -8,16 +7,15 @@
 #include "sci_28d.h"
 #include <Arduino.h>
 #include <cstdint>
-#include <esp32-hal-gpio.h>
 #include <random>
 #include <sys/stat.h>
+#include "soc/rtc_cntl_reg.h"
 
-constexpr uint8_t BOOT_BUTTON_PIN = 0;
 constexpr uint32_t ARM_TIMEOUT_MS = 3000;
 
 FruitStore store;
 BTManager bt;
-PiezoAcoustic acoustic_sensor(ADC1_CHANNEL_0);
+PiezoAcoustic acoustic_sensor(ADC1_CHANNEL_5);
 
 // Dynamic Config
 float dynamic_adc_threshold = 0.15f;
@@ -45,8 +43,10 @@ void handle_laptop_capture_image_only() {
 }
 
 void setup() {
+  // TEST band-aid: disable the brownout detector (power is marginal via CH340).
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
-  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
   if (init_camera_subsystem()) {
     Serial.println("[Main] Camera ready for captures.");
@@ -71,20 +71,9 @@ void loop() {
     trigger_threshold = bt.get_updated_threshold();
   }
 /// 1.Trigger for inference
-  constexpr uint32_t BOUNCE_MS = 50;
-  static uint32_t last_btn_ms = 0;
-  static bool last_btn_state = HIGH;
-
-  bool btn_now = (digitalRead(BOOT_BUTTON_PIN) == LOW);
-  if (btn_now && !last_btn_state && (current_time - last_btn_ms >= BOUNCE_MS)) {
-      capture_button_pressed = true;      // one press = one inference run
-      last_btn_ms = current_time;
+  if (bt.check_inference_request() && mode == MODE_INFERENCE) {
+    capture_button_pressed = true;
   }
-  last_btn_state = btn_now;
-/// 2.
-    if(bt.check_inference_request() && mode == MODE_INFERENCE){
-        capture_button_pressed = true;
-    }
 
   bt.service_transfer();
 
