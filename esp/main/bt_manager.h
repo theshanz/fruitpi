@@ -57,10 +57,19 @@ private:
     // Command Flags matching bt_manager.cpp
     bool capture_image_requested;
     bool arm_acoustic_requested;
+    bool raw_capture_requested;
+    bool raw_capture_trigger_mode;   // true = trigger-based, false = continuous
+    uint8_t raw_capture_windows;     // number of capture windows (default 20)
     bool cancel_requested;
     bool threshold_updated;
     float new_threshold_val;
     bool inference_requested;
+    bool ms_scan_requested;
+    bool ms_debug_requested;
+    bool ms_config_requested;
+    float ms_cfg_gain_r, ms_cfg_gain_g, ms_cfg_gain_b;
+    int   ms_cfg_aec;
+    bool  ms_cfg_ambient;
 
     // Destination buffer for received MODEL transfers
     uint8_t model_rx_buffer[sizeof(Fruit28D)];
@@ -73,6 +82,10 @@ private:
     size_t    tx_chunks;
     bool      tx_active;
     uint32_t  tx_last_activity_ms;
+    uint32_t  tx_last_chunk_ms;
+    uint16_t  tx_next_seq;            // next chunk of the initial pass
+    size_t    tx_resend_range_idx;    // cursor into tx_pending_resend
+    uint16_t  tx_resend_seq;          // current chunk inside the range
     std::vector<TransferRange> tx_pending_resend;
 
     // ─── TransferEngine: Receiver state (uploads) ───
@@ -117,10 +130,13 @@ public:
     void onWrite(NimBLECharacteristic* pCharacteristic) override;
 
     void notify_scan_result(const BiologicalStatus& result);
+    void notify_ms_features(const ColorFeatures& f);
     void notify_status_change(const char* status_msg);
     void send_raw_jpeg_stream(const uint8_t* jpeg_buf, size_t jpeg_len);
     void send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc);
+    void send_ms_debug_jpeg(const uint8_t* jpeg_buf, size_t jpeg_len);
     void service_transfer();
+    bool is_transfer_active() const { return tx_active; }
     bool check_inference_request();
 
     bool check_capture_image_request() {
@@ -128,10 +144,39 @@ public:
         return false;
     }
 
+    bool check_ms_scan_request() {
+        if (ms_scan_requested) { ms_scan_requested = false; return true; }
+        return false;
+    }
+
+    bool check_ms_debug_request() {
+        if (ms_debug_requested) { ms_debug_requested = false; return true; }
+        return false;
+    }
+
+    bool check_ms_config_request(float* gain_r, float* gain_g, float* gain_b, int* aec, bool* ambient) {
+        if (!ms_config_requested) return false;
+        ms_config_requested = false;
+        *gain_r = ms_cfg_gain_r;
+        *gain_g = ms_cfg_gain_g;
+        *gain_b = ms_cfg_gain_b;
+        *aec = ms_cfg_aec;
+        *ambient = ms_cfg_ambient;
+        return true;
+    }
+
     bool check_arm_acoustic_request() {
         if (arm_acoustic_requested) { arm_acoustic_requested = false; return true; }
         return false;
     }
+
+    bool check_raw_capture_request() {
+        if (raw_capture_requested) { raw_capture_requested = false; return true; }
+        return false;
+    }
+
+    bool is_raw_capture_trigger_mode() const { return raw_capture_trigger_mode; }
+    uint8_t get_raw_capture_windows() const { return raw_capture_windows; }
 
     bool check_and_clear_cancel_request() {
         if (cancel_requested) { cancel_requested = false; return true; }

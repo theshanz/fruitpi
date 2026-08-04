@@ -343,16 +343,21 @@ class FruitStudioGUI:
         self.progress_capture.grid(row=12, column=0, columnspan=2, sticky=tk.EW, pady=2)
         self.lbl_capture_pct = ttk.Label(left, text="Image transfer: 0%")
         self.lbl_capture_pct.grid(row=13, column=0, columnspan=2, pady=2)
-        ttk.Button(left, text="Arm & Record Acoustic Tap", command=self.arm_tap).grid(row=14, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
-        ttk.Button(left, text="Cancel Arming", command=self.cancel_arm).grid(row=15, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Label(left, text="Trigger Threshold:").grid(row=14, column=0, sticky=tk.W, pady=4)
+        self.var_threshold = tk.DoubleVar(value=0.02)
+        self.spin_threshold = ttk.Spinbox(left, from_=0.01, to=0.60, increment=0.01, textvariable=self.var_threshold, width=7)
+        self.spin_threshold.grid(row=14, column=1, sticky=tk.EW, pady=4)
+        ttk.Button(left, text="Apply", command=self.apply_threshold).grid(row=14, column=2, sticky=tk.EW, pady=4)
+        ttk.Button(left, text="Arm & Record Acoustic Tap", command=self.arm_tap).grid(row=15, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Cancel Arming", command=self.cancel_arm).grid(row=16, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
 
-        ttk.Separator(left, orient=tk.HORIZONTAL).grid(row=16, column=0, columnspan=2, sticky=tk.EW, pady=10) # FIXED
+        ttk.Separator(left, orient=tk.HORIZONTAL).grid(row=17, column=0, columnspan=2, sticky=tk.EW, pady=10) # FIXED
 
         self.lbl_counts = ttk.Label(left, text="Pictures: 0 | Taps: 0", font=("Arial", 10, "bold"))
-        self.lbl_counts.grid(row=17, column=0, columnspan=2, pady=4)
+        self.lbl_counts.grid(row=18, column=0, columnspan=2, pady=4)
 
-        ttk.Button(left, text="Save Sample Session", command=self.save_session).grid(row=18, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
-        ttk.Button(left, text="Clear Session", command=self.clear_session).grid(row=19, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Save Sample Session", command=self.save_session).grid(row=19, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Clear Session", command=self.clear_session).grid(row=20, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
 
         # Right Previews
         right = ttk.Frame(pane)
@@ -581,10 +586,25 @@ class FruitStudioGUI:
             self.ble_worker.send_config({"command": "capture_image", "mode": "data_collection"})
             self.log("Requesting picture...")
 
+    def get_threshold(self):
+        try:
+            thr = float(self.var_threshold.get())
+        except Exception:
+            thr = 0.15
+        return min(0.60, max(0.01, thr))
+
+    def apply_threshold(self):
+        if self.ble_worker:
+            thr = self.get_threshold()
+            self.ble_worker.send_config({"command": "set_threshold", "threshold": thr})
+            self.log(f"Trigger threshold set to {thr:.2f}")
+
     def arm_tap(self):
         if self.ble_worker:
+            thr = self.get_threshold()
+            self.ble_worker.send_config({"command": "set_threshold", "threshold": thr})
             self.ble_worker.send_config({"command": "arm_acoustic", "mode": "data_collection"})
-            self.log("Acoustic Sensor ARMED! Tap fruit now...")
+            self.log(f"Threshold {thr:.2f} — Acoustic Sensor ARMED! Tap fruit now...")
 
     def cancel_arm(self):
         if self.ble_worker:

@@ -6,6 +6,7 @@
 #include "sdkconfig.h"
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <esp32-hal-adc.h>
 #include <esp32-hal.h>
 #include <pgmspace.h>
@@ -45,7 +46,8 @@ bool PiezoAcoustic::init(){
         return false;
     }
 
-    // Spawn background continuous sampling task on Core 0
+    // Spawn background continuous sampling task on Core 1 (off the WiFi/BT
+    // radio core so BT traffic can't preempt it and punch sampling gaps).
     xTaskCreatePinnedToCore(
         PiezoAcoustic::sampler_task_code,
         "PiezoSamplerTask",
@@ -53,17 +55,11 @@ bool PiezoAcoustic::init(){
         this,
         10,                      // High priority
         &sampler_task_handle,
-        0                        // Core 0
+        1                        // Core 1
     );
 
     Serial.println("[Piezo] Hardware FFT & Background Sampler Subsystem Initialized.");
     return true;
-}
-
-bool PiezoAcoustic::check_impact_detected(float threshold_adc){
-    int raw = adc1_get_raw(adc_channel);
-    float normalized = (float)raw / 4095.0f;
-    return (normalized > threshold_adc);
 }
 
 //Coumpute Normalized Spectral Entropy math
@@ -95,71 +91,6 @@ float PiezoAcoustic::compute_spectral_entropy(const float raw_power[N_FFT_BINS])
     return normalized_entropy;
 }
 
-AcousticFeatures PiezoAcoustic::capture_and_process(){
-    AcousticFeatures result = {0};
-
-    float max_peak_adc = 0.0f;
-    uint8_t sample_period_us = 1000000 / SAMPLING_FREQ_HZ; // ~133
-
-    for (int i = 0; i < FFT_SIZE; i++ ){
-        uint32_t t_start = micros();
-
-        int raw_adc = adc1_get_raw(adc_channel);
-        float normalized_val = (float)raw_adc / 4095.0f;
-
-        if (normalized_val > max_peak_adc){
-            max_peak_adc = normalized_val;
-        }
-
-        adc_buffer[i] = normalized_val;
-
-        while ((micros() - t_start) < sample_period_us);
-
-    }
-
-    result.hertzian_adc = max_peak_adc;
-
-    for (int i = 0; i < FFT_SIZE; i++) {
-        fft_input[i * 2] = adc_buffer[i] * hanning_window [i]; //real (Windowed)
-        fft_input[i * 2 + 1] = 0.0f; //imginary
-    }
-    #if defined(CONFIG_IDF_TARGET_ESP32S3)
-        dsps_fft2r_fc32_ae32(fft_input, FFT_SIZE); // ESP32-S3 SIMD
-    #else
-        dsps_fft2r_fc32(fft_input, FFT_SIZE);      // Generic ESP32 fallback
-    #endif
-
-    dsps_bit_rev_fc32(fft_input, FFT_SIZE);
-
-    float bin_resolution = (float)SAMPLING_FREQ_HZ / (float)FFT_SIZE;
-    float raw_bin_power[N_FFT_BINS] = {0};
-
-    for (int b = 0; b < N_FFT_BINS; b++){
-        float center_freq = FFT_CENTERS[b];
-
-        //find nearest FFT bin intex
-        int target_fft_bin = (int)((center_freq / bin_resolution) + 0.5f);
-        if(target_fft_bin >= (FFT_SIZE / 2)){
-            target_fft_bin = (FFT_SIZE / 2) - 1;
-        }
-
-        //extract real and img components
-        float real = fft_input[target_fft_bin * 2];
-        float imag = fft_input[target_fft_bin * 2 + 1];
-        float power = (real * real) + (imag * imag);
-
-        raw_bin_power[b] = power;
-
-        float conditioned = logf(power +  EPS_LOG) * (center_freq * center_freq) / F2_NORM;
-
-        result.fft_bins[b] = (conditioned < FFT_CLAMP_MIN) ? FFT_CLAMP_MIN : conditioned;
-
-    }
-    result.spectral_entropy = compute_spectral_entropy(raw_bin_power);
-    return result;
-
-}
-
 void PiezoAcoustic::capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_out){
     uint16_t max_peak = 0;
     uint32_t sample_period_us = 1000000 / SAMPLING_FREQ_HZ; // 113
@@ -182,18 +113,40 @@ void PiezoAcoustic::capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_o
     }
 }
 
-//////////////////Continuous Background Recording Subsystem Methods /////////////////////////////////////
-
-bool PiezoAcoustic::start_arming() {
-    arm(0.15f);
-    return true;
+// adc_buffer is written by Core-1 in process_captured_buffer() and read here.
+// Both paths are guarded by protocol: callers only reach this after is_data_ready()
+// returns true, meaning the sampler has finished processing and is back in DISARMED.
+// data_mutex protects latest_features; adc_buffer safety relies on this state convention.
+bool PiezoAcoustic::capture_sampler_raw_window(uint16_t raw_out[512], uint16_t* peak_out) {
+    if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
+        uint16_t peak = 0;
+        for (int i = 0; i < FFT_SIZE; i++) {
+            int raw = (int)lroundf(adc_buffer[i] * 4095.0f);
+            if (raw < 0) raw = 0;
+            if (raw > 4095) raw = 4095;
+            raw_out[i] = (uint16_t)raw;
+            if (raw > peak) peak = (uint16_t)raw;
+        }
+        if (peak_out != nullptr) {
+            *peak_out = peak;
+        }
+        new_data_available.store(false);
+        xSemaphoreGive(data_mutex);
+        return true;
+    }
+    return false;
 }
+
+//////////////////Continuous Background Recording Subsystem Methods /////////////////////////////////////
 
 void PiezoAcoustic::arm(float trigger_threshold) {
     if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
         trigger_threshold_adc = trigger_threshold;
         new_data_available.store(false);
         post_trigger_counter = 0;
+        samples_since_arm = 0;
+        // Keep last_normalized_val at previous ambient reading so first-sample
+        // delta is tiny (~0.002) instead of spiking to 0.032 from 0.0 init.
 
         //prevent old data on new arm sequence
         memset(ring_buffer, 0, sizeof(ring_buffer));
@@ -230,7 +183,7 @@ AcousticFeatures PiezoAcoustic::get_latest_features() {
     return temp;
 }
 
-// FreeRTOS Task: High-priority background loop on Core 0
+// FreeRTOS Task: High-priority background loop on Core 1
 void PiezoAcoustic::sampler_task_code(void* parameter) {
     PiezoAcoustic* self = static_cast<PiezoAcoustic*>(parameter);
     uint32_t sample_period_us = 1000000 / SAMPLING_FREQ_HZ; // ~113 us
@@ -252,13 +205,37 @@ void PiezoAcoustic::sampler_task_code(void* parameter) {
         SamplingState cur_state = self->state.load();
 
         if (cur_state == STATE_ARMED) {
-            // Check for trigger impact threshold crossing
-            if (normalized_val >= self->trigger_threshold_adc) {
-                self->post_trigger_counter = 0;
-                self->state.store(STATE_CAPTURING);
+            self->samples_since_arm++;
+
+            // Derivative trigger: detect sharp impulse even when absolute
+            // value is below threshold. Fruit taps produce brief spikes
+            // (<200µs) that have high slope but may not stay above threshold
+            // for 3+ samples. The ring buffer's 64 pre-trigger samples
+            // ensure the impulse is captured at sample 64.
+            //
+            // Warm-up: skip trigger check for first PRE_TRIGGER_SAMPLES so
+            // the ring buffer fills with real background data (not zeros from
+            // memset) and last_normalized_val settles to ambient. This
+            // prevents the startup false trigger where 0→ambient delta
+            // exceeds threshold on sample #1.
+            if (self->samples_since_arm > PRE_TRIGGER_SAMPLES) {
+                float delta = normalized_val - self->last_normalized_val;
+                if (delta < 0) delta = -delta;
+                self->last_normalized_val = normalized_val;
+
+                if (delta >= 0.015f || normalized_val >= self->trigger_threshold_adc) {
+                    self->post_trigger_counter = 0;
+                    self->state.store(STATE_CAPTURING);
+                    Serial.printf("[Acoustic] Trigger fired at sample %u, thresh=%.3f val=%.3f delta=%.4f\n",
+                                  self->samples_since_arm, self->trigger_threshold_adc, normalized_val, delta);
+                }
+            } else {
+                // During warm-up, still update last_normalized_val so it
+                // settles to ambient before trigger checks begin.
+                self->last_normalized_val = normalized_val;
             }
             // Auto-disarm if no tap within timeout (bounds busy window)
-            else if (micros() - self->armed_start_us >= ARM_TIMEOUT_US) {
+            if (micros() - self->armed_start_us >= ARM_TIMEOUT_US) {
                 self->state.store(STATE_DISARMED);
             }
         }
@@ -285,6 +262,10 @@ void PiezoAcoustic::sampler_task_code(void* parameter) {
 
         // Precise microsecond timing enforcement
         while ((micros() - t_start) < sample_period_us);
+
+        // Yield so lower-priority tasks (Arduino loop, camera) on Core 1 still
+        // get CPU while the sampler is armed and busy-waiting.
+        taskYIELD();
     }
 }
 
@@ -339,5 +320,6 @@ void PiezoAcoustic::process_captured_buffer() {
         latest_features = result;
         new_data_available.store(true);
         xSemaphoreGive(data_mutex);
+        Serial.printf("[Acoustic] Capture done, peak=%.3f\n", max_peak_adc);
     }
 }

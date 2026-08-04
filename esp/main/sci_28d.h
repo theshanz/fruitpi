@@ -18,6 +18,9 @@ constexpr float MAX_MASS23 = 300.0f;
 
 extern const char* const CLASS_LABELS[NUM_CLASSES];
 
+// Center frequencies (Hz) for the 15 FFT bins used to build state[10..24].
+extern const float FFT_CENTERS[N_FFT_BINS];
+
 struct BiologicalStatus {
     const char* primary_decision;
     float probabilities[NUM_CLASSES];

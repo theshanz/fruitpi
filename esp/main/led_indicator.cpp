@@ -27,8 +27,10 @@ struct LedShow {
 
 enum class ShowId {
   IDLE,
+  PLACE_FRUIT,
   ARMED,
   CAPTURING,
+  TAP_OK,
   UNRIPE,
   RIPE,
   OVERRIPE,
@@ -45,29 +47,36 @@ enum class ShowId {
 
 static const LedShow SHOWS[] = {
   { 40, 120, 255, Pattern::BREATH, 0.3f, 0 },           // IDLE
-  { 0, 230, 90, Pattern::BREATH, 0.8f, 0 },              // ARMED
-  { 255, 255, 255, Pattern::FLASH_WHITE, 0.0f, 600 },    // CAPTURING
-  { 0, 255, 60, Pattern::SOLID, 0.0f, 4000 },            // UNRIPE
-  { 200, 255, 0, Pattern::SOLID, 0.0f, 4000 },           // RIPE
-  { 255, 140, 0, Pattern::SOLID, 0.0f, 4000 },           // OVERRIPE
-  { 255, 30, 30, Pattern::BLINK, 1.0f, 4000 },           // ROTTEN
-  { 255, 0, 255, Pattern::BLINK, 2.0f, 4000 },           // ARTIFICIAL
-  { 255, 40, 40, Pattern::STROBE, 8.0f, 4000 },          // ANOMALY
-  { 255, 190, 0, Pattern::STROBE, 8.0f, 500 },           // ANALYZING
-  { 255, 110, 20, Pattern::DOUBLE_BLINK, 2.0f, 1500 },   // TIMEOUT
-  { 255, 40, 40, Pattern::BLINK, 3.0f, 1500 },           // CAMERA_ERROR
-  { 80, 140, 255, Pattern::FADE, 0.0f, 800 },            // DISARMED
-  { 180, 80, 255, Pattern::BLINK, 4.0f, 1500 },          // CONNECTED
-  { 0, 0, 0, Pattern::RAINBOW, 0.0f, 1200 },             // BOOT
+  { 255, 255, 255, Pattern::BLINK, 1.2f, 900 },         // PLACE_FRUIT (slow white blink)
+  { 160, 82, 45, Pattern::BREATH, 1.0f, 0 },             // ARMED — brown breath "tap now"
+  { 255, 255, 255, Pattern::FLASH_WHITE, 0.0f, 600 },   // CAPTURING
+  { 160, 82, 45, Pattern::SOLID, 0.0f, 700 },            // TAP_OK — brown "tap captured"
+  { 0, 255, 60, Pattern::SOLID, 0.0f, 5000 },           // UNRIPE
+  { 200, 255, 0, Pattern::SOLID, 0.0f, 5000 },          // RIPE
+  { 255, 140, 0, Pattern::SOLID, 0.0f, 5000 },          // OVERRIPE
+  { 255, 30, 30, Pattern::BLINK, 1.0f, 5000 },          // ROTTEN
+  { 255, 0, 255, Pattern::BLINK, 2.0f, 5000 },          // ARTIFICIAL
+  { 255, 40, 40, Pattern::STROBE, 8.0f, 5000 },         // ANOMALY
+  { 255, 190, 0, Pattern::STROBE, 8.0f, 500 },          // ANALYZING
+  { 255, 110, 20, Pattern::DOUBLE_BLINK, 2.0f, 1500 },  // TIMEOUT
+  { 255, 40, 40, Pattern::BLINK, 3.0f, 1500 },          // CAMERA_ERROR
+  { 80, 140, 255, Pattern::FADE, 0.0f, 800 },           // DISARMED
+  { 180, 80, 255, Pattern::BLINK, 4.0f, 1500 },         // CONNECTED
+  { 0, 0, 0, Pattern::RAINBOW, 0.0f, 1200 },            // BOOT
 };
 
 static LedShow persistent_show;
 static bool overlay_active = false;
 static LedShow overlay_show;
-static bool has_pending = false;
-static ShowId pending_show;
+static ShowId pending_shows[3];
+static uint8_t pending_count = 0;
 static uint32_t overlay_start = 0;
 static uint32_t overlay_end = 0;
+static bool scan_active = false;
+
+void led_indicator_set_scan_active(bool active) {
+  scan_active = active;
+}
 
 static void hsv_to_rgb(uint8_t hue, uint8_t val, uint8_t &r, uint8_t &g, uint8_t &b) {
   uint16_t v = val;
@@ -156,7 +165,7 @@ static bool render(const LedShow &s, uint32_t t, uint8_t &r, uint8_t &g, uint8_t
 static void start_overlay(ShowId id) {
   overlay_show = SHOWS[(int)id];
   overlay_active = true;
-  has_pending = false;
+  pending_count = 0;
   overlay_start = millis();
   overlay_end = overlay_start + overlay_show.duration_ms;
 }
@@ -165,7 +174,7 @@ void led_indicator_init() {
   rgb_led_init();
   persistent_show = SHOWS[(int)ShowId::IDLE];
   overlay_active = false;
-  has_pending = false;
+  pending_count = 0;
   start_overlay(ShowId::BOOT);
 }
 
@@ -177,10 +186,19 @@ void led_indicator_update() {
   }
   last = now;
 
+  // A multispectral scan owns the WS2812 (LED is driven at full brightness for
+  // the R/G/B flashes). Do not let the pet indicator touch the LED meanwhile.
+  if (scan_active) {
+    return;
+  }
+
   if (overlay_active && now >= overlay_end) {
-    if (has_pending) {
-      ShowId nxt = pending_show;
-      has_pending = false;
+    if (pending_count > 0) {
+      ShowId nxt = pending_shows[0];
+      for (uint8_t i = 0; i + 1 < pending_count; i++) {
+        pending_shows[i] = pending_shows[i + 1];
+      }
+      pending_count--;
       overlay_show = SHOWS[(int)nxt];
       overlay_active = true;
       overlay_start = now;
@@ -207,10 +225,24 @@ void led_pet_capturing() {
   start_overlay(ShowId::CAPTURING);
 }
 
+void led_pet_place_fruit() {
+  start_overlay(ShowId::PLACE_FRUIT);
+}
+
 void led_pet_armed() {
   persistent_show = SHOWS[(int)ShowId::ARMED];
   overlay_active = false;
-  has_pending = false;
+  pending_count = 0;
+}
+
+void led_pet_tap_ok() {
+  overlay_show = SHOWS[(int)ShowId::TAP_OK];
+  overlay_active = true;
+  overlay_start = millis();
+  overlay_end = overlay_start + overlay_show.duration_ms;
+  // chain: TAP_OK -> ANALYZING -> (result appended by led_pet_result)
+  pending_count = 1;
+  pending_shows[0] = ShowId::ANALYZING;
 }
 
 void led_pet_result(const char* decision, bool is_anomaly) {
@@ -231,12 +263,21 @@ void led_pet_result(const char* decision, bool is_anomaly) {
       res = ShowId::ARTIFICIAL;
     }
   }
-  overlay_show = SHOWS[(int)ShowId::ANALYZING];
-  overlay_active = true;
-  has_pending = true;
-  pending_show = res;
-  overlay_start = millis();
-  overlay_end = overlay_start + overlay_show.duration_ms;
+  uint32_t now = millis();
+  if (overlay_active && pending_count > 0) {
+    // A guide chain is playing (e.g. after led_pet_tap_ok): append the result
+    // so it shows after ANALYZING instead of clobbering the current cue.
+    if (pending_count < 3) {
+      pending_shows[pending_count++] = res;
+    }
+  } else {
+    overlay_show = SHOWS[(int)ShowId::ANALYZING];
+    overlay_active = true;
+    pending_count = 1;
+    pending_shows[0] = res;
+    overlay_start = now;
+    overlay_end = overlay_start + overlay_show.duration_ms;
+  }
 }
 
 void led_pet_timeout() {

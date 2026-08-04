@@ -17,7 +17,7 @@
 #define FFT_CLAMP_MIN -10.0f
 #define PRE_TRIGGER_SAMPLES 64
 #define RING_BUFFER_SIZE 1024 // Double FFT_SIZE for ring cache
-#define ARM_TIMEOUT_US 3000000 // 3s
+#define ARM_TIMEOUT_US 5000000 // 5s
 
 struct AcousticFeatures {
     float hertzian_adc; //Peak impact voltage
@@ -60,6 +60,14 @@ class PiezoAcoustic {
         uint16_t post_trigger_counter = 0;
         uint32_t armed_start_us = 0;
 
+        // Derivative trigger: detect sharp impulse (high delta) even when
+        // absolute value is below threshold. Fruit taps produce brief spikes
+        // (<200µs) that cross threshold for <2 samples but have high slope.
+        // delta >= 0.015 catches the impulse; absolute threshold catches
+        // strong taps and provides a fallback.
+        float last_normalized_val = 0.0f;
+        uint16_t samples_since_arm = 0;
+
         TaskHandle_t sampler_task_handle = nullptr;
         SemaphoreHandle_t data_mutex = nullptr;
 
@@ -73,15 +81,15 @@ class PiezoAcoustic {
         PiezoAcoustic(adc1_channel_t channel = ADC1_CHANNEL_6);
 
         bool init();
-        bool check_impact_detected(float threshold_adc = 0.15f);
-        AcousticFeatures capture_and_process();
-
         void capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_out);
 
-        bool start_arming();
+        // Expose the background sampler's captured 512-sample window (64
+        // pre-trigger + 448 post-trigger) as raw ADC values. Call after
+        // is_data_ready() returns true. Clears the data-ready flag.
+        bool capture_sampler_raw_window(uint16_t raw_out[512], uint16_t* peak_out);
 
         // Continuous Background Recording API
-        void arm(float trigger_threshold = 0.15f);
+        void arm(float trigger_threshold = 0.02f);
         void disarm();
         bool is_data_ready();
         AcousticFeatures get_latest_features();

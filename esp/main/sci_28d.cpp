@@ -3,13 +3,6 @@
 #include <cmath>
 #include <algorithm>
 
-#if defined(ESP_PLATFORM) && __has_include("dsps_dotprod.h")
-    #include "dsps_dotprod.h"
-    #define HAS_ESP_DSP 1
-#else
-    #define HAS_ESP_DSP 0
-#endif
-
 const float FFT_CENTERS[N_FFT_BINS] = {
     150.0f, 250.0f, 350.0f, 450.0f, 550.0f,
     650.0f, 750.0f, 850.0f, 950.0f, 1100.0f,
@@ -23,6 +16,18 @@ const char* const  CLASS_LABELS[NUM_CLASSES] = {
     "ROTTEN_OR_HOLLOW",
     "ARTIFICIALLY_RIPENED"
 };
+
+// When SCI_28D_HARDCODED is defined, this file compiles to only the shared
+// constants above; the rule-based implementation (sci_28d_hardcoded.cpp)
+// provides the same functions instead. Callers are unchanged.
+#if !defined(SCI_28D_HARDCODED)
+
+#if defined(ESP_PLATFORM) && __has_include("dsps_dotprod.h")
+    #include "dsps_dotprod.h"
+    #define HAS_ESP_DSP 1
+#else
+    #define HAS_ESP_DSP 0
+#endif
 
 static inline float clamp_f(float v, float lo, float hi){
     if (v < lo) return lo;
@@ -239,3 +244,5 @@ BiologicalStatus evaluate_fruit_3tap(
 
     return result;
 }
+
+#endif // !defined(SCI_28D_HARDCODED)
