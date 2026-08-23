@@ -83,9 +83,22 @@ void assemble_state_28d(
 
     state[25] = acoustic.spectral_entropy;
 
-    // Bias-independent tap strength (peak deviation from window mean,
-    // normalized 0-1) — raw peak moved with the charge-amp bias point.
-    state[26] = acoustic.impact_amplitude;
+    if (ACOUSTIC_FORCE_INVARIANT) {
+        // Make the band vector independent of tap strength: the conditioning
+        // multiplied log-power by f^2/NORM, so removing amp^2 from power is
+        // subtracting 2*ln(amp) scaled by the same factor, per band.
+        const float amp = acoustic.impact_amplitude > IMPACT_AMP_FLOOR
+                              ? acoustic.impact_amplitude
+                              : IMPACT_AMP_FLOOR;
+        const float corr = 2.0f * logf(amp);
+        for (int i = 0; i < 15; i++) {
+            const float fi = FFT_CENTERS[i];
+            state[10 + i] -= corr * (fi * fi) / F2_NORM;
+        }
+        state[26] = 0.0f;                  // force channel: no class signal
+    } else {
+        state[26] = acoustic.impact_amplitude;
+    }
 
     state[27] = 0.0f;
 }
@@ -99,6 +112,9 @@ BiologicalStatus evaluate_fruit_single(
 
     for (int c = 0; c < NUM_CLASSES; c++){
         raw_scores[c] = compute_dot_product(state, model.weights[c], VECTOR_DIMENSIONS) + model.biases[c];
+        if (!((ACTIVE_CLASS_MASK >> c) & 1U)) {
+            raw_scores[c] = -100000.0f;    // class disabled for this test build
+        }
     }
 
     float green_mass = 0.0f;

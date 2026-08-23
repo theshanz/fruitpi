@@ -21,12 +21,22 @@ void assemble_state_28d(
     if (s9 > 1.0f) s9 = 1.0f;
     state[9] = s9;
 
-    for (int i = 0; i < 15; i++) state[10 + i] = acoustic.fft_bins[i];
+    if (ACOUSTIC_FORCE_INVARIANT) {
+        // Must stay identical to sci_28d.cpp / extract_28d.py.
+        const float amp = acoustic.impact_amplitude > IMPACT_AMP_FLOOR
+                              ? acoustic.impact_amplitude
+                              : IMPACT_AMP_FLOOR;
+        const float corr = 2.0f * logf(amp);
+        for (int i = 0; i < 15; i++) {
+            const float fi = FFT_CENTERS[i];
+            state[10 + i] -= corr * (fi * fi) / F2_NORM;
+        }
+        state[26] = 0.0f;
+    } else {
+        for (int i = 0; i < 15; i++) state[10 + i] = acoustic.fft_bins[i];
+        state[26] = acoustic.impact_amplitude;
+    }
     state[25] = acoustic.spectral_entropy;
-
-    // Bias-independent tap strength (peak |sample - window mean|, 0-1) —
-    // MUST match extract_28d.py, which normalizes the same way.
-    state[26] = acoustic.impact_amplitude;
     state[27] = 0.0f;
 }
 

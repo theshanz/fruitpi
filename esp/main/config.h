@@ -99,6 +99,15 @@ constexpr uint32_t LCD_FRAME_MS          = 4;     // min gap between LED frame w
 constexpr uint32_t LCD_ANIM_MS           = 180;   // LCD animation frame interval
 
 // ─── Classifier ───────────────────────────────────────────────────
+// Force-invariant acoustics: subtract 2*ln(amp)*f^2/NORM from each band so
+// tap strength cancels (power was ~amp^2); dim 26 then carries no class
+// signal and is zeroed. Prototypes/models MUST be built with the same flag
+// (extract_28d.py / rules_to_model.py mirror it).
+constexpr bool  ACOUSTIC_FORCE_INVARIANT = true;
+constexpr float IMPACT_AMP_FLOOR         = 0.004f; // div-by-zero guard for weak taps
+// Bit i enables class i: bit0=UNRIPE bit1=PERFECTLY_RIPE bit2=OVERRIPE
+// bit3=ROTTEN_OR_HOLLOW bit4=ARTIFICIALLY_RIPENED. 0x03 = two-class test.
+constexpr uint8_t ACTIVE_CLASS_MASK      = 0x03;
 constexpr float GREEN_MASS_VETO_THRESHOLD   = 0.25f;
 constexpr float ANOMALY_CONFIDENCE_THRESHOLD = 0.35f;
 constexpr float MIN_MASS23 = 10.0f;   // volume^(2/3) normalization range
