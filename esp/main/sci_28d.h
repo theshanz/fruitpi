@@ -1,22 +1,23 @@
 #pragma once
 
 #include <cstdint>
+#include "config.h"
 #include "extract_hues.h"
 #include "piezo_acoustic.h"
 
 constexpr int VECTOR_DIMENSIONS = 28;
 constexpr int NUM_CLASSES = 5;
 
-constexpr int GREEN_BINS_START = 5;
-constexpr int GREEN_BINS_END = 8;
+constexpr int GREEN_BINS_START = 5;  // hue bins 82.5°–120° = green
+constexpr int GREEN_BINS_END   = 8;
 
-constexpr float GREEN_MASS_VETO_THRESHOLD = 0.25f;
-constexpr float ANOMALY_CONFIDENCE_THRESHOLD = 0.35f;
-
-constexpr float MIN_MASS23 = 10.0f;
-constexpr float MAX_MASS23 = 300.0f;
+// Classifier knobs live in config.h (GREEN_MASS_VETO_THRESHOLD,
+// ANOMALY_CONFIDENCE_THRESHOLD, MIN_MASS23, MAX_MASS23).
 
 extern const char* const CLASS_LABELS[NUM_CLASSES];
+
+// Center frequencies (Hz) for the 15 FFT bins used to build state[10..24].
+extern const float FFT_CENTERS[N_FFT_BINS];
 
 struct BiologicalStatus {
     const char* primary_decision;

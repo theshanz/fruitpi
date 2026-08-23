@@ -34,15 +34,12 @@ esp/.piolibdeps/
 esp/.cache/
 esp/compile_commands.json
 esp/extra_script.py
-esp/platformio.ini
 esp/.gitignore
 datacollection/python/__pycache__/
 datacollection/python/samples/scan_002/
 datacollection/esp/platformio.ini
 datacollection/python/samples/
 mango-sorting-system/node_modules/
-esp/main/extract_hues.h
-esp/main/extract_hues.cpp
 datacollection/dataset/Mango/Mango_1785608456/
 datacollection/__pycache__/
 .jcodeignore

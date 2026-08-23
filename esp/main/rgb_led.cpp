@@ -44,6 +44,10 @@ void rgb_led_set(uint8_t r, uint8_t g, uint8_t b) {
             (uint8_t)((uint16_t)b * g_brightness / 255U));
 }
 
+void rgb_led_set_raw(uint8_t r, uint8_t g, uint8_t b) {
+  rgb_write(r, g, b);
+}
+
 void rgb_led_flash_white() {
   rgb_write(g_flash_brightness, g_flash_brightness, g_flash_brightness);
 }

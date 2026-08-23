@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include <driver/adc.h> // rplacing analogRead
+#include "config.h"
 
 // Background task and synchronization includes
 #include <atomic>
@@ -9,18 +9,13 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
-#define FFT_SIZE 512 //Must be 2^N
-#define SAMPLING_FREQ_HZ 8820 //Nyquist = 4410 Hz
-#define N_FFT_BINS 15 //15 28-D vector slots
-#define F2_NORM 441000.0F //Normalization
-#define EPS_LOG 1e-10f
-#define FFT_CLAMP_MIN -10.0f
-#define PRE_TRIGGER_SAMPLES 64
-#define RING_BUFFER_SIZE 1024 // Double FFT_SIZE for ring cache
-#define ARM_TIMEOUT_US 3000000 // 3s
+// All acoustic tunables live in config.h (FFT_SIZE, SAMPLING_FREQ_HZ,
+// N_FFT_BINS, F2_NORM, EPS_LOG, FFT_CLAMP_MIN, PRE_TRIGGER_SAMPLES,
+// RING_BUFFER_SIZE, PIEZO_FLUSH_SAMPLES, TRIGGER_DELTA_MIN, gate params...).
 
 struct AcousticFeatures {
-    float hertzian_adc; //Peak impact voltage
+    float hertzian_adc;       // Peak raw level in window (0-1, legacy/CSV parity)
+    float impact_amplitude;   // Peak |sample - window mean| (0-1) — true tap strength
     float fft_bins[N_FFT_BINS]; //15 f^2 - conditioned log power bins
     float spectral_entropy; //Normalized s.e.
 };
@@ -56,9 +51,25 @@ class PiezoAcoustic {
         volatile uint16_t ring_head = 0;
 
         std::atomic<SamplingState> state{STATE_DISARMED};
-        float trigger_threshold_adc = 0.15f;
+        float trigger_threshold_adc = 0.15f; // min |x - baseline| (deviation, 0-1)
+        uint32_t settle_us = 0;      // ignore triggers this long after arm()
         uint16_t post_trigger_counter = 0;
         uint32_t armed_start_us = 0;
+
+        // Slow ambient baseline for deviation-based triggering. Locked to the
+        // first sample of each session, then EMA-tracked: fast during settle
+        // (absorbs LCD/button burst ring), slow while listening.
+        float baseline = 0.0f;
+
+        // Derivative trigger: detect sharp impulse (high delta) even when
+        // absolute value is below threshold. Fruit taps produce brief spikes
+        // (<200µs) that cross threshold for <2 samples but have high slope.
+        // delta >= 0.015 catches the impulse; the baseline-deviation check
+        // catches strong taps and provides a fallback.
+        float prev_sample_val = 0.0f;
+        float slew_noise_ema = SLEW_NOISE_EMA_INIT;
+        float dev_noise_ema = DEV_NOISE_EMA_INIT;
+        uint16_t samples_since_arm = 0;
 
         TaskHandle_t sampler_task_handle = nullptr;
         SemaphoreHandle_t data_mutex = nullptr;
@@ -73,15 +84,19 @@ class PiezoAcoustic {
         PiezoAcoustic(adc1_channel_t channel = ADC1_CHANNEL_6);
 
         bool init();
-        bool check_impact_detected(float threshold_adc = 0.15f);
-        AcousticFeatures capture_and_process();
-
         void capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_out);
 
-        bool start_arming();
+        // Expose the background sampler's captured 512-sample window (64
+        // pre-trigger + 448 post-trigger) as raw ADC values. Call after
+        // is_data_ready() returns true. Clears the data-ready flag.
+        bool capture_sampler_raw_window(uint16_t raw_out[512], uint16_t* peak_out);
 
         // Continuous Background Recording API
-        void arm(float trigger_threshold = 0.15f);
+        // trigger_threshold_adc is a DEVIATION threshold: |sample - baseline|
+        // (normalized 0-1), not a raw ADC level. settle_us keeps the trigger
+        // masked while post-arm electrical/mechanical ringing decays; the
+        // baseline re-tracks quickly during that window.
+        void arm(float trigger_threshold = 0.02f, uint32_t settle_us = 0);
         void disarm();
         bool is_data_ready();
         AcousticFeatures get_latest_features();

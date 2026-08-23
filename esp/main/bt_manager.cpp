@@ -8,11 +8,16 @@ BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharSca
                          pCharScanResults(nullptr), pCharRawStream(nullptr), store_ref(nullptr),
                          device_connected(false), current_mode(MODE_INFERENCE),
                          capture_image_requested(false), arm_acoustic_requested(false),
-                         cancel_requested(false), threshold_updated(false), new_threshold_val(0.15f),
+                         raw_capture_requested(false), raw_capture_trigger_mode(false), raw_capture_windows(20), cancel_requested(false),
+                         threshold_updated(false), new_threshold_val(0.15f),
                          tx_buf(nullptr), tx_len(0), tx_id(0), tx_type(0), tx_chunks(0), tx_active(false),
-                         tx_last_activity_ms(0), rx_buf(nullptr), rx_len(0), rx_id(0), rx_type(0),
+                         tx_last_activity_ms(0), tx_last_chunk_ms(0), tx_next_seq(0),
+                         tx_resend_range_idx(0), tx_resend_seq(0), rx_buf(nullptr), rx_len(0), rx_id(0), rx_type(0),
                          rx_chunks(0), rx_received_count(0), rx_active(false), rx_last_activity_ms(0),
-                         rx_next_progress_bytes(0), inference_requested(false)
+                         rx_next_progress_bytes(0), inference_requested(false), ms_scan_requested(false),
+                         ms_debug_requested(false), ms_config_requested(false),
+                         ms_cfg_gain_r(1.0f), ms_cfg_gain_g(1.0f), ms_cfg_gain_b(1.0f), ms_cfg_aec(0),
+                         ms_cfg_ambient(true)
 {
     memset(&current_config, 0, sizeof(ScanConfig));
     strncpy(current_config.target_fruit, "Mango", sizeof(current_config.target_fruit) - 1);
@@ -187,9 +192,44 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 {
                     arm_acoustic_requested = true;
                 }
+                else if (strcmp(cmd, "raw_capture") == 0)
+                {
+                    raw_capture_requested = true;
+                    raw_capture_trigger_mode = false;
+                    raw_capture_windows = 20;
+                    if (doc.containsKey("trigger") && doc["trigger"].as<bool>()) {
+                        raw_capture_trigger_mode = true;
+                    }
+                    if (doc.containsKey("windows")) {
+                        raw_capture_windows = doc["windows"].as<uint8_t>();
+                        if (raw_capture_windows < 1) raw_capture_windows = 1;
+                        if (raw_capture_windows > 20) raw_capture_windows = 20;
+                    }
+                }
                 else if (strcmp(cmd, "inference_request") == 0)
                 {
                     inference_requested = true;
+                }
+                else if (strcmp(cmd, "ms_capture") == 0)
+                {
+                    ms_scan_requested = true;
+                }
+                else if (strcmp(cmd, "ms_debug") == 0)
+                {
+                    ms_debug_requested = true;
+                }
+                else if (strcmp(cmd, "ms_config") == 0 &&
+                         doc.containsKey("gain_r") && doc.containsKey("gain_g") && doc.containsKey("gain_b"))
+                {
+                    ms_cfg_gain_r = doc["gain_r"];
+                    ms_cfg_gain_g = doc["gain_g"];
+                    ms_cfg_gain_b = doc["gain_b"];
+                    ms_cfg_aec = doc.containsKey("aec") ? doc["aec"].as<int>() : 0;
+                    ms_cfg_ambient = doc.containsKey("ambient") ? doc["ambient"].as<bool>() : true;
+                    ms_config_requested = true;
+                    Serial.printf("[BTManager] ms_config: gain=(%.2f,%.2f,%.2f) aec=%d ambient=%d\n",
+                                  ms_cfg_gain_r, ms_cfg_gain_g, ms_cfg_gain_b, ms_cfg_aec,
+                                  ms_cfg_ambient ? 1 : 0);
                 }
                 else if (strcmp(cmd, "cancel") == 0)
                 {
@@ -246,7 +286,11 @@ bool BTManager::begin_transfer(uint8_t payload_type, const uint8_t *data, size_t
     tx_type = payload_type;
     tx_chunks = (len + CHUNK_SIZE - 1) / CHUNK_SIZE;
     tx_active = true;
+    tx_next_seq = 0;
+    tx_resend_range_idx = 0;
+    tx_resend_seq = 0;
     tx_last_activity_ms = millis();
+    tx_last_chunk_ms = tx_last_activity_ms;
 
     // Header
     uint8_t hdr[8];
@@ -261,21 +305,8 @@ bool BTManager::begin_transfer(uint8_t payload_type, const uint8_t *data, size_t
     pCharRawStream->setValue(hdr, sizeof(hdr));
     pCharRawStream->notify();
 
-    // First pass: stream every chunk at the paced rate.
-    for (uint16_t seq = 0; seq < tx_chunks; seq++)
-    {
-        send_chunk(seq, (seq == tx_chunks - 1));
-        if (tx_chunks >= 25 && ((seq + 1) % 25 == 0 || seq == tx_chunks - 1))
-        {
-            Serial.printf("[BTManager] TX id:%u %u/%u (%u%%)\n",
-                          tx_id, (unsigned)(seq + 1), (unsigned)tx_chunks,
-                          (unsigned)((seq + 1) * 100 / tx_chunks));
-        }
-        tx_last_activity_ms = millis();
-        delay(inter_chunk_delay_ms());
-    }
-    send_pass_done();
-
+    // Non-blocking: the chunk stream is driven from service_transfer() so the
+    // main loop keeps serving arm/status/raw-capture commands mid-transfer.
     Serial.printf("[BTManager] TX id:%u start: %u chunks (%u payload bytes), %lu ms/chunk.\n",
                   tx_id, (unsigned)tx_chunks, (unsigned)tx_len, (unsigned long)inter_chunk_delay_ms());
     return true;
@@ -320,6 +351,8 @@ void BTManager::handle_resend(uint16_t id, const std::vector<TransferRange> &ran
         return;
     }
     tx_pending_resend = ranges;
+    tx_resend_range_idx = 0;
+    tx_resend_seq = ranges.empty() ? 0 : ranges[0].start;
     tx_last_activity_ms = millis();
 }
 
@@ -334,29 +367,79 @@ void BTManager::handle_transfer_done(uint16_t id)
 void BTManager::service_transfer()
 {
     uint32_t now = millis();
-
-    // Resend requested ranges, then signal the end of the pass.
-    if (tx_active && !tx_pending_resend.empty())
+    if (!tx_active)
     {
-        for (const TransferRange &r : tx_pending_resend)
+        // Receiver timeout: upload stalled mid-way.
+        if (rx_active && (now - rx_last_activity_ms > TRANSFER_TIMEOUT_MS))
         {
-            for (uint16_t seq = r.start; seq <= r.end && seq < tx_chunks; seq++)
-            {
-                send_chunk(seq, (seq == tx_chunks - 1));
-                tx_last_activity_ms = now;
-                delay(inter_chunk_delay_ms());
-            }
+            Serial.println("[BTManager] RX transfer timed out, releasing buffer.");
+            free_rx();
         }
-        tx_pending_resend.clear();
-        send_pass_done();
-        Serial.println("[BTManager] TX resend pass complete.");
+        return;
     }
 
     // Sender timeout: receiver went away without acknowledging.
-    if (tx_active && (now - tx_last_activity_ms > TRANSFER_TIMEOUT_MS))
+    if (now - tx_last_activity_ms > TRANSFER_TIMEOUT_MS)
     {
         Serial.println("[BTManager] TX transfer timed out, releasing buffer.");
         free_tx();
+        return;
+    }
+
+    // Pace to the negotiated BLE connection interval; loop is free between chunks.
+    if (now - tx_last_chunk_ms < inter_chunk_delay_ms())
+        return;
+
+    bool sent = false;
+    // Resend pass has priority over the initial pass.
+    if (!tx_pending_resend.empty())
+    {
+        while (tx_resend_range_idx < tx_pending_resend.size())
+        {
+            const TransferRange &r = tx_pending_resend[tx_resend_range_idx];
+            if (tx_resend_seq <= r.end && tx_resend_seq < tx_chunks)
+            {
+                send_chunk(tx_resend_seq, (tx_resend_seq == tx_chunks - 1));
+                tx_resend_seq++;
+                sent = true;
+                break;
+            }
+            tx_resend_range_idx++;
+            tx_resend_seq = (tx_resend_range_idx < tx_pending_resend.size())
+                               ? tx_pending_resend[tx_resend_range_idx].start : 0;
+        }
+        if (tx_resend_range_idx >= tx_pending_resend.size())
+        {
+            tx_pending_resend.clear();
+            tx_resend_range_idx = 0;
+            tx_resend_seq = 0;
+            send_pass_done();
+            Serial.println("[BTManager] TX resend pass complete.");
+        }
+    }
+    else if (tx_next_seq < tx_chunks)
+    {
+        send_chunk(tx_next_seq, (tx_next_seq == tx_chunks - 1));
+        tx_next_seq++;
+        sent = true;
+        if (tx_chunks >= 25 && (tx_next_seq % 25 == 0 || tx_next_seq == tx_chunks))
+        {
+            Serial.printf("[BTManager] TX id:%u %u/%u (%u%%)\n",
+                          tx_id, (unsigned)tx_next_seq, (unsigned)tx_chunks,
+                          (unsigned)(tx_next_seq * 100 / tx_chunks));
+        }
+        if (tx_next_seq >= tx_chunks)
+        {
+            send_pass_done();
+            Serial.printf("[BTManager] TX id:%u streamed %u chunks.\n",
+                          tx_id, (unsigned)tx_chunks);
+        }
+    }
+
+    if (sent)
+    {
+        tx_last_chunk_ms = now;
+        tx_last_activity_ms = now;
     }
 
     // Receiver timeout: upload stalled mid-way.
@@ -379,6 +462,9 @@ void BTManager::free_tx()
     tx_type = 0;
     tx_chunks = 0;
     tx_active = false;
+    tx_next_seq = 0;
+    tx_resend_range_idx = 0;
+    tx_resend_seq = 0;
     tx_pending_resend.clear();
 }
 
@@ -541,6 +627,38 @@ void BTManager::notify_scan_result(const BiologicalStatus &result)
     pCharScanResults->notify();
 }
 
+void BTManager::notify_ms_features(const ColorFeatures &f)
+{
+    if (!device_connected)
+        return;
+
+    float sum = f.raw_rgb_means[0] + f.raw_rgb_means[1] + f.raw_rgb_means[2];
+    float inv = sum > 1e-6f ? 1.0f / sum : 0.0f;
+
+    StaticJsonDocument<448> doc;
+    doc["status"] = "ms_captured";
+
+    JsonArray hist = doc.createNestedArray("hue_histogram");
+    for (int i = 0; i < 8; i++) hist.add(f.hue_histogram[i]);
+    doc["chromatic_dispersion"] = f.chromatic_dispersion;
+    doc["volume_cm3"] = f.volume_cm3;
+
+    JsonArray means = doc.createNestedArray("raw_rgb_means");
+    for (int i = 0; i < 3; i++) means.add(f.raw_rgb_means[i]);
+
+    JsonArray ratios = doc.createNestedArray("rgb_ratios");
+    for (int i = 0; i < 3; i++) ratios.add(f.raw_rgb_means[i] * inv);
+
+    JsonArray ambient = doc.createNestedArray("ambient_rgb_means");
+    for (int i = 0; i < 3; i++) ambient.add(f.ambient_rgb_means[i]);
+
+    char output[448];
+    size_t len = serializeJson(doc, output);
+
+    pCharScanResults->setValue((uint8_t *)output, len);
+    pCharScanResults->notify();
+}
+
 void BTManager::notify_status_change(const char *status_msg)
 {
     if (!device_connected)
@@ -570,6 +688,12 @@ void BTManager::send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t
         return;
     Serial.println("[BTManager] Streaming Raw Acoustic Impact Waveform over BLE...");
     begin_transfer(PKT_TYPE_RAW_WAVEFORM, (const uint8_t *)raw_adc, 512 * sizeof(uint16_t));
+}
+
+void BTManager::send_ms_debug_jpeg(const uint8_t *jpeg_buf, size_t jpeg_len)
+{
+    Serial.printf("[BTManager] ms_debug: streaming %u byte flash JPEG over BLE...\n", (unsigned)jpeg_len);
+    begin_transfer(PKT_TYPE_JPEG, jpeg_buf, jpeg_len);
 }
 
 bool BTManager::check_inference_request()
