@@ -35,6 +35,7 @@ struct Screen {
 enum class Anim : uint8_t { NONE, SPINNER, BAR };
 
 static Screen base_scr   = {"Fruitipi", "Ready - SCAN"};
+static bool   base_is_idle = true;
 static Screen trans_scr;
 static bool   trans_active = false;
 static uint32_t trans_until = 0;
@@ -46,6 +47,22 @@ static uint8_t   spinner_frame = 0;
 static bool s_quiet = false;               // piezo listening: freeze the bus
 
 static const char SPINNER[4] = {'-', '/', char(0x5C), '|'};
+
+// ─── Idle mascot: 2x2 custom-char mango that blinks ─────────────
+// Four CGRAM slots (0-3); slot 7 stays reserved for the confidence bar.
+// Animation = reloading the two "eye" characters, ~16 bytes per blink,
+// no screen repaint.
+static uint8_t MANGO_TOP_L[8] = {0x00,0x03,0x07,0x0F,0x1F,0x1F,0x1F,0x1F};
+static uint8_t MANGO_TOP_R[8] = {0x00,0x10,0x1C,0x1E,0x1F,0x1F,0x1F,0x1F};
+static const uint8_t MANGO_BOT_L_OPEN[8] =
+  {0x1F,0x1F,0x1F,0x1D,0x1F,0x1F,0x1C,0x0E};          // eye open, grin left
+static const uint8_t MANGO_BOT_R_OPEN[8] =
+  {0x1F,0x1F,0x1F,0x17,0x1F,0x1F,0x07,0x07};          // eye open, grin right
+static const uint8_t MANGO_BOT_L_BLINK[8] =
+  {0x1F,0x1F,0x1F,0x11,0x1F,0x1F,0x1C,0x0E};          // eye = lash line
+static const uint8_t MANGO_BOT_R_BLINK[8] =
+  {0x1F,0x1F,0x1F,0x08,0x1F,0x1F,0x07,0x07};
+static bool    mango_blink = false;
 
 // ─── Low-level write ─────────────────────────────────────────────
 static void paint(const Screen& s) {
@@ -99,9 +116,27 @@ static void set_screen(const char* l1, const char* l2, uint32_t hold_ms,
 static void set_base(const char* l1, const char* l2) {
   strncpy(base_scr.l1, l1 ? l1 : "", 16); base_scr.l1[16] = '\0';
   strncpy(base_scr.l2, l2 ? l2 : "", 16); base_scr.l2[16] = '\0';
+  base_is_idle = false;
   trans_active = false;                    // base replaces anything on screen
   cur_anim = Anim::NONE;
   commit(Where::BASE);
+}
+
+static void set_base_idle() {
+  strncpy(base_scr.l1, "\x02\x03 Fruitipi", 16);  base_scr.l1[16] = '\0';
+  strncpy(base_scr.l2, "\x02\x03 Ready  SCAN", 16); base_scr.l2[16] = '\0';
+  base_is_idle = true;
+  trans_active = false;
+  cur_anim = Anim::NONE;
+  commit(Where::BASE);
+}
+
+// Every end-of-cycle event lands here: base returns to idle FIRST, so no
+// stale guide/listening screen can ever resurface under a transient.
+static void finish_cycle(const char* l1, const char* l2, uint32_t hold_ms,
+                         Anim anim = Anim::NONE, float value = 0.0f) {
+  set_base_idle();
+  set_screen(l1, l2, hold_ms, anim, value);
 }
 
 // Transient screens: shown now, revert to base automatically.
@@ -139,13 +174,18 @@ void lcd_display_init() {
   lcd->init();
   lcd->backlight();
 
+  lcd->createChar(0, MANGO_TOP_L);
+  lcd->createChar(1, MANGO_TOP_R);
+  lcd->createChar(2, const_cast<uint8_t*>(MANGO_BOT_L_OPEN));
+  lcd->createChar(3, const_cast<uint8_t*>(MANGO_BOT_R_OPEN));
+
   // Custom character: solid block used by the confidence bar.
   uint8_t block[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
   lcd->createChar(0xFF & 0x07, block);     // slot 7; we print char(0xFF)
   // NOTE: LiquidCrystal_I2C maps write(0xFF) to CGRAM slot 7 on HD44780.
 
   lcd_ready = true;
-  paint(base_scr);
+  set_base_idle();
 }
 
 void lcd_display_update() {
@@ -155,6 +195,20 @@ void lcd_display_update() {
   if (trans_active && trans_until != 0 && now >= trans_until) {
     trans_active = false;                  // event expired — back to base
     commit(Where::BASE);
+    return;
+  }
+
+  // Idle mascot blink: eyes closed for a beat every couple of seconds.
+  if (!trans_active && base_is_idle) {
+    uint32_t interval = mango_blink ? 160UL : 1400UL;
+    if (now - last_anim_ms >= interval) {
+      last_anim_ms = now;
+      mango_blink = !mango_blink;
+      lcd->createChar(2, const_cast<uint8_t*>(mango_blink ? MANGO_BOT_L_BLINK
+                                                          : MANGO_BOT_L_OPEN));
+      lcd->createChar(3, const_cast<uint8_t*>(mango_blink ? MANGO_BOT_R_BLINK
+                                                          : MANGO_BOT_R_OPEN));
+    }
     return;
   }
 
@@ -182,15 +236,16 @@ void lcd_place_on_piezo()   { set_base("Put fruit on", "piezo + SCAN"); }
 // Transient events — always auto-revert to the held state above.
 void lcd_connected()        { flash("BLE", "Connected", CUE_HOLD_MS); }
 void lcd_disconnected()     { flash("BLE lost", nullptr, CUE_HOLD_MS); }
-void lcd_tap_ok()           { set_screen("Tap captured!", "Analyzing...", RESULT_HOLD_MS, Anim::SPINNER); }
+void lcd_tap_ok()           { finish_cycle("Tap captured!", "Analyzing...", RESULT_HOLD_MS, Anim::SPINNER); }
 void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100) {
   char l1[17];
   strncpy(l1, decision ? decision : "RESULT", 16); l1[16] = '\0';
+  set_base_idle();                         // scan cycle over — base goes idle
   if (is_anomaly) set_screen(l1, "ANOMALY!", RESULT_HOLD_MS, Anim::BAR, 0.0f);
   else            set_screen(l1, "", RESULT_HOLD_MS, Anim::BAR,
                              confidence_0_100 / 100.0f);
 }
-void lcd_timeout()          { flash("No tap", "SCAN again", RESULT_HOLD_MS); }
-void lcd_placement_timeout(){ flash("Waiting...", "Timed out", RESULT_HOLD_MS); }
-void lcd_camera_error()     { flash("Camera error!", "SCAN to retry", RESULT_HOLD_MS); }
+void lcd_timeout()          { finish_cycle("No tap", "SCAN again", RESULT_HOLD_MS); }
+void lcd_placement_timeout(){ finish_cycle("Waiting...", "Timed out", RESULT_HOLD_MS); }
+void lcd_camera_error()     { finish_cycle("Camera error!", "SCAN to retry", RESULT_HOLD_MS); }
 #endif
