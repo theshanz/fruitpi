@@ -39,6 +39,12 @@ constexpr uint32_t ARM_SETTLE_MS  = 800;    // ignore triggers this long after a
 constexpr uint32_t ARM_TIMEOUT_MS = 5000;   // auto-disarm when no tap arrives
 constexpr uint32_t ARM_TIMEOUT_US = ARM_TIMEOUT_MS * 1000UL;
 
+// Data-collection arming runs a visible placement countdown first: the piezo
+// is kept DISARMED while the user puts the fruit on it, so the placement
+// itself can never register as a tap. When the countdown ends the sampler
+// arms and the screen flips to "TAP NOW".
+constexpr uint32_t PLACE_GRACE_MS = 3000;
+
 constexpr float PIEZO_DEFAULT_THRESHOLD = 0.02f; // min |x−baseline| deviation;
                                      // real fruit taps measure ~0.02–0.07.
                                      // BLE set_threshold overrides at runtime.

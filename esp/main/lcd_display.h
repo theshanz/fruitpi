@@ -10,7 +10,8 @@ void lcd_set_quiet(bool quiet);     // true = freeze bus (piezo listening)
 void lcd_connected();
 void lcd_disconnected();
 void lcd_disarmed();
-void lcd_armed();
+void lcd_armed();                  // "TAP fruit!" — listening starts
+void lcd_countdown(uint8_t sec);   // "TAP in Ns" — placement grace
 void lcd_tap_ok();
 void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100);
 void lcd_timeout();
@@ -27,6 +28,7 @@ inline void lcd_connected() {}
 inline void lcd_disconnected() {}
 inline void lcd_disarmed() {}
 inline void lcd_armed() {}
+inline void lcd_countdown(uint8_t) {}
 inline void lcd_tap_ok() {}
 inline void lcd_result(const char*, bool, float) {}
 inline void lcd_timeout() {}

@@ -53,6 +53,23 @@ static bool button_pressed_edge(PhysicalButton &btn, uint32_t now) {
 
 static PhysicalButton scan_btn = {SCAN_BUTTON_PIN, false, 0};
 
+// Data-collection arming: visible placement countdown first (piezo fully
+// disarmed while the fruit is placed), then real listening.
+enum class ArmStage : uint8_t { IDLE, GRACE, LISTENING };
+static ArmStage    s_arm_stage = ArmStage::IDLE;
+static uint32_t    s_grace_end_ms = 0;
+static uint8_t     s_grace_shown_sec = 0;
+
+static void begin_placement_grace(float threshold) {
+  (void)threshold;
+  s_arm_stage = ArmStage::GRACE;
+  s_grace_end_ms = millis() + PLACE_GRACE_MS;
+  s_grace_shown_sec = (PLACE_GRACE_MS + 999UL) / 1000UL;
+  lcd_countdown(s_grace_shown_sec);
+  led_pet_place_on_piezo();
+  bt.notify_status_change("place_fruit");
+}
+
 // CANCEL via GPIO ISR: while armed, the sampler busy-waits at high priority
 // on Core 1 and starves loop(), so a polled cancel button would be dead
 // exactly when needed. Debounced at the consumer below.
@@ -78,6 +95,7 @@ static void cancel_scan() {
   placement_start_at = 0;
   scan_requested = false;
   scan_start_at = 0;
+  s_arm_stage = ArmStage::IDLE;
   acoustic_sensor.disarm();
   if (was_active) {
     bt.notify_status_change("disarmed");
@@ -249,12 +267,30 @@ void loop() {
   /// ── 5. Data collection: SCAN arms the piezo for a streamed tap ───
   if (scan_requested && mode == MODE_DATA_COLLECTION) {
     scan_requested = false;
-    if (acoustic_sensor.get_state() == STATE_DISARMED) {
+    if (acoustic_sensor.get_state() == STATE_DISARMED &&
+        s_arm_stage != ArmStage::GRACE) {
+      begin_placement_grace(dynamic_adc_threshold);
+      Serial.printf("[Button] ARM — place fruit, TAP in %us\n",
+                    (unsigned)(PLACE_GRACE_MS / 1000));
+    }
+  }
+
+  // Grace expiry: placement window over — arm for real and say so.
+  if (s_arm_stage == ArmStage::GRACE) {
+    uint32_t left_ms = s_grace_end_ms - current_time;
+    uint8_t sec_left = (uint8_t)((left_ms + 999UL) / 1000UL);
+    if (sec_left != s_grace_shown_sec && sec_left > 0) {
+      s_grace_shown_sec = sec_left;
+      lcd_countdown(sec_left);           // bus is free: piezo still disarmed
+    }
+    if (current_time >= s_grace_end_ms) {
+      s_arm_stage = ArmStage::LISTENING;
       is_acoustic_armed = true;
       arm_start_time = current_time;
       lcd_armed();                       // burst BEFORE arming (see helper)
       start_acoustic_listening(dynamic_adc_threshold);
-      Serial.printf("[Button] ARM (thresh=%.2f) — tap now\n",
+      led_pet_armed();
+      Serial.printf("[Acoustic] ARM (thresh=%.2f) — TAP NOW\n",
                     dynamic_adc_threshold);
       bt.notify_status_change("acoustic_armed");
     }
@@ -408,13 +444,11 @@ void loop() {
 
   /// ── 8. BLE arm request (data collection) ─────────────────────────
   if (bt.check_arm_acoustic_request()) {
-    if (acoustic_sensor.get_state() == STATE_DISARMED) {
-      is_acoustic_armed = true;
-      arm_start_time = current_time;
-      lcd_armed();                       // burst BEFORE arming
-      start_acoustic_listening(dynamic_adc_threshold);
-      Serial.printf("[Acoustic] ARM (thresh=%.2f)\n", dynamic_adc_threshold);
-      bt.notify_status_change("acoustic_armed");
+    if (acoustic_sensor.get_state() == STATE_DISARMED &&
+        s_arm_stage != ArmStage::GRACE) {
+      begin_placement_grace(dynamic_adc_threshold);
+      Serial.printf("[Acoustic] ARM — grace %us, then listen\n",
+                    (unsigned)(PLACE_GRACE_MS / 1000));
     } else {
       bt.notify_status_change("acoustic_already_armed");
     }

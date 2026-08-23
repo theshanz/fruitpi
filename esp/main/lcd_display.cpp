@@ -170,7 +170,12 @@ void lcd_display_update() {
 
 // Held states — the device's answer to "what are you waiting for?"
 void lcd_disarmed()         { set_base("Ready", "SCAN to arm"); }
-void lcd_armed()            { set_base("Listening...", "TAP fruit!"); }
+void lcd_armed()            { set_base("Listening...", "TAP NOW!"); }
+void lcd_countdown(uint8_t sec) {
+  char l2[17];
+  snprintf(l2, sizeof(l2), "TAP in %us", (unsigned)sec);
+  set_base("Place fruit", l2);
+}
 void lcd_place_fruit()      { set_base("Hold fruit up", "to camera..."); }
 void lcd_place_on_piezo()   { set_base("Put fruit on", "piezo + SCAN"); }
 
