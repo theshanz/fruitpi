@@ -104,6 +104,71 @@ static void cancel_scan() {
   }
 }
 
+// ─── Model selector (hold START to open, CANCEL anywhere leaves) ──
+static bool    s_menu_open = false;
+static uint8_t s_menu_idx = 0;
+
+// Default/idle screens always carry the active model badge.
+static void refresh_default_screen() {
+  lcd_set_active_model(store.has_model() ? store.get_loaded_fruit_name()
+                                         : nullptr);
+  lcd_idle();
+}
+
+static void draw_model_menu() {
+  uint8_t count = store.model_count();
+  char name[MAX_MODEL_NAME_LEN] = "?";
+  store.model_name_at(s_menu_idx, name);
+  lcd_menu(name, s_menu_idx, count, store.active_index());
+}
+
+static void open_model_menu() {
+  uint8_t count = store.model_count();
+  if (count == 0) {
+    lcd_flash("No models!", "Save via app");
+    Serial.println("[Menu] Selector empty — save models over BLE first");
+    return;
+  }
+  s_menu_open = true;
+  uint8_t act = store.active_index();
+  s_menu_idx = (act != 0xFF) ? act : 0;
+  draw_model_menu();
+  lcd_flash("SELECT MODEL", "SCN nxt CNC exit");
+  Serial.printf("[Menu] Model selector open (%u models)\n", count);
+}
+
+static void close_model_menu(bool cancelled) {
+  s_menu_open = false;
+  refresh_default_screen();
+  if (cancelled) lcd_flash("Cancelled", nullptr);
+  Serial.println("[Menu] Selector closed");
+}
+
+static void commit_menu_selection() {
+  if (!s_menu_open || s_menu_idx >= store.model_count()) return;
+  char name[MAX_MODEL_NAME_LEN] = "?";
+  store.model_name_at(s_menu_idx, name);
+  if (store.activate_by_index(s_menu_idx)) {
+    s_menu_open = false;
+    refresh_default_screen();
+    lcd_flash("Selected:", name);
+    bt.notify_status_change("model_activated");
+    Serial.printf("[Menu] Activated '%s'\n", name);
+  } else {
+    lcd_flash("Select failed", nullptr);
+  }
+}
+
+// HOLD CANCEL anywhere: forget the persisted choice + unload from RAM.
+static void reset_model_selection() {
+  cancel_scan();
+  store.clear_active();
+  refresh_default_screen();
+  if (s_menu_open) { draw_model_menu(); lcd_flash("Reset — none", "active"); }
+  else             { lcd_flash("Model cleared", nullptr); }
+  bt.notify_status_change("model_cleared");
+}
+
 static void handle_laptop_capture_image_only() {
   Serial.println("[Laptop] Direct Camera Image Request...");
   if (!is_camera_ready()) {
@@ -196,6 +261,8 @@ void setup() {
     while (1) ;
   }
   store.init();
+  refresh_default_screen();              // badge the idle screen if a model
+                                         // survived in NVS
   multispectral_load_calibration();
   bt.init("Fruitipi", &store);
 }
@@ -225,36 +292,78 @@ void loop() {
                   dynamic_adc_threshold);
   }
 
-  /// ── 3. Inference triggers: BOOT button + BLE request ─────────────
-  static uint32_t last_btn_ms = 0;
-  static bool last_btn_state = HIGH;
+  /// ── 3. START button: tap = run inference, hold = model selector ──
+  static bool     start_prev = false;
+  static uint32_t start_press_ms = 0;
+  static bool     start_hold_done = false;
   bool boot_trigger = false;
 
-  bool btn_now = (digitalRead(BOOT_BUTTON_PIN) == LOW);
-  if (btn_now && !last_btn_state &&
-      (current_time - last_btn_ms >= BUTTON_DEBOUNCE_MS)) {
-    boot_trigger = true;                 // one press = one inference run
-    last_btn_ms = current_time;
+  bool start_now = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+  if (start_now && !start_prev) {
+    start_press_ms = current_time;
+    start_hold_done = false;
   }
-  last_btn_state = btn_now;
+  if (start_now && !start_hold_done &&
+      current_time - start_press_ms >= MENU_HOLD_MS) {
+    start_hold_done = true;              // long press consumed, never a tap
+    if (s_menu_open) commit_menu_selection();   // hold again = use browsed
+    else             open_model_menu();
+  }
+  if (!start_now && start_prev && !start_hold_done &&
+      current_time - start_press_ms >= BUTTON_DEBOUNCE_MS) {
+    boot_trigger = true;                 // clean short tap = one inference run
+  }
+  start_prev = start_now;
 
-  if (bt.check_inference_request() && mode == MODE_INFERENCE) {
+  if (bt.check_inference_request() && mode == MODE_INFERENCE && !s_menu_open) {
     boot_trigger = true;
   }
 
   /// ── 4. Physical SCAN / CANCEL buttons ────────────────────────────
   if (button_pressed_edge(scan_btn, current_time)) {
-    scan_requested = true;
-    Serial.println("[Button] SCAN pressed");
+    if (s_menu_open) {
+      // In the selector: SCAN advances through stored models.
+      uint8_t count = store.model_count();
+      if (count > 0) {
+        s_menu_idx = (uint8_t)((s_menu_idx + 1) % count);
+        draw_model_menu();
+        Serial.printf("[Button] SCAN cycles -> model %u\n", s_menu_idx);
+      }
+    } else {
+      scan_requested = true;
+      Serial.println("[Button] SCAN pressed");
+    }
   }
+
+  // CANCEL works everywhere. The ISR only stamps the press; the verdict
+  // waits here so a press can grow into a hold (= selection reset). A
+  // short tap cancels whatever is running / closes the selector.
+  static bool     cancel_pending = false;
+  static uint32_t cancel_press_ms = 0;
+  static bool     cancel_hold_done = false;
+  static uint32_t last_cancel_ms = 0;
   if (s_isr_cancel) {
     s_isr_cancel = false;
-    static uint32_t last_isr_cancel_ms = 0;
-    if (current_time - last_isr_cancel_ms >= BUTTON_DEBOUNCE_MS) {
-      last_isr_cancel_ms = current_time;
-      Serial.println("[Button] CANCEL pressed");
-      cancel_scan();
+    if (!cancel_pending && current_time - last_cancel_ms >= BUTTON_DEBOUNCE_MS) {
+      cancel_pending = true;
+      cancel_press_ms = current_time;
+      cancel_hold_done = false;
+      last_cancel_ms = current_time;
     }
+  }
+  if (cancel_pending) {
+    const bool cancel_down = digitalRead(CANCEL_BUTTON_PIN) == HIGH;
+    if (cancel_down && !cancel_hold_done &&
+        current_time - cancel_press_ms >= MENU_HOLD_MS) {
+      cancel_hold_done = true;
+      reset_model_selection();           // held long enough: wipe selection
+    }
+    if (!cancel_down && !cancel_hold_done) {
+      Serial.println("[Button] CANCEL pressed");
+      cancel_scan();                     // stop any run first...
+      if (s_menu_open) close_model_menu(true);  // ...then leave the selector
+    }
+    if (!cancel_down) cancel_pending = false;   // released — verdict served
   }
 
   bt.service_transfer();
@@ -298,7 +407,17 @@ void loop() {
 
   /// ── 6. Inference guide flow ───────────────────────────────────────
   bool guide_trigger =
-      (boot_trigger || scan_requested) && mode == MODE_INFERENCE;
+      (boot_trigger || scan_requested) && mode == MODE_INFERENCE &&
+      !s_menu_open;                      // selector owns the buttons meanwhile
+
+  // Nothing to classify without an active model — point at the selector.
+  if (guide_trigger && !store.has_model()) {
+    guide_trigger = false;
+    scan_requested = false;
+    Serial.println("[Guide] No active model — hold START to select one");
+    lcd_flash("No model!", "HOLD START");
+    bt.notify_status_change("no_model");
+  }
 
   // Step A — placement confirmed: second press arms the piezo.
   if (guide_trigger && awaiting_placement) {
@@ -355,17 +474,20 @@ void loop() {
       led_pet_tap_ok();
 
       float state[28];
-      assemble_state_28d(state, ms_features_pending, features);
-#if defined(SCI_28D_HARDCODED)
-      static Fruit28D dummy_model = {};  // rule engine ignores stored models
-      BiologicalStatus status = evaluate_fruit_single(state, dummy_model);
-#else
+      assemble_state_28d(state, ms_features_pending, features);  // force-invariant 28-D
       const Fruit28D *model = store.get_active_model_ptr();
-      BiologicalStatus status = evaluate_fruit_single(state, *model);
-#endif
-      bt.notify_scan_result(status);
-      led_pet_result(status.primary_decision, status.is_anomaly);
-      lcd_result(status.primary_decision, status.is_anomaly, status.confidence);
+      if (!model) {
+        // Selection vanished mid-run (BLE delete / held-CANCEL reset).
+        Serial.println("[Guide] No active model — run aborted");
+        bt.notify_status_change("no_model");
+        led_pet_timeout();
+      } else {
+        BiologicalStatus status = evaluate_fruit_single(state, *model);
+        bt.notify_scan_result(status);
+        led_pet_result(status.primary_decision, status.is_anomaly);
+        lcd_result(status.primary_decision, status.is_anomaly,
+                   status.confidence);
+      }
       tap_capture_running = false;
       have_ms_features = false;
     }

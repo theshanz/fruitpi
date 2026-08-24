@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 from datetime import datetime
@@ -21,6 +22,70 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from bleak import BleakClient, BleakScanner
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rules_engine as R  # human rule-space -> 28-D model builder
+
+# ─── UI palette (single source for ttk + classic-tk + matplotlib) ─────
+UI_BG     = "#1e1f22"
+UI_CARD   = "#2b2d31"
+UI_FIELD  = "#141517"
+UI_FG     = "#e8e8e8"
+UI_DIM    = "#a5a5a5"
+UI_ACCENT = "#4f9cf9"
+UI_BORDER = "#3a3d42"
+
+
+class DarkSlider(tk.Canvas):
+    """Flat canvas-drawn slider — immune to ttk/clam theme quirks.
+    Fires command(str_value) on click/drag; .set(v) works like tk.Scale."""
+    TRACK_H, KNOB_R = 6, 9
+
+    def __init__(self, master, from_, to, resolution=1.0, command=None, **kw):
+        super().__init__(master, height=28, highlightthickness=0,
+                         bg=UI_CARD, bd=0, **kw)
+        self.lo, self.hi, self.res, self.cmd = from_, to, resolution, command
+        self._value = from_
+        self.bind("<Button-1>", self._pick)
+        self.bind("<B1-Motion>", self._pick)
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def _x_to_val(self, x):
+        w = max(self.winfo_width() - 2 * self.KNOB_R, 1)
+        frac = min(max((x - self.KNOB_R) / w, 0.0), 1.0)
+        v = self.lo + frac * (self.hi - self.lo)
+        v = round(v / self.res) * self.res
+        return min(max(v, self.lo), self.hi)
+
+    def _pick(self, e):
+        self.set(self._x_to_val(e.x))
+
+    def set(self, v):
+        v = min(max(float(v), self.lo), self.hi)
+        v = round(v / self.res) * self.res
+        changed = abs(v - self._value) > 1e-9
+        self._value = v
+        self._draw()
+        if changed and self.cmd:
+            self.cmd(f"{v:.6g}")
+
+    def get(self):
+        return self._value
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), int(self.winfo_height())
+        if w < 4:
+            return
+        y = h // 2
+        frac = (self._value - self.lo) / (self.hi - self.lo or 1)
+        x = self.KNOB_R + frac * (w - 2 * self.KNOB_R)
+        self.create_rectangle(self.KNOB_R, y - self.TRACK_H // 2, w - self.KNOB_R,
+                              y + self.TRACK_H // 2, fill=UI_FIELD, width=0)
+        self.create_rectangle(self.KNOB_R, y - self.TRACK_H // 2, x,
+                              y + self.TRACK_H // 2, fill=UI_ACCENT, width=0)
+        self.create_oval(x - self.KNOB_R, y - self.KNOB_R, x + self.KNOB_R,
+                         y + self.KNOB_R, fill=UI_FG, outline=UI_CARD)
 
 # ─── BLE UUID DEFINITIONS ──────────────────────────────────────────
 SERVICE_UUID             = "4fa10001-2241-4cf5-9988-34824317f012"
@@ -43,7 +108,7 @@ VECTOR_DIMENSIONS = 28
 CLASS_LABELS = ["UNRIPE", "PERFECTLY_RIPE", "OVERRIPE", "ROTTEN_OR_HOLLOW", "ARTIFICIALLY_RIPENED"]
 
 FFT_CENTERS = np.array([150, 250, 350, 450, 550, 650, 750, 850, 950, 1100, 1300, 1500, 1700, 1900, 2100], dtype=np.float64)
-F2_NORM = 4410000.0
+F2_NORM = 441000.0  # MUST match firmware config.h (was 4410000 — 10x off)
 EPS_LOG = 1e-10
 FFT_CLAMP_MIN = -10.0
 
@@ -275,6 +340,62 @@ class FruitStudioGUI:
         style = ttk.Style()
         style.theme_use("clam")
 
+        # ─── Dark palette ──────────────────────────────────────────────
+        BG      = "#1e1f22"   # window
+        CARD    = "#2b2d31"   # labelframes / panels
+        FIELD   = "#141517"   # entries, lists, text
+        FG      = "#e8e8e8"
+        FG_DIM  = "#a5a5a5"
+        ACCENT  = "#4f9cf9"
+        BORDER  = "#3a3d42"
+
+        self.root.configure(background=BG)
+        style.configure(".", background=BG, foreground=FG, fieldbackground=FIELD,
+                        bordercolor=BORDER, lightcolor=CARD, darkcolor=BG)
+        style.configure("TFrame", background=BG)
+        style.configure("TLabelframe", background=CARD, bordercolor=BORDER,
+                        lightcolor=CARD, darkcolor=CARD)
+        style.configure("TLabelframe.Label", background=CARD, foreground=ACCENT,
+                        font=("Arial", 10, "bold"))
+        style.configure("TLabel", background=CARD, foreground=FG)
+        style.configure("TButton", background="#383b40", foreground=FG,
+                        bordercolor=BORDER)
+        style.map("TButton",
+                  background=[("active", ACCENT), ("pressed", "#3b82f6")],
+                  foreground=[("active", "#ffffff")])
+        style.configure("TEntry", fieldbackground=FIELD, foreground=FG,
+                        insertcolor=FG, bordercolor=BORDER)
+        style.configure("TSpinbox", fieldbackground=FIELD, foreground=FG,
+                        insertcolor=FG, arrowcolor=FG, bordercolor=BORDER)
+        style.configure("TRadiobutton", background=CARD, foreground=FG,
+                        indicatorbackground=FIELD, indicatorforeground=ACCENT,
+                        indicatorborder=BORDER, indicatormargin=(6, 4, 6, 4))
+        style.map("TRadiobutton",
+                  background=[("active", CARD)],
+                  foreground=[("selected", ACCENT)],
+                  indicatorbackground=[("selected", ACCENT)],
+                  indicatorforeground=[("selected", "#ffffff")])
+        style.configure("TCheckbutton", background=CARD, foreground=FG,
+                        indicatorbackground=FIELD, indicatorforeground=ACCENT,
+                        indicatorborder=BORDER, indicatormargin=(6, 4, 6, 4))
+        style.map("TCheckbutton",
+                  background=[("active", CARD)],
+                  foreground=[("selected", ACCENT)],
+                  indicatorbackground=[("selected", ACCENT)],
+                  indicatorforeground=[("selected", "#ffffff")])
+        style.configure("TScale", background=CARD, troughcolor=FIELD,
+                        bordercolor=BORDER)
+        style.configure("TProgressbar", troughcolor="#26272b", background=ACCENT,
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+        style.configure("TPanedwindow", background=BG, bordercolor=BG)
+        style.configure("TNotebook", background=BG, bordercolor=BG)
+        style.configure("TNotebook.Tab", background="#26272b", foreground=FG_DIM,
+                        padding=(14, 6))
+        style.map("TNotebook.Tab",
+                  background=[("selected", CARD)],
+                  foreground=[("selected", ACCENT)])
+        style.configure("TSeparator", background=BORDER)
+
         # Top Bar
         top_frame = ttk.Frame(self.root, padding=10)
         top_frame.pack(fill=tk.X)
@@ -291,19 +412,55 @@ class FruitStudioGUI:
 
         self.tab_collector = ttk.Frame(self.notebook)
         self.tab_trainer = ttk.Frame(self.notebook)
+        self.tab_rules = ttk.Frame(self.notebook)
         self.tab_ble_mgr = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_collector, text="Data Collection & Live Preview")
         self.notebook.add(self.tab_trainer, text="Calibration")
+        self.notebook.add(self.tab_rules, text="Rules Builder")
         self.notebook.add(self.tab_ble_mgr, text="Calibration Manager")
 
         self.setup_collector_tab()
         self.setup_trainer_tab()
+        self.setup_rules_tab()
         self.setup_ble_mgr_tab()
 
+        # Classic-tk widgets the ttk engine can't style.
+        for w in (self.listbox_models, self.txt_train_log, self.txt_rules_raw):
+            try:
+                w.configure(bg=FIELD, fg=FG, insertbackground=FG,
+                            selectbackground=ACCENT, selectforeground="#ffffff",
+                            highlightthickness=0, bd=0, relief=tk.FLAT)
+            except tk.TclError:
+                pass
+
         # Bottom Console Log Bar
-        self.lbl_log = ttk.Label(self.root, text="Ready.", relief=tk.SUNKEN, anchor=tk.W)
+        self.lbl_log = ttk.Label(self.root, text="Ready.", relief=tk.FLAT,
+                                 anchor=tk.W, background="#141517", foreground=FG_DIM)
         self.lbl_log.pack(fill=tk.X, side=tk.BOTTOM, padx=5, pady=2)
+
+        self._apply_dark_matplotlib()
+
+    def _apply_dark_matplotlib(self):
+        """Re-paint every live figure to match the dark UI."""
+        PANEL, TXT, GRID = UI_CARD, "#c9c9c9", "#43464c"
+        for fig in (getattr(self, "fig", None), getattr(self, "fig_rules", None),
+                    getattr(self, "fig_hue", None)):
+            if fig is None:
+                continue
+            fig.patch.set_facecolor(PANEL)
+            for a in fig.axes:
+                a.set_facecolor(PANEL)
+                a.tick_params(colors=TXT)
+                for spine in a.spines.values():
+                    spine.set_color("#555")
+                a.xaxis.label.set_color(TXT)
+                a.yaxis.label.set_color(TXT)
+                if a.get_title():
+                    a.title.set_color("#e8e8e8")
+                if a.get_xgridlines():          # recolor, don't force-on
+                    a.grid(True, color=GRID, lw=0.6)
+                    a.set_axisbelow(True)
 
     # ─── TAB 1: DATA COLLECTOR & LIVE PREVIEW ───────────────────────
     def setup_collector_tab(self):
@@ -345,14 +502,17 @@ class FruitStudioGUI:
         self.lbl_capture_pct.grid(row=13, column=0, columnspan=2, pady=2)
         ttk.Button(left, text="Arm & Record Acoustic Tap", command=self.arm_tap).grid(row=14, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
         ttk.Button(left, text="Cancel Arming", command=self.cancel_arm).grid(row=15, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Capture Hue (camera scan)", command=self.capture_hue).grid(row=16, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        self.lbl_hue_state = ttk.Label(left, text="Hue: not captured yet", foreground="#a5a5a5")
+        self.lbl_hue_state.grid(row=17, column=0, columnspan=2, pady=1)
 
-        ttk.Separator(left, orient=tk.HORIZONTAL).grid(row=16, column=0, columnspan=2, sticky=tk.EW, pady=10) # FIXED
+        ttk.Separator(left, orient=tk.HORIZONTAL).grid(row=18, column=0, columnspan=2, sticky=tk.EW, pady=10) # FIXED
 
-        self.lbl_counts = ttk.Label(left, text="Pictures: 0 | Taps: 0", font=("Arial", 10, "bold"))
-        self.lbl_counts.grid(row=17, column=0, columnspan=2, pady=4)
+        self.lbl_counts = ttk.Label(left, text="Pictures: 0 | Taps: 0 | Hue: no", font=("Arial", 10, "bold"))
+        self.lbl_counts.grid(row=19, column=0, columnspan=2, pady=4)
 
-        ttk.Button(left, text="Save Sample Session", command=self.save_session).grid(row=18, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
-        ttk.Button(left, text="Clear Session", command=self.clear_session).grid(row=19, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Save Sample Session", command=self.save_session).grid(row=20, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
+        ttk.Button(left, text="Clear Session", command=self.clear_session).grid(row=21, column=0, columnspan=2, sticky=tk.EW, pady=4) # FIXED
 
         # Right Previews
         right = ttk.Frame(pane)
@@ -360,9 +520,18 @@ class FruitStudioGUI:
 
         card_img = ttk.LabelFrame(right, text=" Camera Preview ", padding=5)
         card_img.pack(fill=tk.BOTH, expand=True, side=tk.TOP, pady=5)
-        self.canvas_img = tk.Canvas(card_img, bg="#222222", height=220)
+        self.canvas_img = tk.Canvas(card_img, bg="#222222", height=220,
+                                    highlightthickness=0, bd=0)
         self.canvas_img.pack(fill=tk.BOTH, expand=True)
         self.canvas_img.bind("<Configure>", self._on_preview_resize)
+
+        card_hue = ttk.LabelFrame(right, text=" Skin Colour (hue histogram from device scan) ", padding=5)
+        card_hue.pack(fill=tk.X, side=tk.TOP, pady=5)
+        self.fig_hue = Figure(figsize=(5, 1.8), dpi=100)
+        self.ax_hue = self.fig_hue.add_subplot(111)
+        self.ax_hue.set_title("No hue capture yet", fontsize=9)
+        self.canvas_hue_fig = FigureCanvasTkAgg(self.fig_hue, master=card_hue)
+        self.canvas_hue_fig.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         card_graph = ttk.LabelFrame(right, text=" Acoustic Impact Waveform ", padding=5)
         card_graph.pack(fill=tk.BOTH, expand=True, side=tk.BOTTOM, pady=5)
@@ -373,6 +542,9 @@ class FruitStudioGUI:
         self.ax.grid(True)
         self.canvas_graph = FigureCanvasTkAgg(self.fig, master=card_graph)
         self.canvas_graph.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.last_hue_features = None
+        self._apply_dark_matplotlib()
 
     # ─── TAB 2: CALIBRATION ─────────────────────────────────────────
     def setup_trainer_tab(self):
@@ -504,15 +676,272 @@ class FruitStudioGUI:
 
         return W, b
 
-    def pack_model_binary(self, fruit_name, W, b):
+    def pack_model_binary(self, fruit_name, W, b, mask=0x1F):
+        """Pack a trained model (all 5 classes by default) into the 616-byte
+        wire format with the active-class mask byte at offset 612."""
         name_bytes = fruit_name.encode('utf-8').ljust(32, b'\x00')[:32]
         w_flat = W.T.flatten().astype(np.float32)
         b_flat = b.astype(np.float32)
-        return name_bytes + w_flat.tobytes() + b_flat.tobytes()
+        return (name_bytes + w_flat.tobytes() + b_flat.tobytes() +
+                bytes([mask & 0xFF, 0, 0, 0]))
 
     def log_train(self, text):
         self.txt_train_log.insert(tk.END, f"{text}\n")
         self.txt_train_log.see(tk.END)
+
+    # ─── TAB 2b: RULES BUILDER — human knobs -> model ───────────────
+    def setup_rules_tab(self):
+        self.rules_knobs = {lab: dict(R.PRESETS[lab]) for lab in R.CLASS_LABELS}
+        self.rules_enabled = {lab: tk.BooleanVar(value=lab in R.DEFAULT_ENABLED)
+                              for lab in R.CLASS_LABELS}
+        self.rules_current = R.DEFAULT_ENABLED[0]
+
+        pane = ttk.PanedWindow(self.tab_rules, orient=tk.HORIZONTAL)
+        pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # ── Left: categories + build actions ─────────────────────────
+        left = ttk.Frame(pane); pane.add(left, weight=1)
+        card_cat = ttk.LabelFrame(left, text=" Categories in this model ", padding=10)
+        card_cat.pack(fill=tk.X, pady=6)
+        ttk.Label(card_cat, text="Tick = included. Select = edit knobs.").pack(anchor=tk.W)
+        for lab in R.CLASS_LABELS:
+            row = ttk.Frame(card_cat); row.pack(fill=tk.X, pady=2)
+            ttk.Checkbutton(row, variable=self.rules_enabled[lab],
+                            command=self._rules_log_summary).pack(side=tk.LEFT)
+            ttk.Radiobutton(row, text=lab, value=lab,
+                            variable=self._rules_sel_var(),
+                            command=self._rules_load_sliders).pack(side=tk.LEFT)
+
+        card_out = ttk.LabelFrame(left, text=" Build & Deploy ", padding=10)
+        card_out.pack(fill=tk.X, pady=6)
+        name_row = ttk.Frame(card_out); name_row.pack(fill=tk.X, pady=2)
+        ttk.Label(name_row, text="Fruit:").pack(side=tk.LEFT)
+        self.entry_rules_fruit = ttk.Entry(name_row, width=14)
+        self.entry_rules_fruit.insert(0, "Mango")
+        self.entry_rules_fruit.pack(side=tk.LEFT, padx=4)
+        ttk.Label(name_row, text="Temp:").pack(side=tk.LEFT, padx=(8, 0))
+        self.spin_rules_temp = ttk.Spinbox(name_row, from_=0.5, to=10.0,
+                                           increment=0.5, width=5)
+        self.spin_rules_temp.set(2.0)
+        self.spin_rules_temp.pack(side=tk.LEFT, padx=4)
+        ttk.Button(card_out, text="Build & Upload to Device",
+                   command=lambda: self._rules_build(upload=True)).pack(fill=tk.X, pady=3)
+        ttk.Button(card_out, text="Build .bin Only",
+                   command=lambda: self._rules_build(upload=False)).pack(fill=tk.X, pady=3)
+        file_row = ttk.Frame(card_out); file_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(file_row, text="Save Rules", command=self._rules_save).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        ttk.Button(file_row, text="Load Rules", command=self._rules_open).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        self.lbl_rules_status = ttk.Label(card_out, text="Ready.", foreground=UI_DIM)
+        self.lbl_rules_status.pack(anchor=tk.W, pady=(6, 0))
+
+        # ── Middle: the four physical knobs ──────────────────────────
+        mid = ttk.Frame(pane); pane.add(mid, weight=2)
+        card_knob = ttk.LabelFrame(mid, text=" Describe the selected category ", padding=12)
+        card_knob.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas_hue = tk.Canvas(card_knob, height=30, bg=UI_CARD,
+                                    highlightthickness=0, bd=0)
+        self.canvas_hue.pack(fill=tk.X, pady=(2, 0))
+        self.canvas_hue.bind("<Configure>", lambda e: self._rules_redraw())
+
+        self.rules_scales = {}
+        for key, label, lo, hi, fmt, res in [
+            ("skin_hue_deg", "Skin colour", *R.KNOB_LIMITS["skin_hue_deg"], "{:.0f} deg", 1.0),
+            ("spread_deg",   "Colour spread (blotchy-ness)", *R.KNOB_LIMITS["spread_deg"], "{:.0f} deg", 1.0),
+            ("firmness",     "Firmness  Hard <-> Soft", 0.0, 1.0, "{:.0%} soft", 0.01),
+            ("character",    "Tap sound  Crisp ping <-> Dull thud", 0.0, 1.0, "{:.0%} dull", 0.01),
+        ]:
+            row = ttk.Frame(card_knob); row.pack(fill=tk.X, pady=(10, 0))
+            ttk.Label(row, text=label, width=34).pack(side=tk.LEFT)
+            val_lbl = ttk.Label(row, width=10, anchor=tk.E); val_lbl.pack(side=tk.RIGHT)
+            scale = DarkSlider(card_knob, from_=lo, to=hi, resolution=res,
+                               command=lambda v, k=key, l=fmt: self._rules_slide(k, v, l))
+            self.rules_scales[key] = (scale, val_lbl, fmt)   # register BEFORE
+            scale.set(self.rules_knobs[self.rules_current][key])  # first .set()
+            scale.pack(fill=tk.X)
+        self.lbl_veto = ttk.Label(card_knob, text="", foreground="#666")
+        self.lbl_veto.pack(anchor=tk.W, pady=(12, 0))
+        ttk.Button(card_knob, text="Reset this category to its preset",
+                   command=self._rules_reset_preset).pack(anchor=tk.W, pady=6)
+
+        # ── Right: live preview ──────────────────────────────────────
+        right = ttk.Frame(pane); pane.add(right, weight=2)
+        card_prev = ttk.LabelFrame(right, text=" What the device will expect ", padding=8)
+        card_prev.pack(fill=tk.BOTH, expand=True)
+        self.fig_rules = Figure(figsize=(4.6, 3.4), dpi=96)
+        self.ax_hist = self.fig_rules.add_subplot(211)
+        self.ax_spec = self.fig_rules.add_subplot(212, sharex=None)
+        self.bars = self.ax_hist.bar(R.HUE_BIN_CENTRES, np.zeros(8),
+                                     width=R.HUE_BIN_WIDTH * 0.92,
+                                     color=[f"#{r:02x}{g:02x}{b:02x}" for r, g, b in
+                                            [R.hue_to_rgb(c) for c in R.HUE_BIN_CENTRES]])
+        self.ax_hist.set_xlim(R.HUE_WINDOW_MIN, R.HUE_WINDOW_MAX)
+        self.ax_hist.set_ylim(0, 1)
+        self.ax_hist.set_ylabel("skin colour")
+        self.ax_hist.tick_params(labelsize=7)
+        self.spec_line, = self.ax_spec.plot(R.FFT_CENTERS, np.zeros(15), "-o", ms=3)
+        self.ax_spec.set_ylim(-10, 1)
+        self.ax_spec.set_xlabel("tap frequency (Hz)", fontsize=7)
+        self.ax_spec.set_ylabel("energy", fontsize=7)
+        self.ax_spec.tick_params(labelsize=7)
+        self.fig_rules.tight_layout()
+        canvas = FigureCanvasTkAgg(self.fig_rules, master=card_prev)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        adv = ttk.LabelFrame(right, text=" Advanced: raw 28-D prototype ", padding=4)
+        adv.pack(fill=tk.X, pady=(6, 0))
+        self.txt_rules_raw = tk.Text(adv, height=5, font=("Courier", 7),
+                                     state=tk.DISABLED, wrap=tk.WORD)
+        self.txt_rules_raw.pack(fill=tk.X)
+
+        self._rules_redraw()
+        self._rules_log_summary()
+
+    # keep a stable StringVar for "which category am I editing"
+    def _rules_sel_var(self):
+        if not hasattr(self, "_rules_sel"):
+            self._rules_sel = tk.StringVar(value=self.rules_current)
+        return self._rules_sel
+
+    def _rules_slide(self, key, value_str, fmt):
+        try:
+            v = float(value_str)
+        except ValueError:
+            return
+        self.rules_knobs[self._rules_sel_var().get()][key] = v
+        if key not in self.rules_scales:      # callback during construction
+            return
+        scale, lbl, f = self.rules_scales[key]
+        lbl.config(text=f.format(v))
+        self._rules_redraw()
+
+    def _rules_load_sliders(self):
+        lab = self._rules_sel_var().get()
+        k = self.rules_knobs[lab]
+        for key, (scale, lbl, fmt) in self.rules_scales.items():
+            scale.set(k[key])
+        self._rules_redraw()
+
+    def _rules_reset_preset(self):
+        lab = self._rules_sel_var().get()
+        self.rules_knobs[lab] = dict(R.PRESETS[lab])
+        self._rules_load_sliders()
+
+    def _rules_redraw(self):
+        if not hasattr(self, "ax_hist"):
+            return
+        lab = self._rules_sel_var().get()
+        state = R.state_from_knobs(self.rules_knobs[lab])
+        hist = state[0:8]
+
+        for rect, h in zip(self.bars, hist):
+            rect.set_height(h)
+        self.ax_hist.set_ylim(0, max(0.35, float(hist.max()) * 1.15))
+
+        hue = self.rules_knobs[lab]["skin_hue_deg"]
+        w = int(self.canvas_hue.winfo_width() or 260)
+        self.canvas_hue.delete("all")
+        for i in range(w):
+            r, g, b = R.hue_to_rgb(R.HUE_WINDOW_MIN +
+                                   (R.HUE_WINDOW_MAX - R.HUE_WINDOW_MIN) * i / max(w - 1, 1))
+            self.canvas_hue.create_line(i, 0, i, 26, fill=f"#{r:02x}{g:02x}{b:02x}")
+        x = (hue - R.HUE_WINDOW_MIN) / (R.HUE_WINDOW_MAX - R.HUE_WINDOW_MIN) * w
+        self.canvas_hue.create_rectangle(x - 1, 0, x + 1, 26, outline="black", width=2)
+
+        self.spec_line.set_ydata(state[10:25])
+
+        g = R.green_mass(state)
+        if g > R.GREEN_VETO_THRESHOLD:
+            self.lbl_veto.config(
+                text=f"Green veto ACTIVE ({g:.2f} > {R.GREEN_VETO_THRESHOLD}): device will "
+                     f"never answer PERFECTLY_RIPE / ARTIFICIALLY_RIPENED for this skin colour",
+                foreground="#c22")
+        else:
+            self.lbl_veto.config(text=f"Green mass {g:.2f} — veto off", foreground="#666")
+
+        self.txt_rules_raw.config(state=tk.NORMAL)
+        self.txt_rules_raw.delete("1.0", tk.END)
+        np.set_printoptions(precision=3, suppress=True, linewidth=110)
+        self.txt_rules_raw.insert(tk.END,
+            "hue      " + str(state[0:8]) + "\n"
+            "disp/vel " + str(state[8:10]) + "\n"
+            "fft      " + str(state[10:25]) + "\n"
+            "ent/f/r  " + str(state[25:28]))
+        self.txt_rules_raw.config(state=tk.DISABLED)
+        self.fig_rules.canvas.draw_idle()
+
+    def _rules_collect(self):
+        """Enabled categories with knobs -> (blob, info) or raises ValueError."""
+        enabled = [l for l in R.CLASS_LABELS if self.rules_enabled[l].get()]
+        if not enabled:
+            raise ValueError("Tick at least one category!")
+        name = self.entry_rules_fruit.get().strip() or "Fruit"
+        temp = float(self.spin_rules_temp.get() or 2.0)
+        states = {l: R.state_from_knobs(self.rules_knobs[l]) for l in enabled}
+        W, b, ranges, mask = R.build_rules_model(states, enabled, temp)
+        if not R.selftest(states, W, b, mask, n=40):
+            raise ValueError("Internal consistency check failed — adjust knobs and retry")
+        blob = R.pack_binary(name, W, b, mask)
+        return blob, {"name": name, "mask": mask, "enabled": enabled,
+                      "states": states, "W": W, "b": b}
+
+    def _rules_build(self, upload):
+        try:
+            blob, info = self._rules_collect()
+        except (ValueError, EOFError) as e:
+            messagebox.showerror("Rules Builder", str(e))
+            return
+        out = f"{info['name']}_rules.bin"
+        with open(out, "wb") as f:
+            f.write(blob)
+        cats = ", ".join(info["enabled"])
+        msg = (f"Built {out} ({len(blob)} bytes)\nCategories: {cats}\n"
+               f"Class mask: 0x{info['mask']:02X}")
+        if upload:
+            if not self.ble_worker or not self.ble_worker.is_alive():
+                messagebox.showerror("Rules Builder", "Connect to ESP32 over BLE first!")
+                return
+            self.ble_worker.upload_model(blob)
+            msg += "\nUpload started — device auto-selects the saved model."
+        self.lbl_rules_status.config(text=msg.replace("\n", " | ")[:120], foreground=UI_DIM)
+        messagebox.showinfo("Rules Builder", msg)
+
+    def _rules_save(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", initialfile="mango_rules.json",
+            filetypes=[("Human Rules", "*.json")])
+        if not path:
+            return
+        R.save_rules(path, self.entry_rules_fruit.get().strip() or "Fruit",
+                     float(self.spin_rules_temp.get() or 2.0),
+                     [l for l in R.CLASS_LABELS if self.rules_enabled[l].get()],
+                     self.rules_knobs)
+        self.lbl_rules_status.config(text=f"Saved {path}", foreground=UI_DIM)
+
+    def _rules_open(self):
+        path = filedialog.askopenfilename(filetypes=[("Human Rules", "*.json")])
+        if not path:
+            return
+        try:
+            name, temp, enabled, knobs = R.load_rules(path)
+        except Exception as e:
+            messagebox.showerror("Rules Builder", f"Bad rules file:\n{e}")
+            return
+        self.entry_rules_fruit.delete(0, tk.END); self.entry_rules_fruit.insert(0, name)
+        self.spin_rules_temp.set(temp)
+        for lab in R.CLASS_LABELS:
+            self.rules_enabled[lab].set(lab in enabled)
+        self.rules_knobs.update({k: dict(v) for k, v in knobs.items()})
+        self._rules_load_sliders()
+        self._rules_log_summary()
+        self.lbl_rules_status.config(text=f"Loaded {path}", foreground=UI_DIM)
+
+    def _rules_log_summary(self):
+        on = [l for l in R.CLASS_LABELS if self.rules_enabled[l].get()]
+        self.lbl_rules_status.config(
+            text=f"Model will contain {len(on)} categor{'y' if len(on)==1 else 'ies'}: "
+                 + (", ".join(on) if on else "none ticked!"), foreground=UI_DIM)
+
 
     # ─── TAB 3: CALIBRATION MANAGER ─────────────────────────────────
     def setup_ble_mgr_tab(self):
@@ -535,10 +964,14 @@ class FruitStudioGUI:
         f_btn = ttk.Frame(card_flash)
         f_btn.pack(fill=tk.X, pady=5)
         ttk.Button(f_btn, text="Fetch Stored Calibrations", command=self.fetch_installed_models).pack(side=tk.LEFT, padx=5)
+        ttk.Button(f_btn, text="Activate Selected", command=self.activate_selected_model).pack(side=tk.LEFT, padx=5)
         ttk.Button(f_btn, text="Delete Selected Calibration", command=self.delete_selected_model).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f_btn, text="(double-click = activate)").pack(side=tk.LEFT, padx=5)
 
+        self.model_names = []   # raw names; listbox rows carry the ACTIVE marker
         self.listbox_models = tk.Listbox(card_flash, height=8, font=("Arial", 11))
         self.listbox_models.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.listbox_models.bind("<Double-Button-1>", lambda e: self.activate_selected_model())
 
     def upload_selected_model(self):
         if not self.ble_worker or not self.ble_worker.client:
@@ -549,21 +982,48 @@ class FruitStudioGUI:
         if path:
             with open(path, "rb") as f:
                 data = f.read()
-            if len(data) == 612:
+            if len(data) == R.WIRE_BYTES:
                 self.ble_worker.upload_model(data)
                 self.log("Uploading calibration...")
+            elif len(data) == R.WIRE_BYTES - 4:
+                # Legacy 612-byte file: device falls back to its default
+                # class gate (no embedded category mask).
+                self.ble_worker.upload_model(data)
+                self.log("Uploading legacy 612-byte calibration...")
             else:
-                messagebox.showerror("Error", f"Invalid calibration size: {len(data)} bytes (expected 612 bytes)")
+                messagebox.showerror(
+                    "Error", f"Invalid calibration size: {len(data)} bytes "
+                             f"(expected {R.WIRE_BYTES} bytes)")
 
     def fetch_installed_models(self):
         if self.ble_worker:
             self.ble_worker.send_config({"command": "list_models"})
             self.log("Fetching stored calibrations...")
 
-    def delete_selected_model(self):
+    def _selected_model_name(self):
         sel = self.listbox_models.curselection()
-        if sel and self.ble_worker:
-            fruit = self.listbox_models.get(sel[0])
+        if sel and 0 <= sel[0] < len(self.model_names):
+            return self.model_names[sel[0]]
+        return None
+
+    def activate_selected_model(self):
+        fruit = self._selected_model_name()
+        if not fruit:
+            messagebox.showerror("Error", "Select a model in the list first!")
+            return
+        if not (self.ble_worker and self.ble_worker.is_alive()):
+            messagebox.showerror("Error", "Connect to ESP32 over BLE first!")
+            return
+        # Loads to RAM on device, persists the choice, refreshes the LCD badge.
+        self.ble_worker.send_config({"fruit": fruit})
+        self.log(f"Activating '{fruit}'...")
+
+    def delete_selected_model(self):
+        fruit = self._selected_model_name()
+        if not fruit:
+            messagebox.showerror("Error", "Select a model in the list first!")
+            return
+        if self.ble_worker:
             if messagebox.askyesno("Confirm Delete", f"Delete calibration '{fruit}' from device flash?"):
                 self.ble_worker.send_config({"command": "delete_model", "fruit": fruit})
                 self.log(f"Requesting delete of '{fruit}'...")
@@ -591,9 +1051,57 @@ class FruitStudioGUI:
             self.ble_worker.send_config({"command": "cancel"})
             self.log("Disarmed.")
 
+    def capture_hue(self):
+        if not (self.ble_worker and self.ble_worker.is_alive()):
+            messagebox.showerror("Error", "Connect to ESP32 over BLE first!")
+            return
+        self.lbl_hue_state.config(text="Hue: scanning...", foreground="#4f9cf9")
+        self.ble_worker.send_config({"command": "ms_capture"})
+        self.log("Requesting multispectral hue scan...")
+
+    def _handle_hue_captured(self, payload):
+        """Device replied to ms_capture: store, plot, autofill volume."""
+        self.last_hue_features = {
+            "hue_histogram": [float(v) for v in payload.get("hue_histogram", [])],
+            "chromatic_dispersion": float(payload.get("chromatic_dispersion", 1.0)),
+            "volume_cm3": float(payload.get("volume_cm3", 0.0)),
+        }
+        hist = self.last_hue_features["hue_histogram"]
+        disp = self.last_hue_features["chromatic_dispersion"]
+        vol = self.last_hue_features["volume_cm3"]
+
+        self.ax_hue.clear()
+        if len(hist) == 8:
+            colors = ["#%02x%02x%02x" % R.hue_to_rgb(c) for c in R.HUE_BIN_CENTRES]
+            self.ax_hue.bar(R.HUE_BIN_CENTRES, hist,
+                            width=R.HUE_BIN_WIDTH * 0.9, color=colors)
+            green = sum(hist[R.GREEN_BINS_START:R.GREEN_BINS_END])
+            self.ax_hue.set_title(
+                f"dispersion {disp:.2f} | volume {vol:.0f} cm³ | green {green:.2f}"
+                + ("  (veto!)" if green > R.GREEN_VETO_THRESHOLD else ""),
+                fontsize=8)
+        else:
+            self.ax_hue.set_title("Bad hue payload", fontsize=9)
+        self.ax_hue.set_ylim(0, max(0.05, max(hist or [0]) * 1.2))
+        self._apply_dark_matplotlib()
+        self.fig_hue.canvas.draw_idle()
+
+        self.lbl_hue_state.config(
+            text=f"Hue: captured (vol {vol:.0f} cm³)", foreground="#7ddb7d")
+        self._update_counts_label()
+        if vol > 0:   # trust the camera's own estimate over the typed one
+            self.entry_vol.delete(0, tk.END)
+            self.entry_vol.insert(0, f"{vol:.1f}")
+
+    def _update_counts_label(self):
+        h = "yes" if self.last_hue_features else "no"
+        self.lbl_counts.config(text=f"Pictures: {len(self.captured_images)} | "
+                                    f"Taps: {len(self.captured_waveforms)} | Hue: {h}")
+
     def save_session(self):
-        if not self.captured_images and not self.captured_waveforms:
-            messagebox.showwarning("Warning", "No images or taps collected!")
+        if not self.captured_images and not self.captured_waveforms \
+                and not self.last_hue_features:
+            messagebox.showwarning("Warning", "No images, taps or hue scans collected!")
             return
 
         fruit = self.entry_fruit_name.get().strip()
@@ -609,6 +1117,13 @@ class FruitStudioGUI:
         for i, wave in enumerate(self.captured_waveforms):
             np.savetxt(os.path.join(out_dir, f"waveform_{i+1:02d}.csv"), wave, delimiter=",", fmt="%d")
 
+        n_hues = 0
+        if self.last_hue_features:
+            # Same schema extract_28d.py reads back for vision dims 0..9.
+            with open(os.path.join(out_dir, "hue_01.json"), "w") as f:
+                json.dump(self.last_hue_features, f, indent=4)
+            n_hues = 1
+
         meta = {
             "fruit_type": fruit,
             "category": cat,
@@ -617,6 +1132,7 @@ class FruitStudioGUI:
             "mass_grams": float(self.entry_mass.get() or 0.0),
             "num_images": len(self.captured_images),
             "num_taps": len(self.captured_waveforms),
+            "num_hues": n_hues,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         with open(os.path.join(out_dir, "metadata.json"), "w") as f:
@@ -648,8 +1164,14 @@ class FruitStudioGUI:
     def clear_session(self):
         self.captured_images.clear()
         self.captured_waveforms.clear()
+        self.last_hue_features = None
         self._last_img = None
-        self.lbl_counts.config(text="Pictures: 0 | Taps: 0")
+        self.lbl_counts.config(text="Pictures: 0 | Taps: 0 | Hue: no")
+        self.lbl_hue_state.config(text="Hue: not captured yet", foreground="#a5a5a5")
+        self.ax_hue.clear()
+        self.ax_hue.set_title("No hue capture yet", fontsize=9)
+        self._apply_dark_matplotlib()
+        self.fig_hue.canvas.draw_idle()
         self.canvas_img.delete("all")
         self.ax.clear()
         self.ax.grid(True)
@@ -675,22 +1197,34 @@ class FruitStudioGUI:
             elif msg_type == "jpeg":
                 img = Image.open(io.BytesIO(payload))
                 self.captured_images.append(img)
-                self.lbl_counts.config(text=f"Pictures: {len(self.captured_images)} | Taps: {len(self.captured_waveforms)}")
+                self._update_counts_label()
                 self._last_img = img
                 self._fit_preview_to_canvas()
             elif msg_type == "waveform":
                 self.captured_waveforms.append(payload)
-                self.lbl_counts.config(text=f"Pictures: {len(self.captured_images)} | Taps: {len(self.captured_waveforms)}")
+                self._update_counts_label()
                 self.ax.clear()
                 self.ax.plot(payload, color="red")
                 self.ax.set_title(f"Acoustic Tap #{len(self.captured_waveforms)} (Peak: {np.max(payload)})")
                 self.ax.grid(True)
                 self.canvas_graph.draw()
             elif msg_type == "results_json":
-                if "models" in payload:
-                    self.listbox_models.delete(0, tk.END)
-                    for m in payload["models"]:
-                        self.listbox_models.insert(tk.END, m)
+                if isinstance(payload, dict):
+                    if payload.get("status") == "ms_captured":
+                        self._handle_hue_captured(payload)
+                    if "models" in payload:
+                        # Full inventory; mark the model loaded on device.
+                        active = payload.get("active", "")
+                        self.model_names = list(payload["models"])
+                        self.listbox_models.delete(0, tk.END)
+                        for m in self.model_names:
+                            marker = "   [ACTIVE]" if m == active else ""
+                            self.listbox_models.insert(tk.END, f"{m}{marker}")
+                    status = payload.get("status")
+                    if status in ("model_saved", "model_deleted",
+                                  "model_activated", "model_cleared"):
+                        # Device state changed — re-pull the inventory.
+                        self.root.after(700, self.fetch_installed_models)
 
         self.root.after(100, self.process_queue)
 

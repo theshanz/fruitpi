@@ -37,4 +37,13 @@ public:
     bool has_model() const { return is_model_loaded_in_ram; }
 
     const char* get_loaded_fruit_name() const { return loaded_fruit_name; }
+
+    // ── Model browser (on-device selector) ────────────────────────
+    // Enumeration order is stable within one boot.
+    uint8_t model_count();
+    bool    model_name_at(uint8_t idx, char out[MAX_MODEL_NAME_LEN]);
+    // Activates (loads to RAM) and persists the choice across reboots.
+    bool    activate_by_index(uint8_t idx);
+    void    clear_active();               // forget persisted choice + unload
+    uint8_t active_index();               // 0xFF when none persists
 };

@@ -19,6 +19,13 @@ void lcd_placement_timeout();
 void lcd_camera_error();
 void lcd_place_fruit();
 void lcd_place_on_piezo();
+
+void lcd_menu(const char* name, uint8_t idx, uint8_t count,
+              uint8_t active_idx);       // selector w/ position bar (0xFF = none)
+void lcd_ready_model(const char* name);// "[mango] Mango OK / SCAN = check"
+void lcd_idle();                       // mascot idle (or active-model badge)
+void lcd_set_active_model(const char* name); // nullptr/"" = plain idle
+void lcd_flash(const char* l1, const char* l2); // transient cue, auto-revert
 #else
 // No display wired on this board — every call compiles away.
 inline void lcd_display_init() {}
@@ -36,4 +43,9 @@ inline void lcd_placement_timeout() {}
 inline void lcd_camera_error() {}
 inline void lcd_place_fruit() {}
 inline void lcd_place_on_piezo() {}
+inline void lcd_menu(const char*, uint8_t, uint8_t, uint8_t) {}
+inline void lcd_ready_model(const char*) {}
+inline void lcd_idle() {}
+inline void lcd_set_active_model(const char*) {}
+inline void lcd_flash(const char*, const char*) {}
 #endif

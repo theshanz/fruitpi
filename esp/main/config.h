@@ -14,6 +14,7 @@ constexpr uint8_t CANCEL_BUTTON_PIN = 21;  // active-high, wired to 5V (prefer 3
                                      // WARNING: GPIO12 = CAM_PIN_Y6 — reads permanently
                                      // pressed if wired. Never use it for a button.
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
+constexpr uint32_t MENU_HOLD_MS       = 800;   // hold-to-commit / hold-to-reset
 
 // ─── LCD (PCF8574 I2C backpack) ───────────────────────────────────
 constexpr uint8_t  LCD_SDA_PIN = 41;  // NOT GPIO1: adjacent to piezo ADC (coupling)
@@ -106,7 +107,10 @@ constexpr uint32_t LCD_ANIM_MS           = 180;   // LCD animation frame interva
 constexpr bool  ACOUSTIC_FORCE_INVARIANT = true;
 constexpr float IMPACT_AMP_FLOOR         = 0.004f; // div-by-zero guard for weak taps
 // Bit i enables class i: bit0=UNRIPE bit1=PERFECTLY_RIPE bit2=OVERRIPE
-// bit3=ROTTEN_OR_HOLLOW bit4=ARTIFICIALLY_RIPENED. 0x03 = two-class test.
+// bit3=ROTTEN_OR_HOLLOW bit4=ARTIFICIALLY_RIPENED.
+// Fallback ONLY: models built by rules_to_model.py carry their own
+// active_class_mask (auto-derived from the labels fed in); a nonzero
+// per-model mask always wins over this. 0x03 = two-class test default.
 constexpr uint8_t ACTIVE_CLASS_MASK      = 0x03;
 constexpr float GREEN_MASS_VETO_THRESHOLD   = 0.25f;
 constexpr float ANOMALY_CONFIDENCE_THRESHOLD = 0.35f;

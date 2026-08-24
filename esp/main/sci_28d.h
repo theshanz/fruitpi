@@ -36,9 +36,21 @@ struct alignas(16) ManifoldModel28D {
     char fruit_name[32];
     float weights[NUM_CLASSES][VECTOR_DIMENSIONS];
     float biases[NUM_CLASSES];
+    // Bit i enables class i (CLASS_LABELS order). 0 = legacy model without
+    // an embedded mask -> firmware falls back to ACTIVE_CLASS_MASK.
+    uint8_t active_class_mask;
+    uint8_t reserved[3];
 };
 
 using Fruit28D = ManifoldModel28D;
+
+// On-the-wire/.bin sizes. sizeof(Fruit28D) is larger (alignment padding);
+// loaders accept anything >= MODEL_WIRE_BYTES_LEGACY so old 612-byte files
+// and BLE uploads keep working.
+constexpr size_t MODEL_WIRE_BYTES =
+    32 + NUM_CLASSES * VECTOR_DIMENSIONS * sizeof(float) +
+    NUM_CLASSES * sizeof(float) + 4;                    // 616
+constexpr size_t MODEL_WIRE_BYTES_LEGACY = MODEL_WIRE_BYTES - 4;  // 612
 
 void assemble_state_28d(
     float state[VECTOR_DIMENSIONS],

@@ -1,5 +1,6 @@
 #include "sci_28d.h"
 #include <cstring>
+#include <cstddef>
 #include <cmath>
 #include <algorithm>
 
@@ -16,6 +17,14 @@ const char* const  CLASS_LABELS[NUM_CLASSES] = {
     "ROTTEN_OR_HOLLOW",
     "ARTIFICIALLY_RIPENED"
 };
+
+// Layout guards: the wire format the converter and BLE test pack must match
+// what this engine reads. (sizeof(Fruit28D) is bigger due to alignment.)
+static_assert(MODEL_WIRE_BYTES == 616, "wire size drifted");
+static_assert(MODEL_WIRE_BYTES_LEGACY == 612, "legacy wire size drifted");
+static_assert(offsetof(ManifoldModel28D, biases) ==
+                  32 + NUM_CLASSES * VECTOR_DIMENSIONS * sizeof(float),
+              "biases offset mismatch");
 
 // When SCI_28D_HARDCODED is defined, this file compiles to only the shared
 // constants above; the rule-based implementation (sci_28d_hardcoded.cpp)
@@ -110,10 +119,16 @@ BiologicalStatus evaluate_fruit_single(
     BiologicalStatus result;
     float raw_scores[NUM_CLASSES];
 
+    // The model carries its own category gate (built by rules_to_model.py
+    // from whichever labels were fed in). 0 = legacy file -> config default.
+    const uint8_t class_mask = model.active_class_mask
+                                   ? model.active_class_mask
+                                   : (uint8_t)ACTIVE_CLASS_MASK;
+
     for (int c = 0; c < NUM_CLASSES; c++){
         raw_scores[c] = compute_dot_product(state, model.weights[c], VECTOR_DIMENSIONS) + model.biases[c];
-        if (!((ACTIVE_CLASS_MASK >> c) & 1U)) {
-            raw_scores[c] = -100000.0f;    // class disabled for this test build
+        if (!((class_mask >> c) & 1U)) {
+            raw_scores[c] = -100000.0f;    // class not part of this model
         }
     }
 

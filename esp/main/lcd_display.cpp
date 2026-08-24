@@ -32,7 +32,7 @@ struct Screen {
   char l2[17];
 };
 
-enum class Anim : uint8_t { NONE, SPINNER, BAR };
+enum class Anim : uint8_t { NONE, SPINNER, BAR, MENU_CELL };
 
 static Screen base_scr   = {"Fruitipi", "Ready - SCAN"};
 static bool   base_is_idle = true;
@@ -63,6 +63,9 @@ static const uint8_t MANGO_BOT_L_BLINK[8] =
 static const uint8_t MANGO_BOT_R_BLINK[8] =
   {0x1F,0x1F,0x1F,0x08,0x1F,0x1F,0x07,0x07};
 static bool    mango_blink = false;
+static uint8_t menu_cell_col = 0;        // LCD column of the blinking bar cell
+static bool    menu_cell_on = false;
+static char    s_model_name[17] = {0};  // active model badge for idle screens
 
 // ─── Low-level write ─────────────────────────────────────────────
 static void paint(const Screen& s) {
@@ -123,8 +126,14 @@ static void set_base(const char* l1, const char* l2) {
 }
 
 static void set_base_idle() {
-  strncpy(base_scr.l1, "\x02\x03 Fruitipi", 16);  base_scr.l1[16] = '\0';
-  strncpy(base_scr.l2, "\x02\x03 Ready  SCAN", 16); base_scr.l2[16] = '\0';
+  if (s_model_name[0]) {
+    // Default screen carries the active model badge (selector bar mirrors it).
+    snprintf(base_scr.l1, sizeof(base_scr.l1), "\x02\x03 %.13s OK", s_model_name);
+    strncpy(base_scr.l2, "\x02\x03 Ready  SCAN", 16); base_scr.l2[16] = '\0';
+  } else {
+    strncpy(base_scr.l1, "\x02\x03 Fruitipi", 16);  base_scr.l1[16] = '\0';
+    strncpy(base_scr.l2, "\x02\x03 Ready  SCAN", 16); base_scr.l2[16] = '\0';
+  }
   base_is_idle = true;
   trans_active = false;
   cur_anim = Anim::NONE;
@@ -212,6 +221,15 @@ void lcd_display_update() {
     return;
   }
 
+  // Model-selector bar: the browsed cell pulses in place.
+  if (!trans_active && cur_anim == Anim::MENU_CELL &&
+      now - last_anim_ms >= LCD_ANIM_MS * 2) {
+    last_anim_ms = now;
+    menu_cell_on = !menu_cell_on;
+    lcd->setCursor(menu_cell_col, 0);
+    lcd->print(menu_cell_on ? char(0xFF) : '.');
+  }
+
   // Spinner advances one character position per frame — no repaint.
   if (trans_active && cur_anim == Anim::SPINNER &&
       now - last_anim_ms >= LCD_ANIM_MS) {
@@ -231,6 +249,46 @@ void lcd_countdown(uint8_t sec) {
   set_base("Place fruit", l2);
 }
 void lcd_place_fruit()      { set_base("Hold fruit up", "to camera..."); }
+
+void lcd_menu(const char* name, uint8_t idx, uint8_t count, uint8_t active_idx) {
+  char l1[17];
+  snprintf(l1, sizeof(l1), ">%s", name ? name : "?");
+  l1[16] = '\0';
+
+  cur_anim = Anim::NONE;
+  if (count > 0 && count <= 6) {
+    // Right-aligned information bar: block = active model, dot = idle,
+    // the browsed cell pulses (handled by the MENU_CELL animation).
+    const uint8_t first = 16 - count;
+    for (uint8_t i = 0; i < count; i++)
+      l1[first + i] = (i == active_idx) ? char(0xFF) : '.';
+    if (idx < count) l1[first + idx] = '.';      // browsed cell starts hollow
+    menu_cell_col = first + idx;
+    cur_anim = Anim::MENU_CELL;
+    menu_cell_on = true;
+  } else if (count > 6) {
+    snprintf(l1 + strlen(l1), 17 - strlen(l1), "%u/%u", idx + 1, count);
+  }
+  strncpy(base_scr.l1, l1, 16); base_scr.l1[16] = '\0';
+  strncpy(base_scr.l2, (idx == active_idx) ? "Active, hold=use" : "Hold START: use", 16);
+  base_scr.l2[16] = '\0';
+  base_is_idle = false;
+  trans_active = false;
+  commit(Where::BASE);
+}
+
+void lcd_ready_model(const char* name) {
+  lcd_set_active_model(name);
+  set_base_idle();
+}
+void lcd_set_active_model(const char* name) {
+  strncpy(s_model_name, (name && name[0]) ? name : "", 16);
+  s_model_name[16] = '\0';
+}
+void lcd_idle() { set_base_idle(); }
+void lcd_flash(const char* l1, const char* l2) {
+  set_screen(l1, l2, CUE_HOLD_MS);
+}
 void lcd_place_on_piezo()   { set_base("Put fruit on", "piezo + SCAN"); }
 
 // Transient events — always auto-revert to the held state above.

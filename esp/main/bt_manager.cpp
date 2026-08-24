@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "esp_heap_caps.h"
+#include "lcd_display.h"
 
 BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharScanConfig(nullptr),
                          pCharScanResults(nullptr), pCharRawStream(nullptr), store_ref(nullptr),
@@ -145,17 +146,23 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 const char *cmd = doc["command"];
                 if (strcmp(cmd, "list_models") == 0)
                 {
-                    // Send list of installed models back to GUI
-                    StaticJsonDocument<256> resp;
+                    // Full NVS inventory + which one is loaded right now.
+                    StaticJsonDocument<768> resp;
                     JsonArray arr = resp.createNestedArray("models");
-
-                    // Query active model name or NVS Flash list
-                    if (store_ref->has_model())
+                    if (store_ref)
                     {
-                        arr.add(store_ref->get_loaded_fruit_name());
+                        const uint8_t n = store_ref->model_count();
+                        char name[MAX_MODEL_NAME_LEN];
+                        for (uint8_t i = 0; i < n; i++)
+                        {
+                            if (store_ref->model_name_at(i, name))
+                                arr.add(name);
+                        }
+                        if (store_ref->has_model())
+                            resp["active"] = store_ref->get_loaded_fruit_name();
                     }
 
-                    char output[256];
+                    char output[768];
                     size_t len = serializeJson(resp, output);
                     pCharScanResults->setValue((uint8_t *)output, len);
                     pCharScanResults->notify();
@@ -164,6 +171,11 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 {
                     const char *target_fruit = doc["fruit"];
                     store_ref->delete_model_from_flash(target_fruit);
+                    if (store_ref && !store_ref->has_model())
+                    {
+                        lcd_set_active_model(nullptr);
+                        lcd_idle();   // badge cleared when active model died
+                    }
                     notify_status_change("model_deleted");
                 }
                 else if (strcmp(cmd, "resend") == 0 && doc.containsKey("id") && doc.containsKey("ranges"))
@@ -245,7 +257,12 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
             {
                 strncpy(current_config.target_fruit, doc["fruit"], sizeof(current_config.target_fruit) - 1);
                 // Load model into RAM immediately upon switching fruit selection
-                store_ref->load_model_to_ram(current_config.target_fruit);
+                if (store_ref->load_model_to_ram(current_config.target_fruit))
+                {
+                    lcd_set_active_model(store_ref->get_loaded_fruit_name());
+                    lcd_idle();   // default screen shows the new badge
+                    notify_status_change("model_activated");
+                }
             }
 
             if (doc.containsKey("volume_cm3"))
@@ -590,6 +607,8 @@ void BTManager::process_incoming_model()
     {
         // Automatically activate newly saved model into RAM
         store_ref->load_model_to_ram(incoming_model.fruit_name);
+        lcd_set_active_model(store_ref->get_loaded_fruit_name());
+        lcd_idle();
         notify_status_change("model_saved");
         Serial.println("[BTManager] New Model Saved to Flash & Loaded to RAM!");
     }
