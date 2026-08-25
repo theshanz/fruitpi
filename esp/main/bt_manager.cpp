@@ -1,5 +1,7 @@
 #include "bt_manager.h"
 #include <ArduinoJson.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 #include <cmath>
 
 #include "esp_heap_caps.h"
@@ -33,9 +35,42 @@ uint16_t BTManager::next_transfer_id()
     return counter;
 }
 
+// ─── Vision gate persistence (NVS namespace "vision") ────────────────
+static const char *VISION_NS = "vision";
+
+static void vision_load_nvs()
+{
+    nvs_handle_t nvs;
+    if (nvs_open(VISION_NS, NVS_READONLY, &nvs) != ESP_OK)
+        return; // first boot: keep config.h defaults
+    float v = g_visionValueMin, sv = g_visionSatMin;
+    size_t sz = sizeof(float);
+    if (nvs_get_blob(nvs, "value_min", &v, &sz) == ESP_OK)
+        g_visionValueMin = v;
+    sz = sizeof(float);
+    if (nvs_get_blob(nvs, "sat_min", &sv, &sz) == ESP_OK)
+        g_visionSatMin = sv;
+    nvs_close(nvs);
+    Serial.printf("[BTManager] vision gates loaded: value_min=%.2f sat_min=%.2f\n",
+                  g_visionValueMin, g_visionSatMin);
+}
+
+static void vision_save_nvs()
+{
+    nvs_handle_t nvs;
+    if (nvs_open(VISION_NS, NVS_READWRITE, &nvs) != ESP_OK)
+        return;
+    nvs_set_blob(nvs, "value_min", &g_visionValueMin, sizeof(float));
+    nvs_set_blob(nvs, "sat_min", &g_visionSatMin, sizeof(float));
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    Serial.println("[BTManager] vision gates saved to NVS");
+}
+
 bool BTManager::init(const char *device_name, FruitStore *store)
 {
     store_ref = store;
+    vision_load_nvs();
 
     NimBLEDevice::init(device_name);
     NimBLEDevice::setMTU(512);
@@ -246,6 +281,29 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 else if (strcmp(cmd, "cancel") == 0)
                 {
                     cancel_requested = true;
+                }
+                else if (strcmp(cmd, "vision_config") == 0)
+                {
+                    // Runtime-tunable black/glare gates (clamped to sane range)
+                    if (doc.containsKey("value_min"))
+                    {
+                        float v = doc["value_min"];
+                        if (v < 0.0f) v = 0.0f;
+                        if (v > 0.9f) v = 0.9f;
+                        g_visionValueMin = v;
+                    }
+                    if (doc.containsKey("sat_min"))
+                    {
+                        float sv = doc["sat_min"];
+                        if (sv < 0.0f) sv = 0.0f;
+                        if (sv > 0.9f) sv = 0.9f;
+                        g_visionSatMin = sv;
+                    }
+                    Serial.printf("[BTManager] vision_config: value_min=%.2f sat_min=%.2f\n",
+                                  g_visionValueMin, g_visionSatMin);
+                    if (doc.containsKey("save") && doc["save"].as<bool>())
+                        vision_save_nvs();
+                    notify_status_change("vision_configured");
                 }
                 else if (strcmp(cmd, "set_threshold") == 0 && doc.containsKey("threshold"))
                 {

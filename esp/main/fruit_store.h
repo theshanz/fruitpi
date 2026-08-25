@@ -3,8 +3,11 @@
 #include "sci_28d.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 constexpr size_t MAX_MODEL_NAME_LEN = 32;
+constexpr uint8_t MAX_CACHED_MODELS = 12;
 
 class FruitStore {
 private:
@@ -17,7 +20,17 @@ private:
     bool is_model_loaded_in_ram;
     char loaded_fruit_name[MAX_MODEL_NAME_LEN];
 
+    // ── Browse cache: NVS entry iteration is NOT thread-safe vs the
+    //    NimBLE task touching NVS concurrently (LoadProhibited crash),
+    //    so we enumerate exactly ONCE at init and maintain in RAM. ──
+    char cached_names[MAX_CACHED_MODELS][MAX_MODEL_NAME_LEN];
+    uint8_t cached_count;
+    SemaphoreHandle_t store_mutex;
+
     void get_nvs_key(const char* fruit_name, char key_out[16]) const;
+    void rebuild_cache_locked();
+    void cache_remove_locked(const char* nvs_key);
+    void cache_add_locked(const char* fruit_name);
 
 public:
     FruitStore();
@@ -39,7 +52,7 @@ public:
     const char* get_loaded_fruit_name() const { return loaded_fruit_name; }
 
     // ── Model browser (on-device selector) ────────────────────────
-    // Enumeration order is stable within one boot.
+    // Served from the RAM cache; stable order within one boot.
     uint8_t model_count();
     bool    model_name_at(uint8_t idx, char out[MAX_MODEL_NAME_LEN]);
     // Activates (loads to RAM) and persists the choice across reboots.

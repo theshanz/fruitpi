@@ -6,9 +6,70 @@
 constexpr const char* NVS_NAMESPACE = "fruit_models";
 constexpr const char* ACTIVE_NAME_KEY = "active_name";
 
-FruitStore::FruitStore() : is_model_loaded_in_ram(false) {
+FruitStore::FruitStore()
+    : is_model_loaded_in_ram(false), cached_count(0), store_mutex(nullptr) {
     memset(&active_model_ram, 0, sizeof(Fruit28D));
     memset(loaded_fruit_name, 0, sizeof(loaded_fruit_name));
+    memset(cached_names, 0, sizeof(cached_names));
+}
+
+// ─── Browse cache internals ───────────────────────────────────────
+// Enumerates NVS entries exactly once. Only ever called from init()
+// with the mutex held — never races the NimBLE task afterwards.
+void FruitStore::rebuild_cache_locked() {
+    cached_count = 0;
+    nvs_iterator_t it = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_NAMESPACE,
+                                      NVS_TYPE_BLOB);
+    while (it != nullptr && cached_count < MAX_CACHED_MODELS) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        if (strncmp(info.key, "m_", 2) == 0) {
+            // decode real fruit name from the blob's first bytes
+            nvs_handle_t nvs;
+            if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+                Fruit28D tmp{};
+                size_t len = sizeof(tmp);
+                if (nvs_get_blob(nvs, info.key, &tmp, &len) == ESP_OK &&
+                    tmp.fruit_name[0] != '\0') {
+                    strncpy(cached_names[cached_count], tmp.fruit_name,
+                            MAX_MODEL_NAME_LEN - 1);
+                    cached_names[cached_count][MAX_MODEL_NAME_LEN - 1] = '\0';
+                    cached_count++;
+                }
+                nvs_close(nvs);
+            }
+        }
+        it = nvs_entry_next(it);
+    }
+    if (it != nullptr) nvs_release_iterator(it);
+}
+
+void FruitStore::cache_remove_locked(const char* nvs_key) {
+    for (uint8_t i = 0; i < cached_count; i++) {
+        char key[16];
+        get_nvs_key(cached_names[i], key);
+        if (strcmp(key, nvs_key) == 0) {
+            for (uint8_t j = i; j + 1 < cached_count; j++) {
+                memcpy(cached_names[j], cached_names[j + 1],
+                       MAX_MODEL_NAME_LEN);
+            }
+            cached_count--;
+            memset(cached_names[cached_count], 0, MAX_MODEL_NAME_LEN);
+            return;
+        }
+    }
+}
+
+void FruitStore::cache_add_locked(const char* fruit_name) {
+    for (uint8_t i = 0; i < cached_count; i++) {
+        if (strcmp(cached_names[i], fruit_name) == 0) return; // overwrite
+    }
+    if (cached_count < MAX_CACHED_MODELS) {
+        strncpy(cached_names[cached_count], fruit_name,
+                MAX_MODEL_NAME_LEN - 1);
+        cached_names[cached_count][MAX_MODEL_NAME_LEN - 1] = '\0';
+        cached_count++;
+    }
 }
 
 void FruitStore::get_nvs_key(const char* fruit_name, char key_out[16]) const {
@@ -26,6 +87,10 @@ void FruitStore::get_nvs_key(const char* fruit_name, char key_out[16]) const {
 }
 
 bool FruitStore::init() {
+    if (store_mutex == nullptr) {
+        store_mutex = xSemaphoreCreateMutex();
+    }
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -51,7 +116,10 @@ bool FruitStore::init() {
         nvs_close(nvs);
     }
 
-    Serial.println("[FruitStore] NVS Multi-Fruit Storage Subsystem Ready.");
+    rebuild_cache_locked();   // one-time enumeration, mutex held
+    Serial.printf("[FruitStore] NVS Multi-Fruit Storage Subsystem Ready "
+                  "(%u model%s cached).\n",
+                  cached_count, cached_count == 1 ? "" : "s");
     return true;
 }
 
@@ -79,22 +147,30 @@ bool FruitStore::save_model(const Fruit28D& fruit) {
     }
     Serial.printf("[FruitStore] Saved model '%s' (%u bytes)\n",
                   fruit.fruit_name, (unsigned)sizeof(Fruit28D));
+    if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
+    cache_add_locked(fruit.fruit_name);
+    if (store_mutex) xSemaphoreGive(store_mutex);
     return true;
 }
 
 bool FruitStore::load_model_to_ram(const char* fruit_name) {
     if (fruit_name == nullptr || fruit_name[0] == '\0') return false;
+    if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
 
     char key[16];
     get_nvs_key(fruit_name, key);
 
     nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return false;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        if (store_mutex) xSemaphoreGive(store_mutex);
+        return false;
+    }
 
     Fruit28D tmp{};
     size_t len = sizeof(tmp);
     esp_err_t err = nvs_get_blob(nvs, key, &tmp, &len);
     nvs_close(nvs);
+    // NOTE: mutex released on all exits below via helper lambda-free pattern
 
     // Accept new (mask-carrying) and legacy 612-byte blobs alike; the
     // zeroed tail leaves active_class_mask = 0 -> firmware default classes.
@@ -103,6 +179,7 @@ bool FruitStore::load_model_to_ram(const char* fruit_name) {
         Serial.printf("[FruitStore] Load '%s' failed (0x%X, %u/%u bytes)\n",
                       fruit_name, err, (unsigned)len,
                       (unsigned)sizeof(Fruit28D));
+        if (store_mutex) xSemaphoreGive(store_mutex);
         return false;
     }
 
@@ -111,6 +188,7 @@ bool FruitStore::load_model_to_ram(const char* fruit_name) {
     loaded_fruit_name[MAX_MODEL_NAME_LEN - 1] = '\0';
     is_model_loaded_in_ram = true;
     Serial.printf("[FruitStore] Loaded '%s' into RAM\n", loaded_fruit_name);
+    if (store_mutex) xSemaphoreGive(store_mutex);
     return true;
 }
 
@@ -122,12 +200,16 @@ void FruitStore::unload_active_model() {
 
 bool FruitStore::delete_model_from_flash(const char* fruit_name) {
     if (fruit_name == nullptr || fruit_name[0] == '\0') return false;
+    if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
 
     char key[16];
     get_nvs_key(fruit_name, key);
 
     nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return false;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        if (store_mutex) xSemaphoreGive(store_mutex);
+        return false;
+    }
 
     esp_err_t err = nvs_erase_key(nvs, key);
     if (err == ESP_OK) err = nvs_commit(nvs);
@@ -136,61 +218,41 @@ bool FruitStore::delete_model_from_flash(const char* fruit_name) {
     if (err != ESP_OK) {
         Serial.printf("[FruitStore] Delete '%s' failed (0x%X)\n",
                       fruit_name, err);
+        if (store_mutex) xSemaphoreGive(store_mutex);
         return false;
     }
+    cache_remove_locked(key);
 
     // Dropping the active model leaves the device with nothing to classify.
     if (is_model_loaded_in_ram && strcmp(loaded_fruit_name, fruit_name) == 0) {
         unload_active_model();
     }
+    if (store_mutex) xSemaphoreGive(store_mutex);
     Serial.printf("[FruitStore] Deleted '%s'\n", fruit_name);
     return true;
 }
 
-// ─── Model browser ────────────────────────────────────────────────
+// ─── Model browser (cache-backed — no NVS iteration at runtime) ───
 // Keys follow get_nvs_key(): "m_<name>". The active-name key is a string,
 // so a BLOB-type entry scan naturally lists models only.
 
 uint8_t FruitStore::model_count() {
-    uint8_t n = 0;
-    // Old arduino-esp32 core API: iterators are values; NULL ends the walk.
-    nvs_iterator_t it = nvs_entry_find(nullptr, NVS_NAMESPACE, NVS_TYPE_BLOB);
-    while (it != nullptr) {
-        nvs_entry_info_t info;
-        nvs_entry_info(it, &info);
-        if (strncmp(info.key, "m_", 2) == 0 && n < 255) n++;
-        it = nvs_entry_next(it);
-    }
-    nvs_release_iterator(it);
+    if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
+    uint8_t n = cached_count;
+    if (store_mutex) xSemaphoreGive(store_mutex);
     return n;
 }
 
 bool FruitStore::model_name_at(uint8_t idx, char out[MAX_MODEL_NAME_LEN]) {
-    nvs_iterator_t it = nvs_entry_find(nullptr, NVS_NAMESPACE, NVS_TYPE_BLOB);
-    while (it != nullptr) {
-        nvs_entry_info_t info;
-        nvs_entry_info(it, &info);
-        if (strncmp(info.key, "m_", 2) == 0 && idx == 0) {
-            bool found = false;
-            nvs_handle_t nvs;
-            if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
-                Fruit28D tmp{};
-                size_t len = sizeof(tmp);
-                if (nvs_get_blob(nvs, info.key, &tmp, &len) == ESP_OK) {
-                    strncpy(out, tmp.fruit_name, MAX_MODEL_NAME_LEN - 1);
-                    out[MAX_MODEL_NAME_LEN - 1] = '\0';
-                    found = strlen(out) > 0;
-                }
-                nvs_close(nvs);
-            }
-            nvs_release_iterator(it);
-            return found;
-        }
-        if (strncmp(info.key, "m_", 2) == 0) idx--;
-        it = nvs_entry_next(it);
+    if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
+    bool ok = false;
+    if (idx < cached_count) {
+        strncpy(out, cached_names[idx], MAX_MODEL_NAME_LEN - 1);
+        out[MAX_MODEL_NAME_LEN - 1] = '\0';
+        ok = true;
     }
-    nvs_release_iterator(it);
-    return false;
+    if (store_mutex) xSemaphoreGive(store_mutex);
+    return ok;
 }
 
 bool FruitStore::activate_by_index(uint8_t idx) {
@@ -229,8 +291,7 @@ uint8_t FruitStore::active_index() {
     }
     if (strlen(active) == 0) return 0xFF;
 
-    uint8_t n = model_count();
-    for (uint8_t i = 0; i < n; i++) {
+    for (uint8_t i = 0; i < model_count(); i++) {
         char name[MAX_MODEL_NAME_LEN];
         if (model_name_at(i, name) && strcmp(name, active) == 0) return i;
     }

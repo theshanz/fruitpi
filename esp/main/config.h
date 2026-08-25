@@ -116,3 +116,8 @@ constexpr float GREEN_MASS_VETO_THRESHOLD   = 0.25f;
 constexpr float ANOMALY_CONFIDENCE_THRESHOLD = 0.35f;
 constexpr float MIN_MASS23 = 10.0f;   // volume^(2/3) normalization range
 constexpr float MAX_MASS23 = 300.0f;
+
+// ─── Runtime-tunable vision gates (set over BLE via "vision_config") ───
+// Defaults come from the constexpr originals below.
+extern float g_visionValueMin;
+extern float g_visionSatMin;

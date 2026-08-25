@@ -13,6 +13,10 @@ constexpr float HUE_BIN_WIDTH = (HUE_WINDOW_MAX - HUE_WINDOW_MIN) / HUE_BIN_COUN
 constexpr float UNIFORM_BIN = 1.0f / HUE_BIN_COUNT;
 constexpr float EIGHT_MAX_VAR = 0.875f; // max sum-of-squares for an 8-bin histogram summing to 1
 
+// Runtime-tunable gates (BLE "vision_config"); defaults from config.h.
+float g_visionValueMin = VISION_VALUE_MIN;
+float g_visionSatMin   = VISION_SAT_MIN;
+
 // ─── RGB888 to HSV Conversion ───────────────────────────────────────
 void HueExtractor::rgb888_to_hsv(uint8_t r, uint8_t g, uint8_t b, float& h, float& s, float& v) {
     float rf = r / 255.0f;
@@ -142,7 +146,7 @@ ColorFeatures HueExtractor::process_frame(camera_fb_t* fb, float cm_per_pixel) {
 
         // ─── Background / Noise Filtering ──────────────────────────
         // Filter out dark shadows (V < 0.15), white glare (S < 0.15), or black background
-        if (v < VISION_VALUE_MIN || s < VISION_SAT_MIN) {
+        if (v < g_visionValueMin || s < g_visionSatMin) {
             continue;
         }
 

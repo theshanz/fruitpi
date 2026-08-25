@@ -197,8 +197,14 @@ BiologicalStatus evaluate_fruit_single(
        }
        result.transition_entropy = H;
 
-       constexpr float LOG_5 = 1.6094379124f;
-       result.confidence = clamp_f((1.0f - (H / LOG_5)) * 100.0f, 0.0f, 100.0f);
+       // Max entropy depends on the number of ENABLED classes, not 5.
+       // With a 2-class mask, ln5 normalization pinned confidence >= 68%
+       // and saturated at 100% absurdly easily.
+       int k_enabled = 0;
+       for (int c = 0; c < NUM_CLASSES; c++)
+           if ((model.active_class_mask >> c) & 0x01) k_enabled++;
+       const float log_k = logf((float)(k_enabled > 1 ? k_enabled : NUM_CLASSES));
+       result.confidence = clamp_f((1.0f - (H / log_k)) * 100.0f, 0.0f, 100.0f);
 //////////////////////////////////////////////
        return result;
 }
@@ -272,8 +278,11 @@ BiologicalStatus evaluate_fruit_3tap(
     }
     result.transition_entropy = H;
 
-    constexpr float LOG_5 = 1.6094379124f;
-    result.confidence = clamp_f((1.0f - (H / LOG_5)) * 100.0f, 0.0f, 100.0f);
+    int k_enabled = 0;
+    for (int c = 0; c < NUM_CLASSES; c++)
+        if ((model.active_class_mask >> c) & 0x01) k_enabled++;
+    const float log_k = logf((float)(k_enabled > 1 ? k_enabled : NUM_CLASSES));
+    result.confidence = clamp_f((1.0f - (H / log_k)) * 100.0f, 0.0f, 100.0f);
 
     return result;
 }
