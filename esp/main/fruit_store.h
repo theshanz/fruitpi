@@ -37,6 +37,7 @@ public:
 
     bool init();
     bool save_model(const Fruit28D& fruit);
+    bool get_model_wire(const char* fruit_name, uint8_t out[616]);
     bool load_model_to_ram(const char* fruit_name);
     void unload_active_model();
     bool delete_model_from_flash(const char* fruit_name);

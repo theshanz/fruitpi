@@ -118,44 +118,57 @@ class RulesModel {
 
   // ── Nearest-proto bridge ───────────────────────────────────────────
 
-  /// {label: 28-vector} + enabled labels -> packed model parts.
-  ///
-  /// temp is AUTO-CALIBRATED from the model's own geometry: we measure the
-  /// worst-case winner-vs-runner-up score margin at the prototypes and pick
-  /// the temperature that maps it to ~90% confidence. [tempFactor] is the
-  /// user's sharpness multiplier (0.5 = double margins, 2 = half).
-  /// Returns the effective temp so the UI can show it.
+  /// Knobs -> prototypes -> bridge. Thin wrapper; real work in
+  /// [buildFromPrototypes].
   static ({List<List<double>> w, List<double> b, int mask, double temp})
       buildRulesModel(
       Map<String, List<double>> statesByLabel, List<String> enabledLabels,
       {double tempFactor = 1.0}) {
-    final labels =
-        classLabels.where((l) => statesByLabel.containsKey(l)).toList();
-    assert(labels.isNotEmpty, 'no categories given');
+    return buildFromPrototypes(statesByLabel, enabledLabels,
+        tempFactor: tempFactor);
+  }
 
-    final n = labels.length;
+  /// Prototype vectors + enabled labels -> packed model parts.
+  ///
+  /// Per-dim ranges use a SCALE-AWARE FLOOR:
+  ///   r_d = max(range_d, 0.10, 0.05*max_c|p_c,d|)
+  /// Without it, two classes that nearly agree on a dim (diff 0.02) get
+  /// 1/r^2 amplified into ~2000-weight dims that drown the real signal
+  /// (recorded mango: 6/13 -> 11/13 with this floor).
+  ///
+  /// temp is AUTO-CALIBRATED: worst-case winner-vs-runner-up margin at the
+  /// prototypes maps to ~90% confidence; [tempFactor] multiplies that.
+  static ({List<List<double>> w, List<double> b, int mask, double temp})
+      buildFromPrototypes(
+      Map<String, List<double>> protos, List<String> enabledLabels,
+      {double tempFactor = 1.0}) {
+    final labels = classLabels.where((l) => protos.containsKey(l)).toList();
+    assert(labels.isNotEmpty, 'no categories given');
+    assert(enabledLabels.isNotEmpty, 'no categories enabled');
+
     final ranges = List<double>.filled(dims, 1.0);
     for (var d = 0; d < dims; d++) {
-      var mn = double.infinity, mx = double.negativeInfinity;
+      var mn = double.infinity, mx = double.negativeInfinity, ma = 0.0;
       for (final l in labels) {
-        mn = math.min(mn, statesByLabel[l]![d]);
-        mx = math.max(mx, statesByLabel[l]![d]);
+        mn = math.min(mn, protos[l]![d]);
+        mx = math.max(mx, protos[l]![d]);
+        ma = math.max(ma, protos[l]![d].abs());
       }
-      ranges[d] = (mx - mn) == 0 ? 1.0 : (mx - mn);
+      ranges[d] = math.max((mx - mn), math.max(0.10, 0.05 * ma));
     }
 
     final w = List.generate(numClasses, (_) => List<double>.filled(dims, 0));
     final b = List<double>.filled(numClasses, 0);
-    for (var row = 0; row < n; row++) {
-      final c = classLabels.indexOf(labels[row]);
-      final p = statesByLabel[labels[row]]!;
+    for (final lab in labels) {
+      final c = classLabels.indexOf(lab);
+      final p = protos[lab]!;
       var sumSq = 0.0;
       for (var d = 0; d < dims; d++) {
         final r2 = ranges[d] * ranges[d];
-        w[c][d] = 2.0 * p[d] / (r2 * temp);
+        w[c][d] = 2.0 * p[d] / r2;
         sumSq += p[d] * p[d] / r2;
       }
-      b[c] = -sumSq / temp;
+      b[c] = -sumSq;
     }
 
     var mask = 0;
@@ -164,10 +177,10 @@ class RulesModel {
       if (idx >= 0) mask |= 1 << idx;
     }
 
-    // ── auto-temp: worst-case prototype margin → ~90% target ──
+    // auto-temp: worst-case prototype margin -> ~90% target
     double worstMargin = double.infinity;
     for (final lab in labels) {
-      final scores = classify(statesByLabel[lab]!, w, b, mask);
+      final scores = classify(protos[lab]!, w, b, mask);
       final own = classLabels.indexOf(lab);
       double bestOther = double.negativeInfinity;
       for (var c = 0; c < numClasses; c++) {
@@ -178,15 +191,15 @@ class RulesModel {
       final margin = scores[own] - bestOther;
       if (margin < worstMargin) worstMargin = margin;
     }
-    // ln(9) ≈ 2.197 → 90/10 odds at the prototype itself. Real sensor
-    // noise then pulls confidence below this — honest headroom.
+    // ln(9) ~ 2.197 -> 90/10 odds at the prototype itself; real sensor
+    // noise then pulls confidence below this - honest headroom.
     final autoTemp = (worstMargin == double.infinity || worstMargin <= 0)
         ? 2.0
         : (worstMargin / 2.1972);
     final effTemp = (autoTemp * tempFactor).clamp(0.05, 500.0);
 
-    for (var row = 0; row < n; row++) {
-      final c = classLabels.indexOf(labels[row]);
+    for (final lab in labels) {
+      final c = classLabels.indexOf(lab);
       for (var d = 0; d < dims; d++) {
         w[c][d] /= effTemp;
       }
@@ -196,7 +209,6 @@ class RulesModel {
     }
     return (w: w, b: b, mask: mask, temp: effTemp);
   }
-
   /// Mirror evaluate_fruit_single(): disabled classes score -100000.
   static List<double> classify(
       List<double> state, List<List<double>> w, List<double> b, int mask) {
@@ -270,6 +282,39 @@ class RulesModel {
     final u2 = rng.nextDouble();
     return math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2);
   }
+
+  // ── Measured prototypes (mango, dataset `50%-complete`) ────────────
+  // Class means of the 28-D real feature vectors (13 taps: 6 UNRIPE,
+  // 7 PERFECTLY_RIPE). Extraction mirrors firmware conditioning.
+  // LOO validation: 11/13, median confidence 89% (see
+  // notes/rules-bridge-calibration.md).
+  static const String measuredSourceName =
+      'mango-recording-2026-08 (50%-complete branch)';
+
+  static const List<double> measuredUNRIPE = [
+    0.5421, 0.0194, 0.4288, 0.0000,
+    0.0016, 0.0000, 0.0000, 0.0081,
+    0.9495, 0.0629, 0.6440, 1.5552,
+    3.1562, 6.1648, 8.6951, 12.5689,
+    15.0916, 17.7073, 22.0382, 28.8408,
+    39.5672, 51.8683, 71.0340, 79.1435,
+    102.5381, 0.2000, 0.0000, 0.0000,
+  ];
+
+  static const List<double> measuredPERFECTLYRIPE = [
+    0.4745, 0.0609, 0.4082, 0.0038,
+    0.0046, 0.0171, 0.0159, 0.0150,
+    0.9612, 0.0629, 0.6559, 1.4639,
+    3.4818, 5.8933, 8.2917, 10.6937,
+    14.3089, 16.6865, 20.1426, 24.8715,
+    36.8619, 44.2746, 57.3268, 69.1246,
+    87.3102, 0.2000, 0.0000, 0.0000,
+  ];
+
+  static const Map<String, List<double>> measuredPrototypes = {
+    'UNRIPE': measuredUNRIPE,
+    'PERFECTLY_RIPE': measuredPERFECTLYRIPE,
+  };
 
   // ── Packing ────────────────────────────────────────────────────────
 

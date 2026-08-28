@@ -40,6 +40,13 @@ constexpr uint32_t ARM_SETTLE_MS  = 800;    // ignore triggers this long after a
 constexpr uint32_t ARM_TIMEOUT_MS = 5000;   // auto-disarm when no tap arrives
 constexpr uint32_t ARM_TIMEOUT_US = ARM_TIMEOUT_MS * 1000UL;
 
+// BLE data-collection arming uses a two-stage ready confirmation that mirrors
+// the inference flow: `arm_acoustic` asks the user to PLACE the fruit (piezo
+// stays DISARMED), then `arm_ready` confirms it sits there before listening.
+// READY_WAIT_MS bounds how long we wait for that confirmation before giving
+// up (timeout_disarmed) so the device never hangs armed.
+constexpr uint32_t READY_WAIT_MS = 30000;
+
 // Data-collection arming runs a visible placement countdown first: the piezo
 // is kept DISARMED while the user puts the fruit on it, so the placement
 // itself can never register as a tap. When the countdown ends the sampler

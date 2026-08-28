@@ -71,6 +71,13 @@ class BleProtocol {
   static Map<String, dynamic> cmdInference() => {'command': 'inference_request'};
   static Map<String, dynamic> cmdCancel() => {'command': 'cancel'};
   static Map<String, dynamic> cmdMode(String mode) => {'mode': mode};
+  static Map<String, dynamic> cmdArmAcoustic() =>
+      {'command': 'arm_acoustic'};
+  static Map<String, dynamic> cmdArmReady() =>
+      {'command': 'arm_ready'};
+  static Map<String, dynamic> cmdRawCapture({bool trigger = false, int windows = 20}) =>
+      {'command': 'raw_capture', if (trigger) 'trigger': true, 'windows': windows};
+  static Map<String, dynamic> cmdMsCapture() => {'command': 'ms_capture'};
   static Map<String, dynamic> cmdVisionConfig(
           {double? valueMin, double? satMin, bool save = false}) =>
       {
@@ -120,6 +127,39 @@ class ScanResultData {
       v is num ? v.toDouble() : double.tryParse('$v') ?? 0.0;
 }
 
+/// Hue/multispectral features notified by the firmware (`ms_captured`).
+/// Mirrors BTManager::notify_ms_features: histogram + dispersion + volume.
+class MsCapturedData {
+  final List<double> hueHistogram;
+  final double chromaticDispersion;
+  final double volumeCm3;
+
+  const MsCapturedData({
+    required this.hueHistogram,
+    required this.chromaticDispersion,
+    required this.volumeCm3,
+  });
+
+  static MsCapturedData? tryParse(Map<String, dynamic> j) {
+    if (j['status'] != 'ms_captured') return null;
+    final hist = _list(j['hue_histogram']);
+    if (hist.length != 8) return null;
+    return MsCapturedData(
+      hueHistogram: hist,
+      chromaticDispersion: _d(j['chromatic_dispersion']),
+      volumeCm3: _d(j['volume_cm3']),
+    );
+  }
+
+  static List<double> _list(dynamic v) {
+    if (v is! List) return const [];
+    return v.map((e) => _d(e)).toList();
+  }
+
+  static double _d(dynamic v) =>
+      v is num ? v.toDouble() : double.tryParse('$v') ?? 0.0;
+}
+
 /// Progress of a model upload acknowledged by the firmware.
 class TransferProgress {
   final int id;
@@ -152,6 +192,8 @@ sealed class ResultsEvent {
   static ResultsEvent parse(Uint8List bytes) {
     try {
       final j = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
+      final ms = MsCapturedData.tryParse(j);
+      if (ms != null) return MsCapturedEvent(ms);
       if (j['status'] is String) {
         final status = j['status'] as String;
         if (status == 'transfer_progress') {
@@ -179,6 +221,11 @@ sealed class ResultsEvent {
 class StatusEvent extends ResultsEvent {
   final String status;
   StatusEvent(this.status);
+}
+
+class MsCapturedEvent extends ResultsEvent {
+  final MsCapturedData data;
+  MsCapturedEvent(this.data);
 }
 
 class ResultEvent extends ResultsEvent {

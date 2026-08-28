@@ -35,6 +35,9 @@ class BleService {
   final _results = StreamController<ScanResultData>.broadcast();
   Stream<ScanResultData> get results => _results.stream;
 
+  final _msCaptured = StreamController<MsCapturedData>.broadcast();
+  Stream<MsCapturedData> get msCaptured => _msCaptured.stream;
+
   final _progress = StreamController<TransferProgress>.broadcast();
   Stream<TransferProgress> get progress => _progress.stream;
 
@@ -200,6 +203,33 @@ class BleService {
 
   Future<void> cancel() async => sendCommand(BleProtocol.cmdCancel());
 
+  // ── Data-collection commands ───────────────────────────────────────
+  Future<bool> setDataCollectionMode() async =>
+      sendCommand(BleProtocol.cmdMode('data_collection'));
+
+  Future<bool> setInferenceMode() async =>
+      sendCommand(BleProtocol.cmdMode('inference'));
+
+  Future<bool> armAcoustic() async =>
+      sendCommand(BleProtocol.cmdArmAcoustic());
+
+  /// Second half of the two-stage ready confirmation: after `arm_acoustic`
+  /// told the user to place the fruit, this confirms it sits on the piezo so
+  /// the firmware actually arms (mirrors the inference flow). Sends
+  /// `arm_ready`.
+  Future<bool> armReady() async =>
+      sendCommand(BleProtocol.cmdArmReady());
+
+  Future<bool> captureMs() async => sendCommand(BleProtocol.cmdMsCapture());
+
+  /// Subscribes a listener to completed raw waveform transfers
+  /// (512 uint16 LE samples) — returns an unsubscribe function.
+  StreamSubscription<DownloadedTransfer> onWaveform(
+          void Function(List<double> samples) cb) =>
+      downloads.listen((d) {
+        if (d.isWaveform) cb(d.waveformSamples);
+      });
+
   /// Push new black-spot / glare rejection gates to the device.
   Future<void> sendVisionConfig(
           {double? valueMin, double? satMin, bool save = false}) =>
@@ -223,6 +253,8 @@ class BleService {
         activeModel.value = active;
       case ResultEvent(:final result):
         _results.add(result);
+      case MsCapturedEvent(:final data):
+        _msCaptured.add(data);
       case TransferProgressEvent(:final progress):
         _progress.add(progress);
       case UnknownEvent():
@@ -364,7 +396,7 @@ class BleService {
     _results.close();
     _progress.close();
     _downloads.close();
-    connected.dispose();
+    _msCaptured.close();    connected.dispose();
     models.dispose();
     activeModel.dispose();
   }

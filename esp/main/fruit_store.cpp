@@ -153,6 +153,32 @@ bool FruitStore::save_model(const Fruit28D& fruit) {
     return true;
 }
 
+// Reads one model back in 616-byte wire format (struct padding excluded).
+// Does NOT touch the active-model RAM slot.
+bool FruitStore::get_model_wire(const char* fruit_name, uint8_t out[616]) {
+    if (fruit_name == nullptr || fruit_name[0] == '\0') return false;
+    if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
+
+    char key[16];
+    get_nvs_key(fruit_name, key);
+
+    nvs_handle_t nvs;
+    bool ok = false;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        Fruit28D tmp{};
+        size_t len = sizeof(tmp);
+        if (nvs_get_blob(nvs, key, &tmp, &len) == ESP_OK &&
+            len >= MODEL_WIRE_BYTES_LEGACY) {
+            // blob head is wire-identical: name[32] | W | b | mask+pad
+            memcpy(out, &tmp, MODEL_WIRE_BYTES);
+            ok = true;
+        }
+        nvs_close(nvs);
+    }
+    if (store_mutex) xSemaphoreGive(store_mutex);
+    return ok;
+}
+
 bool FruitStore::load_model_to_ram(const char* fruit_name) {
     if (fruit_name == nullptr || fruit_name[0] == '\0') return false;
     if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);

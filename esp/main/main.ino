@@ -31,6 +31,7 @@ bool     scan_requested = false;      // physical SCAN button edge
 // Inference guide flow: cam scan → fruit on piezo → tap → result.
 bool     awaiting_placement = false;   // cam scan done, waiting for SCAN press
 bool     tap_capture_running = false;  // piezo armed for the inference tap
+uint32_t tap_arm_start_ms = 0;         // armed-at timestamp (tap timeout)
 uint32_t placement_start_at = 0;
 uint32_t scan_start_at = 0;            // millis() when the cam scan should run
 ColorFeatures ms_features_pending;     // vision snapshot taken at cam scan
@@ -55,10 +56,11 @@ static PhysicalButton scan_btn = {SCAN_BUTTON_PIN, false, 0};
 
 // Data-collection arming: visible placement countdown first (piezo fully
 // disarmed while the fruit is placed), then real listening.
-enum class ArmStage : uint8_t { IDLE, GRACE, LISTENING };
+enum class ArmStage : uint8_t { IDLE, GRACE, LISTENING, AWAITING_READY };
 static ArmStage    s_arm_stage = ArmStage::IDLE;
 static uint32_t    s_grace_end_ms = 0;
 static uint8_t     s_grace_shown_sec = 0;
+static uint32_t    s_ready_deadline_ms = 0; // BLE data-collection ready window
 
 static void begin_placement_grace(float threshold) {
   (void)threshold;
@@ -91,11 +93,13 @@ static void cancel_scan() {
                     scan_requested || is_acoustic_armed || scan_start_at != 0;
   is_acoustic_armed = false;
   tap_capture_running = false;
+  tap_arm_start_ms = 0;
   awaiting_placement = false;
   placement_start_at = 0;
   scan_requested = false;
   scan_start_at = 0;
   s_arm_stage = ArmStage::IDLE;
+  s_ready_deadline_ms = 0;
   acoustic_sensor.disarm();
   if (was_active) {
     bt.notify_status_change("disarmed");
@@ -271,6 +275,13 @@ void loop() {
   uint32_t current_time = millis();
   SystemMode mode = bt.get_mode();
 
+  // Mode-change cue: announce DEBUG loudly so nobody scans blind.
+  static SystemMode last_announced_mode = MODE_INFERENCE;
+  if (mode != last_announced_mode) {
+    if (mode == MODE_DEBUG) lcd_flash("DEBUG MODE", nullptr);
+    last_announced_mode = mode;
+  }
+
   /// ── LCD bus discipline ────────────────────────────────────────────
   // While the piezo samples, the LCD stays silent (ADC coupling); any
   // screen requested meanwhile replays automatically when sampling ends.
@@ -315,12 +326,39 @@ void loop() {
   }
   start_prev = start_now;
 
-  if (bt.check_inference_request() && mode == MODE_INFERENCE && !s_menu_open) {
+  // DEBUG mode runs the same guide flow — it just records instead of
+  // classifying (and skips the no-model gate below).
+  if (bt.check_inference_request() &&
+      (mode == MODE_INFERENCE || mode == MODE_DEBUG) && !s_menu_open) {
     boot_trigger = true;
   }
 
   /// ── 4. Physical SCAN / CANCEL buttons ────────────────────────────
-  if (button_pressed_edge(scan_btn, current_time)) {
+  // SCAN is hold-aware like START/CANCEL: short tap = scan trigger,
+  // HOLD = escape hatch back to MODE_INFERENCE (the only way back when
+  // a BLE client flipped the mode and walked away).
+  static bool     scan_prev = false;
+  static uint32_t scan_press_ms = 0;
+  static bool     scan_hold_done = false;
+  bool scan_now = (digitalRead(SCAN_BUTTON_PIN) == HIGH);
+  if (scan_now && !scan_prev) {
+    scan_press_ms = current_time;
+    scan_hold_done = false;
+  }
+  if (scan_now && !scan_hold_done &&
+      current_time - scan_press_ms >= MENU_HOLD_MS) {
+    scan_hold_done = true;
+    if (bt.get_mode() != MODE_INFERENCE) {
+      bt.set_mode(MODE_INFERENCE);
+      bt.notify_status_change("mode_inference");
+      lcd_flash("INFERENCE", "MODE");
+      Serial.println("[Button] SCAN held -> MODE_INFERENCE");
+    }
+    // In inference mode a SCAN hold is deliberately a no-op so an
+    // overlong press never double-fires a scan on release.
+  }
+  if (!scan_now && scan_prev && !scan_hold_done &&
+      current_time - scan_press_ms >= BUTTON_DEBOUNCE_MS) {
     if (s_menu_open) {
       // In the selector: SCAN advances through stored models.
       uint8_t count = store.model_count();
@@ -334,6 +372,7 @@ void loop() {
       Serial.println("[Button] SCAN pressed");
     }
   }
+  scan_prev = scan_now;
 
   // CANCEL works everywhere. The ISR only stamps the press; the verdict
   // waits here so a press can grow into a hold (= selection reset). A
@@ -407,11 +446,14 @@ void loop() {
 
   /// ── 6. Inference guide flow ───────────────────────────────────────
   bool guide_trigger =
-      (boot_trigger || scan_requested) && mode == MODE_INFERENCE &&
+      (boot_trigger || scan_requested) &&
+      (mode == MODE_INFERENCE || mode == MODE_DEBUG) &&
       !s_menu_open;                      // selector owns the buttons meanwhile
 
   // Nothing to classify without an active model — point at the selector.
-  if (guide_trigger && !store.has_model()) {
+  // MODE_DEBUG skips this gate: it records vectors, classification optional.
+  if (guide_trigger && !store.has_model() &&
+      bt.get_mode() != MODE_DEBUG) {
     guide_trigger = false;
     scan_requested = false;
     Serial.println("[Guide] No active model — hold START to select one");
@@ -428,6 +470,7 @@ void loop() {
     lcd_armed();                         // burst BEFORE arming
     start_acoustic_listening(dynamic_adc_threshold);
     tap_capture_running = true;
+    tap_arm_start_ms = current_time;
     Serial.printf("[Guide] TAP NOW (thresh=%.2f)\n", dynamic_adc_threshold);
     bt.notify_status_change("acoustic_armed");
   }
@@ -449,12 +492,23 @@ void loop() {
     if (multispectral_capture(c_f)) {
       ms_features_pending = c_f;         // kept for the tap classifier below
       have_ms_features = true;
-      awaiting_placement = true;
-      placement_start_at = current_time;
-      led_pet_place_on_piezo();
-      lcd_place_on_piezo();
-      Serial.println("[Guide] PLACE ON PIEZO — press SCAN once it sits there");
-      bt.notify_status_change("place_on_piezo");
+      if (bt.get_mode() == MODE_DEBUG) {
+        // Debug mode: skip second-press wait — auto-arm piezo immediately
+        // so the BLE connection doesn't drop before we can arm.
+        start_acoustic_listening(dynamic_adc_threshold);
+        tap_capture_running = true;
+        tap_arm_start_ms = current_time;
+        Serial.println("[Guide] DEBUG: auto-armed piezo — TAP NOW");
+        bt.notify_status_change("acoustic_armed");
+        led_pet_armed();
+      } else {
+        awaiting_placement = true;
+        placement_start_at = current_time;
+        led_pet_place_on_piezo();
+        lcd_place_on_piezo();
+        Serial.println("[Guide] PLACE ON PIEZO — press SCAN once it sits there");
+        bt.notify_status_change("place_on_piezo");
+      }
     } else {
       bt.notify_status_change("camera_error");
       lcd_camera_error();
@@ -462,6 +516,18 @@ void loop() {
   }
 
   // Phase 3/4 — tap captured → classify → report.
+  // No tap within the arm window: abandon the run instead of hanging armed.
+  if (tap_capture_running && !acoustic_sensor.is_data_ready() &&
+      current_time - tap_arm_start_ms >= ARM_TIMEOUT_MS) {
+    tap_capture_running = false;
+    placement_start_at = 0;
+    acoustic_sensor.disarm();
+    Serial.println("[Guide] TAP TIMEOUT — run discarded");
+    bt.notify_status_change("timeout_disarmed");
+    led_pet_timeout();
+    lcd_timeout();
+  }
+
   if (tap_capture_running && acoustic_sensor.is_data_ready()) {
     AcousticFeatures features = acoustic_sensor.get_latest_features();
     if (features.impact_amplitude < MIN_TAP_PEAK) {
@@ -476,8 +542,22 @@ void loop() {
       float state[28];
       assemble_state_28d(state, ms_features_pending, features);  // force-invariant 28-D
       const Fruit28D *model = store.get_active_model_ptr();
-      if (!model) {
-        // Selection vanished mid-run (BLE delete / held-CANCEL reset).
+      bt.notify_debug_state(state, features.impact_amplitude);
+
+      if (bt.get_mode() == MODE_DEBUG) {
+        // Debug mode: always record raw waveform; classify only
+        // if a model happens to be loaded.
+        uint16_t raw_adc[512];
+        uint16_t peak_adc;
+        acoustic_sensor.capture_sampler_raw_window(raw_adc, &peak_adc);
+        bt.send_raw_acoustic_waveform(raw_adc, peak_adc);
+        if (model) {
+          BiologicalStatus status = evaluate_fruit_single(state, *model);
+          bt.notify_scan_result(status);
+        }
+        bt.notify_status_change("debug_captured");
+        lcd_flash("Recorded", nullptr);
+      } else if (!model) {
         Serial.println("[Guide] No active model — run aborted");
         bt.notify_status_change("no_model");
         led_pet_timeout();
@@ -565,15 +645,53 @@ void loop() {
   }
 
   /// ── 8. BLE arm request (data collection) ─────────────────────────
-  if (bt.check_arm_acoustic_request()) {
-    if (acoustic_sensor.get_state() == STATE_DISARMED &&
-        s_arm_stage != ArmStage::GRACE) {
-      begin_placement_grace(dynamic_adc_threshold);
-      Serial.printf("[Acoustic] ARM — grace %us, then listen\n",
-                    (unsigned)(PLACE_GRACE_MS / 1000));
+  // Two-stage ready confirmation, mirroring the inference flow: the first
+  // `arm_acoustic` disarms and asks the user to place the fruit
+  // (`place_on_piezo`); a second `arm_ready` confirms it sits on the piezo
+  // before we actually listen. This avoids the timed-grace freeze the app
+  // saw and guarantees the placement can't false-trigger the tap.
+
+  // ── arm_ready: user confirms the fruit is placed → arm for real.
+  if (bt.check_arm_ready_request()) {
+    if (s_arm_stage == ArmStage::AWAITING_READY) {
+      s_arm_stage = ArmStage::LISTENING;
+      s_ready_deadline_ms = 0;
+      is_acoustic_armed = true;
+      arm_start_time = current_time;
+      start_acoustic_listening(dynamic_adc_threshold);
+      led_pet_armed();
+      Serial.printf("[Acoustic] READY — TAP NOW (thresh=%.2f)\n",
+                    dynamic_adc_threshold);
+      bt.notify_status_change("acoustic_armed");
     } else {
       bt.notify_status_change("acoustic_already_armed");
     }
+  }
+
+  // ── arm_acoustic: asked to arm, but the fruit may not be placed yet.
+  if (bt.check_arm_acoustic_request()) {
+    if (acoustic_sensor.get_state() == STATE_DISARMED &&
+        s_arm_stage != ArmStage::GRACE &&
+        s_arm_stage != ArmStage::AWAITING_READY) {
+      s_arm_stage = ArmStage::AWAITING_READY;
+      s_ready_deadline_ms = current_time + READY_WAIT_MS;
+      lcd_place_on_piezo();
+      led_pet_place_on_piezo();
+      Serial.printf("[Acoustic] ARM — place fruit, send arm_ready to TAP\n");
+      bt.notify_status_change("place_on_piezo");
+    } else {
+      bt.notify_status_change("acoustic_already_armed");
+    }
+  }
+
+  // No READY within the window: abandon instead of hanging waiting forever.
+  if (s_arm_stage == ArmStage::AWAITING_READY && s_ready_deadline_ms != 0 &&
+      current_time >= s_ready_deadline_ms) {
+    s_arm_stage = ArmStage::IDLE;
+    s_ready_deadline_ms = 0;
+    bt.notify_status_change("timeout_disarmed");
+    led_pet_timeout();
+    lcd_timeout();
   }
 
   /// ── 9. Raw waveform debug capture ────────────────────────────────

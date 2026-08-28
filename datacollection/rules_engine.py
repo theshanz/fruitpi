@@ -139,13 +139,57 @@ def state_from_knobs(knobs):
 
 
 # ─── Nearest-proto bridge (same math as rules_to_model.py) ────────────
-def build_rules_model(states_by_label, enabled_labels, temp=2.0):
-    """{label: 28-vector} + enabled list -> (W, b, ranges, mask)."""
+def _scale_aware_ranges(P):
+    """Range floor that mirrors RulesModel.buildFromPrototypes in Dart:
+       r_d = max(range_d, 0.10, 0.05*max_c|p_c,d|)
+
+    Without it, two classes that nearly agree on a dim (diff 0.02) get their
+    1/r^2 term amplified into ~2000-weight dims that drown the real signal
+    (recorded mango: 6/13 -> 11/13 leave-one-out with this floor).
+    """
+    ranges = P.max(axis=0) - P.min(axis=0)
+    max_abs = np.max(np.abs(P), axis=0)
+    ranges = np.maximum(ranges, np.maximum(0.10, 0.05 * max_abs))
+    return ranges
+
+
+def _auto_temp(states_by_label, W, b, mask, temp_factor=1.0):
+    """Auto-calibrated softmax temperature, mirroring the Dart
+    buildFromPrototypes: the worst winner-vs-runner-up margin at the
+    prototypes maps to ~90% confidence. Returns the effective temperature
+    that W,b should be divided by (so the firmware's temp=1 softmax yields
+    honest posteriors)."""
+    labels = [l for l in CLASS_LABELS if l in states_by_label]
+    worst_margin = np.inf
+    for lab in labels:
+        c = CLASS_LABELS.index(lab)
+        scores = classify(states_by_label[lab], W, b, mask)
+        own = scores[c]
+        best_other = -np.inf
+        for i, s in enumerate(scores):
+            if i == c or not ((mask >> i) & 1):
+                continue
+            if s > best_other:
+                best_other = s
+        margin = own - best_other
+        if margin < worst_margin:
+            worst_margin = margin
+    if worst_margin == np.inf or worst_margin <= 0:
+        auto_temp = 2.0
+    else:
+        auto_temp = worst_margin / 2.1972   # ln(9): 90/10 odds at prototype
+    return float(np.clip(auto_temp * temp_factor, 0.05, 500.0))
+
+
+def build_rules_model(states_by_label, enabled_labels, temp=1.0):
+    """{label: 28-vector} + enabled list -> auto-calibrated (W, b, ranges,
+    mask). The softmax temperature is AUTO-CALIBRATED from the prototypes
+    (mirrors Dart RulesModel.buildFromPrototypes); [temp] acts as a
+    multiplier (1.0 = the validated default)."""
     labels = [l for l in CLASS_LABELS if l in states_by_label]
     assert labels, "no categories given"
     P = np.stack([states_by_label[l] for l in labels])
-    ranges = P.max(axis=0) - P.min(axis=0)
-    ranges[ranges == 0] = 1.0                  # dead dims contribute nothing
+    ranges = _scale_aware_ranges(P)
 
     W = np.zeros((NUM_CLASSES, DIMS))
     b = np.zeros(NUM_CLASSES)
@@ -158,7 +202,9 @@ def build_rules_model(states_by_label, enabled_labels, temp=2.0):
     mask = 0
     for lab in enabled_labels:
         mask |= 1 << CLASS_LABELS.index(lab)
-    return W / temp, b / temp, ranges, mask
+
+    eff_temp = _auto_temp(states_by_label, W, b, mask, temp)
+    return W / eff_temp, b / eff_temp, ranges, mask
 
 
 def classify(state, W, b, mask):
@@ -176,8 +222,7 @@ def selftest(states_by_label, W, b, mask, n=200, seed=0):
     rng = np.random.default_rng(seed)
     labels = sorted(states_by_label)
     P = np.stack([states_by_label[l] for l in labels])
-    r = P.max(axis=0) - P.min(axis=0)
-    r[r == 0] = 1.0
+    r = _scale_aware_ranges(P)
     ok = True
     for i, lab in enumerate(labels):
         base = states_by_label[lab]

@@ -16,7 +16,8 @@
 
 enum SystemMode {
     MODE_INFERENCE = 0,
-    MODE_DATA_COLLECTION = 1
+    MODE_DATA_COLLECTION = 1,
+    MODE_DEBUG = 2
 };
 
 struct ScanConfig {
@@ -57,6 +58,7 @@ private:
     // Command Flags matching bt_manager.cpp
     bool capture_image_requested;
     bool arm_acoustic_requested;
+    bool arm_ready_requested;
     bool raw_capture_requested;
     bool raw_capture_trigger_mode;   // true = trigger-based, false = continuous
     uint8_t raw_capture_windows;     // number of capture windows (default 20)
@@ -132,12 +134,16 @@ public:
     void notify_scan_result(const BiologicalStatus& result);
     void notify_ms_features(const ColorFeatures& f);
     void notify_status_change(const char* status_msg);
+    void notify_debug_state(const float state[28], float peak_adc);
     void send_raw_jpeg_stream(const uint8_t* jpeg_buf, size_t jpeg_len);
     void send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc);
     void send_ms_debug_jpeg(const uint8_t* jpeg_buf, size_t jpeg_len);
     void service_transfer();
     bool is_transfer_active() const { return tx_active; }
     bool check_inference_request();
+    bool can_stream() const {
+        return current_mode == MODE_DATA_COLLECTION || current_mode == MODE_DEBUG;
+    }
 
     bool check_capture_image_request() {
         if (capture_image_requested) { capture_image_requested = false; return true; }
@@ -170,6 +176,11 @@ public:
         return false;
     }
 
+    bool check_arm_ready_request() {
+        if (arm_ready_requested) { arm_ready_requested = false; return true; }
+        return false;
+    }
+
     bool check_raw_capture_request() {
         if (raw_capture_requested) { raw_capture_requested = false; return true; }
         return false;
@@ -190,6 +201,7 @@ public:
     }
 
     SystemMode get_mode() const { return current_mode; }
+    void set_mode(SystemMode m) { current_mode = m; }
     const ScanConfig& get_config() const { return current_config; }
     bool is_connected() const { return device_connected; }
 };

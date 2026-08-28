@@ -1,14 +1,16 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/cozy_palette.dart';
 import '../core/rules_model.dart';
+import '../core/training_repository.dart';
 import '../services/ble_service.dart';
 import '../widgets/frosted.dart';
 import '../widgets/spectra_charts.dart';
+import 'data_collection_screen.dart';
 
 typedef Knobs = Map<String, double>;
 
@@ -26,10 +28,12 @@ class RuleBuilderScreen extends StatefulWidget {
 class _RuleBuilderScreenState extends State<RuleBuilderScreen>
     with SingleTickerProviderStateMixin {
   final _nameCtrl = TextEditingController(text: 'Mango');
+  final _repo = TrainingRepository.instance;
   late final Set<String> _enabled;
   late final Map<String, Knobs> _knobs;
-  double _temp = 2.0;
+  double _temp = 2.0; // sharpness MULTIPLIER on the auto-calibrated temp
   String? _previewClass;
+  final Set<String> _measured = {'UNRIPE', 'PERFECTLY_RIPE'};
 
   // floating preview: pops while a knob of this class is being dragged
   String? _focusClass;
@@ -52,25 +56,48 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen>
     _knobs = {
       for (final e in RulesModel.presets.entries) e.key: Map.of(e.value),
     };
+    _repo.addListener(_onRepoChanged);
+  }
+
+  void _onRepoChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _repo.removeListener(_onRepoChanged);
+    super.dispose();
   }
 
   Color _classColor(String label) =>
       Cozy.accents[RulesModel.classLabels.indexOf(label) % Cozy.accents.length];
 
   // ── Derived ────────────────────────────────────────────────────────
-  List<double> _stateOf(String label) => RulesModel.stateFromKnobs(_knobs[label]!);
+  /// Prototype for a class: connected measured data centroid when present,
+  /// else the built-in MEASURED prototype (when that source is picked), else
+  /// knob-generated.
+  List<double> _protoOf(String label) {
+    final collected = _repo.prototypeOf(label);
+    if (collected != null) return collected;
+    if (_measured.contains(label)) {
+      final m = RulesModel.measuredPrototypes[label];
+      if (m != null) return m;
+    }
+    return RulesModel.stateFromKnobs(_knobs[label]!);
+  }
 
-  ({List<List<double>> w, List<double> b, int mask})? get _built {
+  ({List<List<double>> w, List<double> b, int mask, double temp})? get _built {
     if (_enabled.isEmpty) return null;
-    final states = {for (final l in _enabled) l: _stateOf(l)};
-    return RulesModel.buildRulesModel(states, _enabled.toList(), temp: _temp);
+    final protos = {for (final l in _enabled) l: _protoOf(l)};
+    return RulesModel.buildFromPrototypes(protos, _enabled.toList(),
+        tempFactor: _temp);
   }
 
   bool get _selftestOk {
     final b = _built;
     if (b == null) return false;
-    final states = {for (final l in _enabled) l: _stateOf(l)};
-    return RulesModel.selftest(states, b.w, b.b, b.mask);
+    final protos = {for (final l in _enabled) l: _protoOf(l)};
+    return RulesModel.selftest(protos, b.w, b.b, b.mask);
   }
 
   // ── Actions ────────────────────────────────────────────────────────
@@ -131,6 +158,75 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen>
     _toast('No device connected — base64 .bin copied to clipboard');
   }
 
+  /// Open the live data-collection screen for a category.
+  Future<void> _connectData(String label) async {
+    final fruit = _nameCtrl.text.trim().isEmpty ? 'Mango' : _nameCtrl.text.trim();
+    final saved = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DataCollectionScreen(
+          bleService: widget.bleService,
+          category: label,
+          fruitName: fruit,
+        ),
+      ),
+    );
+    if (saved ?? false) {
+      _toast('Recorded ${_repo.sessionsFor(label).length} session(s) for $label');
+    }
+  }
+
+  /// Reopen an already-recorded session in the collection window so the user
+  /// can review, delete taps/hues, rename and re-save it.
+  Future<void> _editData(String label, SampleSession s) async {
+    final fruit = s.fruit;
+    final saved = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DataCollectionScreen(
+          bleService: widget.bleService,
+          category: s.category,
+          fruitName: fruit,
+          editSession: s,
+        ),
+      ),
+    );
+    if (saved ?? false) {
+      _toast('Updated session for ${s.category.replaceAll('_', ' ')}');
+    }
+  }
+
+  /// Pull previously-saved sessions back from disk (survives an app restart).
+  Future<void> _loadFromDisk() async {
+    if (Platform.isLinux && _repo.pickedBaseDir == null) {
+      final ok = await _repo.pickBaseDir();
+      if (!ok) return;
+    }
+    final n = await _repo.loadFromDisk();
+    _toast(n == 0 ? 'No new saved sessions found on disk' : 'Loaded $n saved session(s)');
+  }
+
+  /// Train ALL categories that have connected data into one model.
+  Future<void> _trainAll() async {
+    final name = _nameCtrl.text.trim();
+    if (name.isEmpty) {
+      _toast('Give the fruit a name');
+      return;
+    }
+    final bin = _repo.trainAll(
+        fruitName: name, enabledLabels: _enabled.toList(), tempFactor: _temp);
+    if (bin == null) {
+      _toast('Connect data to at least two enabled categories to train');
+      return;
+    }
+    if (!widget.bleService.isConnected) {
+      await _exportToClipboard(bin);
+      return;
+    }
+    final ok = await widget.bleService.uploadModelBin(bin);
+    _toast(ok ? 'Trained & saved to device flash!' : 'Upload failed');
+  }
+
   void _toast(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       behavior: SnackBarBehavior.floating,
@@ -148,6 +244,11 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen>
       appBar: AppBar(
         title: const Text('Rule Builder'),
         actions: [
+          IconButton(
+            tooltip: 'Load saved sessions from disk',
+            icon: const Icon(Icons.folder_open_rounded),
+            onPressed: _loadFromDisk,
+          ),
           IconButton(
             tooltip: 'Copy .bin as base64',
             icon: const Icon(Icons.copy_all_rounded),
@@ -224,13 +325,15 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen>
             const SizedBox(height: 6),
 
             _SliderTile(
-              label: 'boundary sharpness (temp)',
-              hint: 'lower = crisper class boundaries',
+              label: _built == null
+                  ? 'sharpness multiplier'
+                  : 'sharpness multiplier · temp ${_built!.temp.toStringAsFixed(1)}',
+              hint: 'auto-calibrated to ~90% at prototypes; <1 sharper, >1 softer',
               value: _temp,
-              min: 1.0,
+              min: 0.25,
               max: 4.0,
-              divisions: 30,
-              format: (v) => v.toStringAsFixed(1),
+              divisions: 15,
+              format: (v) => '${v.toStringAsFixed(2)}x',
               color: Cozy.linenAlmond,
               onChanged: (v) => setState(() => _temp = v),
             ),
@@ -241,6 +344,15 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen>
                 color: _classColor(label),
                 knobs: _knobs[label]!,
                 enabled: _enabled.contains(label),
+                measured: _measured.contains(label) &&
+                    RulesModel.measuredPrototypes.containsKey(label),
+                sessions: _repo.sessionsFor(label),
+                onConnect: () => _connectData(label),
+                onRemoveSession: (id) =>
+                    setState(() => _repo.removeSession(label, id)),
+                onEditSession: (s) => _editData(label, s),
+                onToggleSource: (m) => setState(() =>
+                    m ? _measured.add(label) : _measured.remove(label)),
                 onChanged: (on) => setState(
                     () => on ? _enabled.add(label) : _enabled.remove(label)),
                 onKnob: (k, v) => setState(() => _knobs[label]![k] = v),
@@ -249,6 +361,25 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen>
               ),
 
             const SizedBox(height: 16),
+            if (_repo.connectedCategories.isNotEmpty)
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(48),
+                  foregroundColor: Cozy.duskBlue,
+                  side: BorderSide(
+                      color: Cozy.duskBlue.withValues(alpha: 0.5)),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18)),
+                ),
+                onPressed: _enabled.isEmpty ? null : _trainAll,
+                icon: const Icon(Icons.science_rounded, size: 19),
+                label: Text(
+                  'TRAIN ${_repo.connectedCategories.length} CONNECTED CATEGOR${_repo.connectedCategories.length == 1 ? 'Y' : 'IES'}',
+                  style:
+                      const TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1),
+                ),
+              ),
+            const SizedBox(height: 10),
             FilledButton.icon(
               style: FilledButton.styleFrom(
                 minimumSize: const Size.fromHeight(54),
@@ -383,7 +514,7 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen>
     PlotSeries? hueSeries;
     PlotSeries? specSeries;
     if (shown != null) {
-      final st = _stateOf(shown);
+      final st = _protoOf(shown);
       final c = _classColor(shown);
       hueSeries = PlotSeries(shown, c, st.sublist(0, 8));
       specSeries = PlotSeries(shown, c, st.sublist(10, 25));
@@ -468,6 +599,12 @@ class _ClassCard extends StatelessWidget {
   final Color color;
   final Knobs knobs;
   final bool enabled;
+  final bool measured;
+  final List<SampleSession> sessions;
+  final VoidCallback onConnect;
+  final ValueChanged<String> onRemoveSession;
+  final ValueChanged<SampleSession> onEditSession;
+  final ValueChanged<bool> onToggleSource;
   final ValueChanged<bool> onChanged;
   final void Function(String key, double v) onKnob;
   final ValueChanged<String> onFocus;
@@ -478,6 +615,12 @@ class _ClassCard extends StatelessWidget {
     required this.color,
     required this.knobs,
     required this.enabled,
+    required this.measured,
+    required this.sessions,
+    required this.onConnect,
+    required this.onRemoveSession,
+    required this.onEditSession,
+    required this.onToggleSource,
     required this.onChanged,
     required this.onKnob,
     required this.onFocus,
@@ -526,11 +669,46 @@ class _ClassCard extends StatelessWidget {
                     color: enabled ? cs.onSurface : cs.outline)),
             onChanged: onChanged,
           ),
+          if (enabled)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(children: [
+                _sourceChip('KNOBS', !measured, color, cs,
+                    () => onToggleSource(false)),
+                const SizedBox(width: 6),
+                _sourceChip('MEASURED', measured, color, cs,
+                    () => onToggleSource(true)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                      measured
+                          ? 'prototype = recorded data centroid'
+                          : 'prototype = knob-generated',
+                      style: TextStyle(fontSize: 9, color: Cozy.dimGray),
+                      overflow: TextOverflow.ellipsis),
+                ),
+              ]),
+            ),
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 250),
             child: !enabled
                 ? const SizedBox(width: double.infinity)
-                : Column(
+                : measured
+                    ? Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                              'using measured prototype from '
+                              'RulesModel.measuredPrototypes — '
+                              'switch to KNOBS to fine-tune',
+                              style: TextStyle(
+                                  fontSize: 9.5,
+                                  height: 1.4,
+                                  color: Cozy.warmGray)),
+                        ),
+                      )
+                    : Column(
                     key: ValueKey(enabled),
                     children: [
                       _SliderTile(
@@ -584,6 +762,78 @@ class _ClassCard extends StatelessWidget {
                     ],
                   ),
           ),
+          const SizedBox(height: 8),
+          Divider(height: 1, color: Colors.white.withValues(alpha: 0.07)),
+          const SizedBox(height: 8),
+          // ── CONNECTED DATA section ──
+          Row(children: [
+            Icon(Icons.storage_rounded, size: 15, color: color),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                sessions.isEmpty
+                    ? 'NO MEASURED DATA CONNECTED'
+                    : '${sessions.length} SESSION${sessions.length == 1 ? '' : 'S'} · '
+                        '${sessions.fold<int>(0, (a, s) => a + s.tapCount)} TAPS',
+                style: TextStyle(
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.8,
+                    color: sessions.isEmpty ? Cozy.dimGray : color),
+              ),
+            ),
+            TextButton.icon(
+              style: TextButton.styleFrom(foregroundColor: color),
+              onPressed: enabled ? onConnect : null,
+              icon: const Icon(Icons.add_link_rounded, size: 16),
+              label: const Text('CONNECT DATA',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 10)),
+            ),
+          ]),
+          if (sessions.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Column(children: [
+                for (final s in sessions)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 4),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.03),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(children: [
+                      Expanded(
+                        child: Text(
+                          '${s.id} · ${s.tapCount} taps',
+                          style: const TextStyle(
+                              fontSize: 9.5,
+                              fontFamily: Cozy.monoFamily,
+                              color: Cozy.warmGray),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        icon: const Icon(Icons.edit_outlined, size: 15,
+                            color: Cozy.duskBlue),
+                        tooltip: 'Reopen & edit this session',
+                        onPressed: () => onEditSession(s),
+                      ),
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        icon: const Icon(Icons.remove_circle_outline_rounded,
+                            size: 15, color: Cozy.roseError),
+                        tooltip: 'Remove this session',
+                        onPressed: () => onRemoveSession(s.id),
+                      ),
+                    ]),
+                  ),
+              ]),
+            ),
         ]),
       ),
     );
@@ -663,6 +913,44 @@ class _SliderTile extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+
+class _sourceChip extends StatelessWidget {
+  final String text;
+  final bool selected;
+  final Color color;
+  final ColorScheme cs;
+  final VoidCallback onTap;
+
+  const _sourceChip(this.text, this.selected, this.color, this.cs, this.onTap);
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+        decoration: BoxDecoration(
+          color: selected
+              ? color.withValues(alpha: 0.18)
+              : Colors.white.withValues(alpha: 0.04),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+              color: selected
+                  ? color.withValues(alpha: 0.7)
+                  : Colors.white.withValues(alpha: 0.08)),
+        ),
+        child: Text(text,
+            style: TextStyle(
+                fontFamily: Cozy.monoFamily,
+                fontSize: 9.5,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1,
+                color: selected ? color : Cozy.warmGray)),
       ),
     );
   }

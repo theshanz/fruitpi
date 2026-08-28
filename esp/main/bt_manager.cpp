@@ -10,7 +10,7 @@
 BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharScanConfig(nullptr),
                          pCharScanResults(nullptr), pCharRawStream(nullptr), store_ref(nullptr),
                          device_connected(false), current_mode(MODE_INFERENCE),
-                         capture_image_requested(false), arm_acoustic_requested(false),
+                         capture_image_requested(false), arm_acoustic_requested(false), arm_ready_requested(false),
                          raw_capture_requested(false), raw_capture_trigger_mode(false), raw_capture_windows(20), cancel_requested(false),
                          threshold_updated(false), new_threshold_val(0.15f),
                          tx_buf(nullptr), tx_len(0), tx_id(0), tx_type(0), tx_chunks(0), tx_active(false),
@@ -115,7 +115,11 @@ bool BTManager::init(const char *device_name, FruitStore *store)
 void BTManager::onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc)
 {
     device_connected = true;
-    Serial.println("[BTManager] Mobile App Connected.");
+    // Clear any stale guide-flow state left over from a previous
+    // connection that dropped mid-run (BLE disconnect during camera
+    // scan leaves awaiting_placement / tap_capture_running dirty).
+    cancel_requested = true;
+    Serial.println("[BTManager] Mobile App Connected. Restarting Advertising...");
     if (desc)
     {
         // Request a faster connection interval (min 15ms, max 30ms) and
@@ -239,6 +243,10 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 {
                     arm_acoustic_requested = true;
                 }
+                else if (strcmp(cmd, "arm_ready") == 0)
+                {
+                    arm_ready_requested = true;
+                }
                 else if (strcmp(cmd, "raw_capture") == 0)
                 {
                     raw_capture_requested = true;
@@ -281,6 +289,20 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 else if (strcmp(cmd, "cancel") == 0)
                 {
                     cancel_requested = true;
+                }
+                else if (strcmp(cmd, "get_model") == 0 &&
+                         doc.containsKey("fruit"))
+                {
+                    // Stream a stored model back using the standard
+                    // download engine (PKT_TYPE_MODEL).
+                    static uint8_t wire[MODEL_WIRE_BYTES];
+                    if (store_ref &&
+                        store_ref->get_model_wire(doc["fruit"], wire)) {
+                        begin_transfer(PKT_TYPE_MODEL, wire,
+                                       MODEL_WIRE_BYTES);
+                    } else {
+                        notify_status_change("model_error");
+                    }
                 }
                 else if (strcmp(cmd, "vision_config") == 0)
                 {
@@ -331,9 +353,16 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
 
             if (doc.containsKey("mode"))
             {
-                current_mode = (doc["mode"] == "data_collection") ? MODE_DATA_COLLECTION : MODE_INFERENCE;
+                const char *m = doc["mode"];
+                if (strcmp(m, "data_collection") == 0)
+                    current_mode = MODE_DATA_COLLECTION;
+                else if (strcmp(m, "debug") == 0)
+                    current_mode = MODE_DEBUG;
+                else
+                    current_mode = MODE_INFERENCE;
                 Serial.printf("[BTManager] Mode set to: %s\n",
-                              (current_mode == MODE_DATA_COLLECTION) ? "DATA COLLECTION" : "INFERENCE");
+                              (current_mode == MODE_DATA_COLLECTION) ? "DATA COLLECTION" :
+                              (current_mode == MODE_DEBUG) ? "DEBUG" : "INFERENCE");
             }
         }
     }
@@ -736,6 +765,26 @@ void BTManager::notify_ms_features(const ColorFeatures &f)
     pCharScanResults->notify();
 }
 
+// Full pipeline telemetry: the exact 28-D state the classifier saw,
+// plus the raw tap peak. One notify per inference — the app records it.
+void BTManager::notify_debug_state(const float state[28], float peak_adc)
+{
+    if (!device_connected)
+        return;
+
+    DynamicJsonDocument doc(1280);
+    doc["status"] = "debug_state";
+    doc["peak"] = roundf(peak_adc * 1000.0f) / 1000.0f;
+    JsonArray st = doc.createNestedArray("state");
+    for (int i = 0; i < 28; i++)
+        st.add(roundf(state[i] * 1000.0f) / 1000.0f);
+
+    char output[1400];
+    size_t n = serializeJson(doc, output, sizeof(output));
+    pCharScanResults->setValue((uint8_t *)output, n);
+    pCharScanResults->notify();
+}
+
 void BTManager::notify_status_change(const char *status_msg)
 {
     if (!device_connected)
@@ -753,16 +802,14 @@ void BTManager::notify_status_change(const char *status_msg)
 // ─── Public stream entry points (thin wrappers over the engine) ──────
 void BTManager::send_raw_jpeg_stream(const uint8_t *jpeg_buf, size_t jpeg_len)
 {
-    if (current_mode != MODE_DATA_COLLECTION)
-        return;
+    if (!can_stream()) return;
     Serial.printf("[BTManager] Streaming %u byte High-Res JPEG over BLE...\n", (unsigned)jpeg_len);
     begin_transfer(PKT_TYPE_JPEG, jpeg_buf, jpeg_len);
 }
 
 void BTManager::send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc)
 {
-    if (current_mode != MODE_DATA_COLLECTION)
-        return;
+    if (!can_stream()) return;
     Serial.println("[BTManager] Streaming Raw Acoustic Impact Waveform over BLE...");
     begin_transfer(PKT_TYPE_RAW_WAVEFORM, (const uint8_t *)raw_adc, 512 * sizeof(uint16_t));
 }

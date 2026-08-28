@@ -58,8 +58,13 @@ def load_protos(paths):
 
 def build_model(by_class, temp):
     protos = np.stack(list(by_class.values()))
+    # Scale-aware range floor mirroring the Dart RulesModel.buildFromPrototypes:
+    #   r_d = max(range_d, 0.10, 0.05*max_c|p_c,d|)
+    # Without it, near-agreed dims (diff ~0.02) get 1/r^2 blown into
+    # ~2000-weight dims that drown the real separation (recorded mango:
+    # naive centroids 0/13 -> this floor 11/13).
     ranges = protos.max(axis=0) - protos.min(axis=0)
-    ranges[ranges == 0] = 1.0                       # dead dims contribute nothing
+    ranges = np.maximum(ranges, np.maximum(0.10, 0.05 * np.max(np.abs(protos), axis=0)))
     W = np.zeros((NUM_CLASSES, DIMS)); b = np.zeros(NUM_CLASSES)
     for c, p in by_class.items():
         W[c] = 2.0 * p / (ranges**2)
@@ -67,7 +72,31 @@ def build_model(by_class, temp):
     mask = 0
     for c in by_class:
         mask |= 1 << c
-    return W / temp, b / temp, ranges, mask
+    eff_temp = _auto_temp(by_class, W, b, mask, temp)
+    return W / eff_temp, b / eff_temp, ranges, mask
+
+
+def _auto_temp(by_class, W, b, mask, temp_factor=1.0):
+    """Auto-calibrated temperature (mirror Dart buildFromPrototypes):
+    worst winner-vs-runner-up margin at each prototype -> ~90% confidence."""
+    enabled = sorted(by_class)
+    worst_margin = np.inf
+    for c in enabled:
+        scores = np.asarray(W @ by_class[c] + b)
+        own = scores[c]
+        best_other = -np.inf
+        for i in range(NUM_CLASSES):
+            if i == c or not ((mask >> i) & 1):
+                continue
+            if scores[i] > best_other:
+                best_other = scores[i]
+        margin = own - best_other
+        if margin < worst_margin:
+            worst_margin = margin
+    basis = 2.0
+    if worst_margin != np.inf and worst_margin > 0:
+        basis = worst_margin / 2.1972   # ln(9) -> 90/10 odds at prototype
+    return float(np.clip(basis * temp_factor, 0.05, 500.0))
 
 def pack(name, W, b, mask):
     nb = name.encode()[:32].ljust(32, b"\0")
@@ -79,7 +108,8 @@ def selftest(by_class, W, b, mask, n):
     rng = np.random.default_rng(0)
     enabled = sorted(by_class)
     r = np.stack(list(by_class.values()))
-    r = r.max(0) - r.min(0); r[r == 0] = 1.0
+    r = np.maximum(r.max(0) - r.min(0),
+                   np.maximum(0.10, 0.05 * np.max(np.abs(r), axis=0)))
 
     ok = True
     trials_total = 0
@@ -101,30 +131,37 @@ def selftest(by_class, W, b, mask, n):
           f"({trials_total} trials, classes={[LABELS[c] for c in enabled]})")
     return ok
 
-main = argparse.ArgumentParser()
-main.add_argument("--name", required=True)
-main.add_argument("--proto", action="append", required=True)
-main.add_argument("--out", default=None)
-main.add_argument("--temp", type=float, default=2.0)
-main.add_argument("--selftest", type=int, default=200)
-main.add_argument("--mask", default=None,
-                  help="override class bitmask (e.g. 0x03); default: auto "
-                       "from the labels found in the prototypes")
-a = main.parse_args()
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--proto", action="append", required=True)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--temp", type=float, default=1.0,
+                        help="softmax temperature multiplier (default 1.0 = "
+                             "the auto-calibrated value; >1 softens boundaries)")
+    parser.add_argument("--selftest", type=int, default=200)
+    parser.add_argument("--mask", default=None,
+                        help="override class bitmask (e.g. 0x03); default: auto "
+                             "from the labels found in the prototypes")
+    a = parser.parse_args(argv)
 
-by_class = load_protos(a.proto)
-W, b, ranges, auto_mask = build_model(by_class, a.temp)
-mask = int(a.mask, 0) if a.mask else auto_mask
-if mask == 0:
-    raise SystemExit("empty class mask — nothing would be classified")
-print("ranges :", np.array2string(ranges, precision=5))
-print("classes:", ", ".join(LABELS[c] for c in sorted(by_class)),
-      f"(mask=0x{mask:02X}" + (", overridden" if a.mask else ", from labels") + ")")
-ok = selftest(by_class, W, b, mask, a.selftest)
+    by_class = load_protos(a.proto)
+    W, b, ranges, auto_mask = build_model(by_class, a.temp)
+    mask = int(a.mask, 0) if a.mask else auto_mask
+    if mask == 0:
+        raise SystemExit("empty class mask — nothing would be classified")
+    print("ranges :", np.array2string(ranges, precision=5))
+    print("classes:", ", ".join(LABELS[c] for c in sorted(by_class)),
+          f"(mask=0x{mask:02X}" + (", overridden" if a.mask else ", from labels") + ")")
+    ok = selftest(by_class, W, b, mask, a.selftest)
 
-blob = pack(a.name, W, b, mask)
-out = a.out or f"{a.name}_rules.bin"
-open(out,"wb").write(blob)
-print(f"[+] wrote {out} ({len(blob)} bytes; expected {WIRE_BYTES}: "
-      f"{'OK' if len(blob)==WIRE_BYTES else 'BAD'})")
-sys.exit(0 if ok and len(blob)==WIRE_BYTES else 1)
+    blob = pack(a.name, W, b, mask)
+    out = a.out or f"{a.name}_rules.bin"
+    open(out, "wb").write(blob)
+    print(f"[+] wrote {out} ({len(blob)} bytes; expected {WIRE_BYTES}: "
+          f"{'OK' if len(blob)==WIRE_BYTES else 'BAD'})")
+    return 0 if ok and len(blob) == WIRE_BYTES else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

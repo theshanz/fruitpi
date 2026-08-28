@@ -122,8 +122,13 @@ class _HueBarsPainter extends CustomPainter {
   bool shouldRepaint(covariant _HueBarsPainter old) => old.series != series;
 }
 
-/// Live conditioned log-power spectrum over the 15 firmware FFT band
-/// centres (150 Hz … 2.1 kHz) — mirrors state[10..24] exactly.
+/// Spectrum chart with two modes:
+///   • 15 points (Rule Builder) → conditioned log-power at the firmware band
+///     centres, drawn as a smooth spline with a dot on each centre and
+///     frequency labels (150 Hz · 1.1 kHz · 2.1 kHz).
+///   • dense (Data Collection live/preview) → the real full-resolution FFT
+///     log-magnitude curve over 150 Hz–2.1 kHz, drawn as a smooth line with
+///     no per-point dots.
 class SpectrumChart extends StatelessWidget {
   final PlotSeries? series;
   final double height;
@@ -142,11 +147,28 @@ class _SpectrumPainter extends CustomPainter {
   final PlotSeries? series;
   _SpectrumPainter(this.series);
 
-  static const lo = -10.0, hi = -0.2;
   static const centers = [
     150, 250, 350, 450, 550, 650, 750, 850, 950,
     1100, 1300, 1500, 1700, 1900, 2100,
   ];
+
+  static const denseBand = [150, 1100, 2100]; // end labels for the dense mode
+
+  /// Auto-scaled Y range that always includes 0 and pads symmetrically, so
+  /// the same chart serves both the conditioned log-power (Rule Builder,
+  /// ≈-10..0) and the dense log-magnitude (Data Collection, positive span)
+  /// without a hardcoded window.
+  (double, double) _range(List<double> v) {
+    var mn = 0.0, mx = 0.0;
+    for (final x in v) {
+      final c = x.clamp(-100.0, 100.0);
+      if (c < mn) mn = c;
+      if (c > mx) mx = c;
+    }
+    final span = (mx - mn) == 0 ? 1.0 : (mx - mn);
+    final pad = span * 0.15;
+    return (mn - pad, mx + pad);
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -158,7 +180,8 @@ class _SpectrumPainter extends CustomPainter {
       canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
     }
 
-    if (series == null || series!.values.length != centers.length) {
+    final vals = series?.values;
+    if (vals == null || vals.isEmpty) {
       final tp = TextPainter(
         text: TextSpan(
             text: 'enable a class to see its tap spectrum',
@@ -170,53 +193,116 @@ class _SpectrumPainter extends CustomPainter {
           Offset((size.width - tp.width) / 2, (size.height - tp.height) / 2));
       return;
     }
-    final s = series!;
-    final color = s.color;
+
+    final dense = vals.length != centers.length;
+    final color = series!.color;
+    final (lo, hi) = _range(vals);
 
     double y(double v) =>
-        size.height - ((v.clamp(lo, hi) - lo) / (hi - lo)) * (size.height - 18) - 4;
+        size.height - ((v - lo) / (hi - lo)) * (size.height - 18) - 4;
 
+    // zero baseline (only when data straddles 0, e.g. mean-normalized shape)
+    if (lo < 0 && hi > 0) {
+      final y0 = y(0);
+      canvas.drawLine(Offset(0, y0), Offset(size.width, y0),
+          Paint()
+            ..color = Colors.white.withValues(alpha: 0.14)
+            ..strokeWidth = 1);
+    }
+
+    void drawCurve(List<Offset> pts, {bool round = false}) {
+      final fill = Path()..moveTo(pts.first.dx, size.height);
+      for (final p in pts) {
+        fill.lineTo(p.dx, p.dy);
+      }
+      fill.lineTo(pts.last.dx, size.height);
+      canvas.drawPath(
+          fill,
+          Paint()
+            ..shader = LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                color.withValues(alpha: 0.30),
+                color.withValues(alpha: 0.02),
+              ],
+            ).createShader(Rect.fromLTWH(0, 0, size.width, size.height)));
+
+      if (round) {
+        // smooth spline through sparse control points
+        final line = Path()..moveTo(pts.first.dx, pts.first.dy);
+        for (var i = 0; i + 1 < pts.length; i++) {
+          final mid = Offset((pts[i].dx + pts[i + 1].dx) / 2,
+              (pts[i].dy + pts[i + 1].dy) / 2);
+          line.quadraticBezierTo(pts[i].dx, pts[i].dy, mid.dx, mid.dy);
+        }
+        line.lineTo(pts.last.dx, pts.last.dy);
+        canvas.drawPath(
+            line,
+            Paint()
+              ..color = color
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 2.2
+              ..strokeCap = StrokeCap.round);
+      } else {
+        // dense: straight polyline is faithful at this resolution
+        final line = Path()..moveTo(pts.first.dx, pts.first.dy);
+        for (var i = 1; i < pts.length; i++) {
+          line.lineTo(pts[i].dx, pts[i].dy);
+        }
+        canvas.drawPath(
+            line,
+            Paint()
+              ..color = color
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 2.2
+              ..strokeCap = StrokeCap.round
+              ..strokeJoin = StrokeJoin.round);
+      }
+    }
+
+    if (dense) {
+      // real full-resolution log-magnitude curve (150 Hz → 2.1 kHz)
+      final pts = List<Offset>.generate(
+          vals.length,
+          (i) => Offset(i / (vals.length - 1) * size.width, y(vals[i])));
+      drawCurve(pts);
+      for (final f in denseBand) {
+        final frac = (f - denseBand.first) /
+            (denseBand.last - denseBand.first).toDouble();
+        _text(canvas, size, _fmtHz(f), frac * size.width, size.height - 11,
+            center: true);
+      }
+      return;
+    }
+
+    // conditioned log-power at the 15 firmware band centres (Rule Builder)
     final pts = List<Offset>.generate(
-        centers.length, (i) => Offset(i / (centers.length - 1) * size.width, y(s.values[i])));
-
-    // filled area under curve
-    final fill = Path()..moveTo(pts.first.dx, size.height);
-    for (final p in pts) {
-      fill.lineTo(p.dx, p.dy);
-    }
-    fill.lineTo(pts.last.dx, size.height);
-    canvas.drawPath(
-        fill,
-        Paint()
-          ..shader = LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [
-              color.withValues(alpha: 0.30),
-              color.withValues(alpha: 0.02),
-            ],
-          ).createShader(Rect.fromLTWH(0, 0, size.width, size.height)));
-
-    // smooth stroke
-    final line = Path()..moveTo(pts.first.dx, pts.first.dy);
-    for (var i = 0; i + 1 < pts.length; i++) {
-      final mid = Offset(
-          (pts[i].dx + pts[i + 1].dx) / 2, (pts[i].dy + pts[i + 1].dy) / 2);
-      line.quadraticBezierTo(pts[i].dx, pts[i].dy, mid.dx, mid.dy);
-    }
-    line.lineTo(pts.last.dx, pts.last.dy);
-    canvas.drawPath(
-        line,
-        Paint()
-          ..color = color
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.2
-          ..strokeCap = StrokeCap.round);
-
-    // dots on every band centre (like collectorrr's "-o" markers)
+        centers.length,
+        (i) =>
+            Offset(i / (centers.length - 1) * size.width, y(vals[i])));
+    drawCurve(pts, round: true);
     for (final p in pts) {
       canvas.drawCircle(p, 2.4, Paint()..color = color);
     }
+    for (final b in const {0, 7, 14}) {
+      _text(canvas, size, '${centers[b]} Hz', pts[b].dx, size.height - 11,
+          center: true);
+    }
+  }
+
+  static String _fmtHz(int hz) => hz >= 1000 ? '${hz ~/ 1000}.${(hz % 1000) ~/ 100} kHz' : '$hz Hz';
+
+  void _text(Canvas canvas, Size size, String msg, double x, double y,
+      {bool center = false}) {
+    final tp = TextPainter(
+      text: TextSpan(
+          text: msg,
+          style: TextStyle(
+              fontSize: 9, color: Colors.white.withValues(alpha: 0.35))),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, Offset(center ? x - tp.width / 2 : x, y));
   }
 
   @override
