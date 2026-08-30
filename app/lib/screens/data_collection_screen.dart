@@ -7,10 +7,13 @@ import '../core/cozy_palette.dart';
 import '../core/protocol.dart';
 import '../core/rules_model.dart';
 import '../core/training_extractor.dart';
+import '../core/training_extractor32d.dart';
 import '../core/training_repository.dart';
 import '../services/ble_service.dart';
+import '../widgets/feature_views.dart';
 import '../widgets/frosted.dart';
 import '../widgets/spectra_charts.dart';
+import '../widgets/volume_selector.dart';
 import '../widgets/waveform_chart.dart';
 
 /// Live measured-data collection for one ripeness category.
@@ -63,6 +66,11 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
 
   late final TextEditingController _nameCtrl;
 
+  // Per-session container volume (cm³): acts as the default/nominal volume for
+  // this capture session. Threads into the live 32-D preview and the persisted
+  // session when no hue scan carries a measured volume.
+  double _sessionVolumeCm3 = 350.0;
+
   _ArmState _armState = _ArmState.idle;
   int _armSeq = 0; // guards against stale re-arm callbacks
   bool _saving = false;
@@ -89,6 +97,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
       final e = widget.editSession!;
       _hues.addAll(e.hues);
       _taps.addAll(e.taps);
+      if (_hues.isNotEmpty) _sessionVolumeCm3 = _hues.first.volumeCm3;
       if (_taps.isNotEmpty) {
         _liveWave = _taps.last.waveform;
       }
@@ -257,15 +266,23 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
   }
 
   // ── save ───────────────────────────────────────────────────────────
+  /// Allow saving with at least 1 tap OR at least 1 hue scan, so a tap-only
+  /// (acoustic-only) session can be saved without first taking a photo.
+  bool get _canSave => _taps.isNotEmpty || _hues.isNotEmpty;
+
   Future<void> _saveSession() async {
-    if (_hues.isEmpty) {
-      _toast('Capture at least one hue scan');
-      return;
-    }
-    if (_taps.isEmpty) {
-      _toast('Record at least one tap');
-      return;
-    }
+    if (!_canSave) return;
+    // When there are no hue scans (tap-only session), persist nominal defaults
+    // (uniform hue, 350 cm³) so the session still forms a valid 32-D profile.
+    final effectiveHues = _hues.isNotEmpty
+        ? _hues
+        : [
+            HueRecord(
+              hueHistogram: [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125],
+              chromaticDispersion: 1.0,
+              volumeCm3: _sessionVolumeCm3,
+            ),
+          ];
     final fruit = _nameCtrl.text.trim().isEmpty
         ? widget.fruitName
         : _nameCtrl.text.trim();
@@ -285,7 +302,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
       await repo.updateSession(
         category: e.category,
         id: e.id,
-        hues: List.unmodifiable(_hues),
+        hues: List.unmodifiable(effectiveHues),
         taps: List.unmodifiable(_taps),
         newFruit: fruit,
       );
@@ -293,21 +310,13 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
       await repo.addSession(
         fruit: fruit,
         category: widget.category,
-        hues: List.unmodifiable(_hues),
+        hues: List.unmodifiable(effectiveHues),
         taps: List.unmodifiable(_taps),
       );
     }
     setState(() => _saving = false);
     if (!mounted) return;
     Navigator.of(context).pop(true);
-  }
-
-  void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      behavior: SnackBarBehavior.floating,
-      duration: const Duration(seconds: 3),
-      content: Text(msg),
-    ));
   }
 
   // ── preview ────────────────────────────────────────────────────────
@@ -337,18 +346,6 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
       _selectedHueIndex = null;
     });
   }
-  /// Live spectrum = the real full-resolution FFT log-magnitude curve over
-  /// the acoustic band (150 Hz–2.1 kHz), NOT the force-invariant-scaled model
-  /// features (which saturate flat/ramped) and NOT a sparse per-band estimate
-  /// (which looks spiky). Defaults to the last tap; on wide layouts a tapped
-  /// row swaps it to that specific tap's spectrum.
-  List<double>? get _lastSpectrum {
-    if (_selectedTapIndex != null && _selectedTapIndex! < _taps.length) {
-      return List<double>.from(_taps[_selectedTapIndex!].spectrum);
-    }
-    return _taps.isEmpty ? null : List<double>.from(_taps.last.spectrum);
-  }
-
   /// Aggregate hue for the whole session (average across captures). On wide
   /// layouts a tapped hue row swaps it to that single capture's histogram.
   List<double> _avgHistogram() {
@@ -372,6 +369,105 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
       Cozy.accents[RulesModel.classLabels.indexOf(widget.category) %
           Cozy.accents.length];
 
+  /// Session-average volume (cm³); falls back to the per-session volume when
+  /// no hue captured yet.
+  double get _avgVolume {
+    if (_hues.isEmpty) return _sessionVolumeCm3;
+    var vol = 0.0;
+    for (final h in _hues) {
+      vol += h.volumeCm3;
+    }
+    return vol / _hues.length;
+  }
+
+  /// Live 32-D acoustic fingerprint of the most recent tap: the 4x4
+  /// spectrogram (16D) + 6 bio-moment bars, extracted in real time from the
+  /// captured waveform via the same balanced 32-D extractor as the firmware.
+  /// Rendered next to the raw waveform so every tap is visibly grounded in the
+  /// actual measured physics, not a bare squiggle.
+  Widget _buildLive32DCard(TapRecord lastTap) {
+    final state32d = TrainingExtractor32D.extractState32dBalanced(
+      wave: lastTap.waveform,
+      visionHues: _avgHistogram(),
+      volumeCm3: _avgVolume,
+    );
+    final spectrogramValues = state32d.sublist(10, 26);
+    final bioMomentValues = state32d.sublist(26, 32);
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF14161B),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(children: [
+            const Icon(Icons.fingerprint_rounded,
+                size: 14, color: Cozy.matcha),
+            const SizedBox(width: 6),
+            const Text(
+              'EXTRACTED 32D SIGNATURE (THIS TAP)',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 0.8,
+                color: Cozy.matcha,
+              ),
+            ),
+          ]),
+          const SizedBox(height: 8),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Left: 4x4 Spectrogram Heatmap
+              Expanded(
+                flex: 5,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('4x4 SPECTROGRAM (16D)',
+                        style: TextStyle(fontSize: 12, color: Cozy.dimGray)),
+                    const SizedBox(height: 4),
+                    SpectrogramGrid(
+                      values: spectrogramValues,
+                      color: Cozy.matcha,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 14),
+              // Right: 6 Bio-Moment Bars
+              Expanded(
+                flex: 6,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('FLESH DYNAMICS (6D)',
+                        style: TextStyle(fontSize: 12, color: Cozy.dimGray)),
+                    const SizedBox(height: 4),
+                    FleshDynamicsBars(
+                      values: bioMomentValues,
+                      color: Cozy.chamomile,
+                      labels: const [
+                        'cen', 'tail', 'harm', 'stiff', 'entr', 'damp'],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── UI ─────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
@@ -379,11 +475,6 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
     final hueChartWidget = HueHistogramChart(
         series: PlotSeries(widget.category, _color, _avgHistogram()),
         height: 120);
-
-    final spec = _lastSpectrum;
-    final specChart = spec == null
-        ? null
-        : PlotSeries(widget.category, _color, spec);
 
     return Scaffold(
       appBar: AppBar(
@@ -415,16 +506,16 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                     children: [
                       Text(_isEditing ? 'EDITING SESSION' : 'SESSION DESTINATION',
                           style: TextStyle(
-                              fontSize: 9, letterSpacing: 1.2, color: Cozy.dimGray)),
+                              fontSize: 13, letterSpacing: 1.2, color: Cozy.dimGray)),
                       const SizedBox(height: 3),
                       Text('${_nameCtrl.text} · ${widget.category}',
                           style: const TextStyle(
-                              fontSize: 12,
+                              fontSize: 16,
                               fontWeight: FontWeight.bold,
                               color: Cozy.oatmeal)),
                       const SizedBox(height: 2),
                       Text(_destLabel ?? '',
-                          style: const TextStyle(fontSize: 9.5, color: Cozy.warmGray)),
+                          style: const TextStyle(fontSize: 13.5, color: Cozy.warmGray)),
                     ],
                   ),
                 ),
@@ -448,7 +539,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
               style: const TextStyle(fontFamily: Cozy.monoFamily, fontSize: 13),
               decoration: InputDecoration(
                 labelText: _isEditing ? 'FRUIT NAME (RENAME)' : 'FRUIT NAME',
-                labelStyle: TextStyle(fontSize: 11, color: Cozy.dimGray),
+                labelStyle: TextStyle(fontSize: 15, color: Cozy.dimGray),
                 prefixIcon:
                     const Icon(Icons.local_florist_rounded, color: Cozy.matcha),
                 filled: true,
@@ -462,6 +553,30 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                     borderSide: const BorderSide(color: Cozy.matcha)),
               ),
               onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 14),
+
+            // per-session container volume
+            FrostedBox(
+              padding: const EdgeInsets.all(14),
+              borderRadius: BorderRadius.circular(18),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const SectionLabel(title: '// SESSION VOLUME'),
+                    const SizedBox(height: 4),
+                    const Text(
+                        'used for this session’s live 32-D preview and any '
+                        'tap-only save',
+                        style: TextStyle(
+                            fontSize: 13.5, color: Cozy.dimGray)),
+                    const SizedBox(height: 12),
+                    VolumeSelector(
+                      volumeCm3: _sessionVolumeCm3,
+                      onChanged: (v) =>
+                          setState(() => _sessionVolumeCm3 = v),
+                    ),
+                  ]),
             ),
             const SizedBox(height: 14),
 
@@ -485,13 +600,13 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                         ),
                         child: const Text('SHOW AVG',
                             style: TextStyle(
-                                fontSize: 9, color: Cozy.duskBlue)),
+                                fontSize: 13, color: Cozy.duskBlue)),
                       ),
                     ),
                     const SizedBox(width: 8),
                   ],
                   Text('${_hues.length} captured',
-                      style: const TextStyle(fontSize: 9.5, color: Cozy.dimGray)),
+                      style: const TextStyle(fontSize: 13.5, color: Cozy.dimGray)),
                 ]),
                 const SizedBox(height: 10),
                 hueChartWidget,
@@ -534,7 +649,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                   child: Text(_latestTip,
                       key: ValueKey(_latestTip),
                       style: TextStyle(
-                          fontSize: 10.5,
+                          fontSize: 14.5,
                           height: 1.4,
                           color: _armState == _ArmState.tapNow
                               ? Cozy.chamomile
@@ -543,7 +658,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                 const SizedBox(height: 4),
                 Row(children: [
                   Text('AUTO RE-ARM',
-                      style: TextStyle(fontSize: 9.5, color: Cozy.dimGray)),
+                      style: TextStyle(fontSize: 13.5, color: Cozy.dimGray)),
                   const Spacer(),
                   Switch(
                     value: _autoReArm,
@@ -557,6 +672,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                 SizedBox(
                     height: 140,
                     child: WaveformChart(samples: _liveWave, height: 140)),
+                if (_taps.isNotEmpty) _buildLive32DCard(_taps.last),
                 const SizedBox(height: 12),
                 Row(children: [
                   Expanded(
@@ -597,11 +713,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                         backgroundColor: Cozy.matcha,
                         foregroundColor: Cozy.deepBg,
                       ),
-                      onPressed: _saving ||
-                              _hues.isEmpty ||
-                              _taps.isEmpty
-                          ? null
-                          : _saveSession,
+                      onPressed: _saving || !_canSave ? null : _saveSession,
                       icon: _saving
                           ? const SizedBox(
                               width: 16,
@@ -616,47 +728,6 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                 ]),
               ]),
             ),
-            const SizedBox(height: 14),
-
-            // live spectrum from the last tap / selected tap (FFT magnitude)
-            if (specChart != null)
-              FrostedBox(
-                padding: const EdgeInsets.all(14),
-                borderRadius: BorderRadius.circular(18),
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(children: [
-                        const Expanded(
-                            child: SectionLabel(title: '// LIVE TAP SPECTRUM')),
-                        if (_wide && _selectedTapIndex != null)
-                          GestureDetector(
-                            onTap: _clearSelection,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: Cozy.matcha.withValues(alpha: 0.14),
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: const Text('SHOW LAST',
-                                  style: TextStyle(
-                                      fontSize: 9, color: Cozy.matcha)),
-                            ),
-                          ),
-                      ]),
-                      const SizedBox(height: 6),
-                      Text(
-                          _selectedTapIndex != null
-                              ? 'tap ${_selectedTapIndex! + 1} … FFT log-magnitude (150 Hz–2.1 kHz)'
-                              : 'last tap … FFT log-magnitude (150 Hz–2.1 kHz)',
-                          style: TextStyle(
-                              fontSize: 9.5, color: Cozy.dimGray)),
-                      const SizedBox(height: 8),
-                      SizedBox(
-                          height: 130, child: SpectrumChart(series: specChart)),
-                    ]),
-              ),
             const SizedBox(height: 14),
 
             // scrollable, deleteable recording list
@@ -693,7 +764,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
                     '${_hues[i].chromaticDispersion.toStringAsFixed(2)} · '
                     '${_hues[i].volumeCm3.toStringAsFixed(0)} cm³',
                     style: const TextStyle(
-                        fontSize: 10.5, color: Cozy.oatmeal))),
+                        fontSize: 14.5, color: Cozy.oatmeal))),
             // aggregate shown as average (per-capture detail is in each file)
             IconButton(
               visualDensity: VisualDensity.compact,
@@ -860,7 +931,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
         ),
         child: Column(children: [
           Text(label,
-              style: const TextStyle(fontSize: 8.5, letterSpacing: 1.2, color: Cozy.dimGray)),
+              style: const TextStyle(fontSize: 12.5, letterSpacing: 1.2, color: Cozy.dimGray)),
           const SizedBox(height: 4),
           Text(value,
               style: TextStyle(
@@ -900,7 +971,7 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
           Expanded(
               child: Text(text,
                   style: TextStyle(
-                      fontSize: 10.5,
+                      fontSize: 14.5,
                       color: Cozy.oatmeal,
                       fontWeight: selected ? FontWeight.bold : FontWeight.normal))),
           if (onTap != null && !_wide)

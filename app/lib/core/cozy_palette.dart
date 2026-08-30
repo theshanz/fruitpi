@@ -5,6 +5,7 @@ class Cozy {
   Cozy._();
 
   static const matcha = Color(0xFFA3C9A8);
+  static const mintCyan = Color(0xFF9FE0D6);
   static const chamomile = Color(0xFFE8D08D);
   static const heatherPink = Color(0xFFD4A5C1);
   static const duskBlue = Color(0xFF9FB3C8);
@@ -25,28 +26,38 @@ class Cozy {
   static TextTheme textTheme() => const TextTheme(
         displayLarge: TextStyle(
             fontFamily: monoFamily,
-            fontWeight: FontWeight.w700,
+            fontWeight: FontWeight.w800,
+            fontSize: 34,
             color: oatmeal),
         headlineMedium: TextStyle(
             fontFamily: monoFamily,
-            fontWeight: FontWeight.w700,
+            fontWeight: FontWeight.w800,
+            fontSize: 26,
             color: oatmeal),
         titleLarge: TextStyle(
             fontFamily: monoFamily,
-            fontWeight: FontWeight.w600,
+            fontWeight: FontWeight.w700,
+            fontSize: 20,
             color: oatmeal),
         titleMedium: TextStyle(
             fontFamily: monoFamily,
-            fontWeight: FontWeight.w600,
+            fontWeight: FontWeight.w700,
+            fontSize: 17,
             color: oatmeal),
         bodyLarge: TextStyle(
-            fontFamily: monoFamily, fontSize: 13, color: oatmeal),
+            fontFamily: monoFamily, fontWeight: FontWeight.w600, fontSize: 16,
+            color: oatmeal),
         bodyMedium: TextStyle(
-            fontFamily: monoFamily, fontSize: 12, color: warmGray),
+            fontFamily: monoFamily, fontWeight: FontWeight.w600, fontSize: 15,
+            color: warmGray),
         labelLarge: TextStyle(
-            fontFamily: monoFamily, fontWeight: FontWeight.w700, color: oatmeal),
+            fontFamily: monoFamily,
+            fontWeight: FontWeight.w700,
+            fontSize: 15,
+            color: oatmeal),
         labelSmall: TextStyle(
-            fontFamily: monoFamily, fontSize: 10, color: dimGray),
+            fontFamily: monoFamily, fontWeight: FontWeight.w600, fontSize: 13,
+            color: dimGray),
       );
 
   static ThemeData darkTheme() => ThemeData(

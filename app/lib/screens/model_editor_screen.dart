@@ -5,12 +5,14 @@ import 'package:flutter/services.dart';
 
 import '../core/cozy_palette.dart';
 import '../core/protocol.dart' show BleProtocol;
-import '../core/rules_model.dart';
+import '../core/rules_model32d.dart';
 import '../services/ble_service.dart';
 import '../widgets/frosted.dart';
 
-/// Edits an existing model .bin — rename, enable/disable classes,
-/// sharpen/soften boundaries — then re-uploads (same name = NVS overwrite).
+/// Edits an existing 32-D model .bin — rename, enable/disable classes — then
+/// re-uploads (same name = NVS overwrite). Note: the 32-D model uses
+/// unit-normalized cosine prototypes, so there is no boundary-sharpness knob
+/// (scaling a constant per-class bias cannot change the argmax).
 class ModelEditorScreen extends StatefulWidget {
   final BleService bleService;
   final Uint8List originalBin;
@@ -24,7 +26,6 @@ class ModelEditorScreen extends StatefulWidget {
 class _ModelEditorScreenState extends State<ModelEditorScreen> {
   late TextEditingController _nameCtrl;
   late int _mask;
-  double _sharpFactor = 1.0; // cumulative W,b scale applied on save
 
   bool get _isLegacy => widget.originalBin.length < BleProtocol.modelWireBytes;
 
@@ -32,28 +33,23 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
   void initState() {
     super.initState();
     _nameCtrl =
-        TextEditingController(text: RulesModel.binName(widget.originalBin));
-    _mask = BinEdit.maskOf(widget.originalBin);
+        TextEditingController(text: RulesModel32D.binName(widget.originalBin));
+    _mask = RulesModel32D.maskOf(widget.originalBin);
   }
 
-  // ── derived preview bin ────────────────────────────────────────────
   Uint8List get _edited {
     var b = widget.originalBin;
     if (!_isLegacy) {
-      b = BinEdit.withMask(b, _mask);
-      if ((_sharpFactor - 1.0).abs() > 0.001) {
-        b = BinEdit.scaledBy(b, _sharpFactor);
-      }
+      b = RulesModel32D.withMask(b, _mask);
     }
-    return BinEdit.withName(b, _nameCtrl.text.trim());
+    return RulesModel32D.withName(b, _nameCtrl.text.trim());
   }
 
   Set<int> get _enabledClasses => {
-        for (var c = 0; c < RulesModel.classLabels.length; c++)
+        for (var c = 0; c < RulesModel32D.classLabels.length; c++)
           if (((_mask >> c) & 1) == 1) c
       };
 
-  // ── actions ────────────────────────────────────────────────────────
   Future<void> _saveAndUpload() async {
     final name = _nameCtrl.text.trim();
     if (name.isEmpty) {
@@ -67,7 +63,8 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
     final bin = _edited;
 
     if (!widget.bleService.isConnected) {
-      await Clipboard.setData(ClipboardData(text: RulesModel.toBase64(bin)));
+      await Clipboard.setData(
+          ClipboardData(text: RulesModel32D.toBase64(bin)));
       _toast('not connected — edited .bin copied to clipboard');
       return;
     }
@@ -93,7 +90,7 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
             ),
             const SizedBox(height: 12),
             Text('overwriting flash entry…',
-                style: TextStyle(fontSize: 11, color: Cozy.warmGray)),
+                style: TextStyle(fontSize: 15, color: Cozy.warmGray)),
           ]),
         ),
       ),
@@ -118,7 +115,6 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
         content: Text(msg)));
   }
 
-  // ── build ──────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -138,7 +134,7 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
                     const TextStyle(fontFamily: Cozy.monoFamily, fontSize: 13),
                 decoration: InputDecoration(
                   labelText: 'FRUIT NAME',
-                  labelStyle: TextStyle(fontSize: 11, color: Cozy.dimGray),
+                  labelStyle: TextStyle(fontSize: 15, color: Cozy.dimGray),
                   prefixIcon:
                       const Icon(Icons.local_florist_rounded, color: Cozy.matcha),
                   filled: true,
@@ -156,55 +152,18 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
                 Padding(
                   padding: const EdgeInsets.only(top: 6),
                   child: Text(
-                      'legacy 612-byte model — mask & sharpness editing unavailable',
-                      style:
-                          TextStyle(fontSize: 10, color: Cozy.chamomile)),
+                      'legacy ${widget.originalBin.length}-byte model — '
+                      'class editing unavailable',
+                      style: TextStyle(fontSize: 14, color: Cozy.chamomile)),
                 ),
               const SizedBox(height: 14),
 
               const SectionLabel(title: '// ENABLED CLASSES'),
               Text('disabled classes score −100000 on device',
-                  style: TextStyle(fontSize: 9.5, color: Cozy.dimGray)),
+                  style: TextStyle(fontSize: 13.5, color: Cozy.dimGray)),
               const SizedBox(height: 8),
-              for (var c = 0; c < RulesModel.classLabels.length; c++)
+              for (var c = 0; c < RulesModel32D.classLabels.length; c++)
                 _classToggle(c),
-
-              if (!_isLegacy) ...[
-                const SizedBox(height: 14),
-                const SectionLabel(title: '// BOUNDARY SHARPNESS'),
-                Row(children: [
-                  Expanded(
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        trackHeight: 5,
-                        activeTrackColor:
-                            Cozy.linenAlmond.withValues(alpha: 0.85),
-                        inactiveTrackColor:
-                            Colors.white.withValues(alpha: 0.08),
-                        thumbColor: Cozy.linenAlmond,
-                      ),
-                      child: Slider(
-                        value: _sharpFactor,
-                        min: 0.25,
-                        max: 4.0,
-                        divisions: 15,
-                        onChanged: (v) => setState(() => _sharpFactor = v),
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 92,
-                    child: Text(
-                        _sharpFactor < 0.99
-                            ? 'sharper ×${(1 / _sharpFactor).toStringAsFixed(1)}'
-                            : _sharpFactor > 1.01
-                                ? 'softer ÷${_sharpFactor.toStringAsFixed(1)}'
-                                : 'unchanged',
-                        style: TextStyle(
-                            fontSize: 10.5, color: Cozy.warmGray)),
-                  ),
-                ]),
-              ],
             ]),
           ),
           const SizedBox(height: 16),
@@ -219,7 +178,8 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
             onPressed: _saveAndUpload,
             icon: const Icon(Icons.save_rounded),
             label: const Text('SAVE & OVERWRITE ON DEVICE',
-                style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.8)),
+                style:
+                    TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.8)),
           ),
           const SizedBox(height: 24),
         ]),
@@ -228,8 +188,8 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
   }
 
   Widget _classToggle(int c) {
-    final on = (( _mask >> c) & 1) == 1;
-    final label = RulesModel.classLabels[c];
+    final on = ((_mask >> c) & 1) == 1;
+    final label = RulesModel32D.classLabels[c];
     final color = Cozy.accents[c % Cozy.accents.length];
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
@@ -256,7 +216,7 @@ class _ModelEditorScreenState extends State<ModelEditorScreen> {
               child: Text(label.replaceAll('_', ' ').toLowerCase(),
                   style: TextStyle(
                       fontFamily: Cozy.monoFamily,
-                      fontSize: 11.5,
+                      fontSize: 15.5,
                       fontWeight: FontWeight.bold,
                       color: on ? Cozy.oatmeal : Cozy.dimGray)),
             ),

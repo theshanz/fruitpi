@@ -5,7 +5,7 @@
 
 #include <vector>
 
-#include "sci_28d.h"
+#include "sci_32d.h"
 #include "fruit_store.h"
 
 #define SERVICE_UUID             "4fa10001-2241-4cf5-9988-34824317f012"
@@ -22,6 +22,7 @@ enum SystemMode {
 
 struct ScanConfig {
     char target_fruit[32];
+    uint8_t target_tap_count;        // taps per inference run (1..7, 0 = default 3)
     float override_volume_cm3;
     bool use_volume_override;
 };
@@ -74,7 +75,7 @@ private:
     bool  ms_cfg_ambient;
 
     // Destination buffer for received MODEL transfers
-    uint8_t model_rx_buffer[sizeof(Fruit28D)];
+    uint8_t model_rx_buffer[MODEL_WIRE_BYTES];
 
     // ─── TransferEngine: Sender state (downloads) ───
     uint8_t*  tx_buf;
@@ -134,7 +135,9 @@ public:
     void notify_scan_result(const BiologicalStatus& result);
     void notify_ms_features(const ColorFeatures& f);
     void notify_status_change(const char* status_msg);
-    void notify_debug_state(const float state[28], float peak_adc);
+    void notify_debug_state(const float state[VECTOR_DIMENSIONS], float peak_adc);
+    void notify_scan_config();
+    void notify_models();
     void send_raw_jpeg_stream(const uint8_t* jpeg_buf, size_t jpeg_len);
     void send_raw_acoustic_waveform(const uint16_t raw_adc[512], uint16_t peak_adc);
     void send_ms_debug_jpeg(const uint8_t* jpeg_buf, size_t jpeg_len);
@@ -203,5 +206,18 @@ public:
     SystemMode get_mode() const { return current_mode; }
     void set_mode(SystemMode m) { current_mode = m; }
     const ScanConfig& get_config() const { return current_config; }
+
+    // Configurable N-tap consensus (default 3, clamped 1..MAX_CONSENSUS_TAPS).
+    uint8_t get_target_tap_count() const {
+        uint8_t n = current_config.target_tap_count
+                        ? current_config.target_tap_count
+                        : 3;
+        if (n < 1) n = 1;
+        if (n > MAX_CONSENSUS_TAPS) n = MAX_CONSENSUS_TAPS;
+        return n;
+    }
+    bool has_volume_override() const { return current_config.use_volume_override; }
+    float get_override_volume_cm3() const { return current_config.override_volume_cm3; }
+
     bool is_connected() const { return device_connected; }
 };

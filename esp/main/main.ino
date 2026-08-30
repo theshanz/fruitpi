@@ -7,7 +7,7 @@
 #include "led_indicator.h"
 #include "multispectral.h"
 #include "piezo_acoustic.h"
-#include "sci_28d.h"
+#include "sci_32d.h"
 #include <Arduino.h>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +36,12 @@ uint32_t placement_start_at = 0;
 uint32_t scan_start_at = 0;            // millis() when the cam scan should run
 ColorFeatures ms_features_pending;     // vision snapshot taken at cam scan
 bool     have_ms_features = false;
+
+// Multi-tap consensus: each tap contributes a block-normalized state vector;
+// collected taps are fused by median posterior in evaluate_fruit_ntap_32d.
+float    tap_states[MAX_CONSENSUS_TAPS][32];
+uint8_t  current_tap_idx = 0;          // how many taps collected so far
+uint8_t  total_taps = 1;               // target from BLE ScanConfig (clamped)
 
 // ─── Buttons ──────────────────────────────────────────────────────
 struct PhysicalButton {
@@ -94,6 +100,7 @@ static void cancel_scan() {
   is_acoustic_armed = false;
   tap_capture_running = false;
   tap_arm_start_ms = 0;
+  current_tap_idx = 0;
   awaiting_placement = false;
   placement_start_at = 0;
   scan_requested = false;
@@ -247,8 +254,8 @@ static void run_raw_capture() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(SCAN_BUTTON_PIN, INPUT_PULLDOWN);
+  // START and SCAN are merged onto one GPIO14 button (active-high).
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLDOWN);   // == SCAN_BUTTON_PIN (same pin)
   pinMode(CANCEL_BUTTON_PIN, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(CANCEL_BUTTON_PIN), cancel_button_isr,
                   RISING);
@@ -303,28 +310,42 @@ void loop() {
                   dynamic_adc_threshold);
   }
 
-  /// ── 3. START button: tap = run inference, hold = model selector ──
-  static bool     start_prev = false;
-  static uint32_t start_press_ms = 0;
-  static bool     start_hold_done = false;
+  /// ── 3. START/SCAN button (merged on GPIO14): tap = inference/scan, ──
+  ///    hold = model selector. Active-high (INPUT_PULLDOWN).
+  static bool     btn_prev = false;
+  static uint32_t btn_press_ms = 0;
+  static bool     btn_hold_done = false;
   bool boot_trigger = false;
 
-  bool start_now = (digitalRead(BOOT_BUTTON_PIN) == LOW);
-  if (start_now && !start_prev) {
-    start_press_ms = current_time;
-    start_hold_done = false;
+  bool btn_now = (digitalRead(BOOT_BUTTON_PIN) == HIGH);  // == SCAN_BUTTON_PIN
+  if (btn_now && !btn_prev) {
+    btn_press_ms = current_time;
+    btn_hold_done = false;
   }
-  if (start_now && !start_hold_done &&
-      current_time - start_press_ms >= MENU_HOLD_MS) {
-    start_hold_done = true;              // long press consumed, never a tap
+  if (btn_now && !btn_hold_done &&
+      current_time - btn_press_ms >= MENU_HOLD_MS) {
+    btn_hold_done = true;              // long press consumed, never a tap
     if (s_menu_open) commit_menu_selection();   // hold again = use browsed
-    else             open_model_menu();
+    else             open_model_menu();          // hold = open the selector
   }
-  if (!start_now && start_prev && !start_hold_done &&
-      current_time - start_press_ms >= BUTTON_DEBOUNCE_MS) {
-    boot_trigger = true;                 // clean short tap = one inference run
+  if (!btn_now && btn_prev && !btn_hold_done &&
+      current_time - btn_press_ms >= BUTTON_DEBOUNCE_MS) {
+    // Clean short tap.
+    if (s_menu_open) {
+      // In the selector: a tap advances through stored models.
+      uint8_t count = store.model_count();
+      if (count > 0) {
+        s_menu_idx = (uint8_t)((s_menu_idx + 1) % count);
+        draw_model_menu();
+        Serial.printf("[Button] Button cycles -> model %u\n", s_menu_idx);
+      }
+    } else {
+      boot_trigger = true;              // run inference
+      scan_requested = true;            // merged SCAN role (data-collection arm / guide)
+      Serial.println("[Button] START/SCAN pressed");
+    }
   }
-  start_prev = start_now;
+  btn_prev = btn_now;
 
   // DEBUG mode runs the same guide flow — it just records instead of
   // classifying (and skips the no-model gate below).
@@ -332,47 +353,6 @@ void loop() {
       (mode == MODE_INFERENCE || mode == MODE_DEBUG) && !s_menu_open) {
     boot_trigger = true;
   }
-
-  /// ── 4. Physical SCAN / CANCEL buttons ────────────────────────────
-  // SCAN is hold-aware like START/CANCEL: short tap = scan trigger,
-  // HOLD = escape hatch back to MODE_INFERENCE (the only way back when
-  // a BLE client flipped the mode and walked away).
-  static bool     scan_prev = false;
-  static uint32_t scan_press_ms = 0;
-  static bool     scan_hold_done = false;
-  bool scan_now = (digitalRead(SCAN_BUTTON_PIN) == HIGH);
-  if (scan_now && !scan_prev) {
-    scan_press_ms = current_time;
-    scan_hold_done = false;
-  }
-  if (scan_now && !scan_hold_done &&
-      current_time - scan_press_ms >= MENU_HOLD_MS) {
-    scan_hold_done = true;
-    if (bt.get_mode() != MODE_INFERENCE) {
-      bt.set_mode(MODE_INFERENCE);
-      bt.notify_status_change("mode_inference");
-      lcd_flash("INFERENCE", "MODE");
-      Serial.println("[Button] SCAN held -> MODE_INFERENCE");
-    }
-    // In inference mode a SCAN hold is deliberately a no-op so an
-    // overlong press never double-fires a scan on release.
-  }
-  if (!scan_now && scan_prev && !scan_hold_done &&
-      current_time - scan_press_ms >= BUTTON_DEBOUNCE_MS) {
-    if (s_menu_open) {
-      // In the selector: SCAN advances through stored models.
-      uint8_t count = store.model_count();
-      if (count > 0) {
-        s_menu_idx = (uint8_t)((s_menu_idx + 1) % count);
-        draw_model_menu();
-        Serial.printf("[Button] SCAN cycles -> model %u\n", s_menu_idx);
-      }
-    } else {
-      scan_requested = true;
-      Serial.println("[Button] SCAN pressed");
-    }
-  }
-  scan_prev = scan_now;
 
   // CANCEL works everywhere. The ISR only stamps the press; the verdict
   // waits here so a press can grow into a hold (= selection reset). A
@@ -502,11 +482,17 @@ void loop() {
         bt.notify_status_change("acoustic_armed");
         led_pet_armed();
       } else {
+        // Multi-tap consensus: read the target tap count from BLE ScanConfig
+        // (clamped 1..7). A run-wide volume override replaces the
+        // camera-derived estimate for every tap of this run.
+        total_taps = bt.get_target_tap_count();
+        current_tap_idx = 0;
         awaiting_placement = true;
         placement_start_at = current_time;
         led_pet_place_on_piezo();
         lcd_place_on_piezo();
-        Serial.println("[Guide] PLACE ON PIEZO — press SCAN once it sits there");
+        Serial.printf("[Guide] PLACE ON PIEZO — %u tap%s, press SCAN when ready\n",
+                      total_taps, total_taps == 1 ? "" : "s");
         bt.notify_status_change("place_on_piezo");
       }
     } else {
@@ -522,6 +508,7 @@ void loop() {
     tap_capture_running = false;
     placement_start_at = 0;
     acoustic_sensor.disarm();
+    current_tap_idx = 0;               // discard partial consensus run
     Serial.println("[Guide] TAP TIMEOUT — run discarded");
     bt.notify_status_change("timeout_disarmed");
     led_pet_timeout();
@@ -536,13 +523,21 @@ void loop() {
                     features.impact_amplitude);
       start_acoustic_listening(dynamic_adc_threshold);
     } else {
-      Serial.println("[Guide] TAP DETECTED — analyzing...");
+      Serial.printf("[Guide] TAP %u/%u DETECTED\n", current_tap_idx + 1,
+                    total_taps);
       led_pet_tap_ok();
 
-      float state[28];
-      assemble_state_28d(state, ms_features_pending, features);  // force-invariant 28-D
-      const Fruit28D *model = store.get_active_model_ptr();
-      bt.notify_debug_state(state, features.impact_amplitude);
+      // Apply a run-wide volume override (BLE ScanConfig) if present.
+      if (bt.has_volume_override()) {
+        ms_features_pending.volume_cm3 = bt.get_override_volume_cm3();
+      }
+      assemble_state_32d(tap_states[current_tap_idx], ms_features_pending,
+                         features);                    // block-norm 32-D
+      bt.notify_debug_state(tap_states[current_tap_idx],
+                            features.impact_amplitude);
+      current_tap_idx++;
+
+      const Fruit32D *model = store.get_active_model_ptr();
 
       if (bt.get_mode() == MODE_DEBUG) {
         // Debug mode: always record raw waveform; classify only
@@ -552,24 +547,46 @@ void loop() {
         acoustic_sensor.capture_sampler_raw_window(raw_adc, &peak_adc);
         bt.send_raw_acoustic_waveform(raw_adc, peak_adc);
         if (model) {
-          BiologicalStatus status = evaluate_fruit_single(state, *model);
+          BiologicalStatus status =
+              evaluate_fruit_ntap_32d(tap_states, current_tap_idx, *model);
           bt.notify_scan_result(status);
         }
         bt.notify_status_change("debug_captured");
         lcd_flash("Recorded", nullptr);
+        tap_capture_running = false;
+        current_tap_idx = 0;
+        have_ms_features = false;
       } else if (!model) {
         Serial.println("[Guide] No active model — run aborted");
         bt.notify_status_change("no_model");
         led_pet_timeout();
+        tap_capture_running = false;
+        current_tap_idx = 0;
+        have_ms_features = false;
+      } else if (current_tap_idx < total_taps) {
+        // Consensus run — collect more taps. Re-arm the piezo and show
+        // progress; the vision snapshot stays unchanged from the cam scan.
+        Serial.printf("[Guide] %u/%u — TAP AGAIN\n", current_tap_idx,
+                      total_taps);
+        char line1[16];
+        snprintf(line1, sizeof(line1), "TAP %u/%u OK", current_tap_idx,
+                 total_taps);
+        lcd_flash(line1, "TAP AGAIN");
+        start_acoustic_listening(dynamic_adc_threshold);
+        tap_capture_running = true;
+        tap_arm_start_ms = current_time;
       } else {
-        BiologicalStatus status = evaluate_fruit_single(state, *model);
+        // Final tap: fuse all collected states by median posterior.
+        BiologicalStatus status =
+            evaluate_fruit_ntap_32d(tap_states, total_taps, *model);
         bt.notify_scan_result(status);
         led_pet_result(status.primary_decision, status.is_anomaly);
         lcd_result(status.primary_decision, status.is_anomaly,
                    status.confidence);
+        tap_capture_running = false;
+        current_tap_idx = 0;
+        have_ms_features = false;
       }
-      tap_capture_running = false;
-      have_ms_features = false;
     }
   }
 

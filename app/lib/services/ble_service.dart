@@ -29,6 +29,11 @@ class BleService {
   final models = ValueNotifier<List<String>>([]);
   final activeModel = ValueNotifier<String?>(null);
 
+  /// Authoritative run-scope scan config as reported by the firmware (mode,
+  /// tap count, volume). Updated by pushed `scan_config` events and by every
+  /// `get_status` poll / model list reply that carries config.
+  final scanConfig = ValueNotifier<ScanConfigData?>(null);
+
   final _statuses = StreamController<String>.broadcast();
   Stream<String> get statuses => _statuses.stream;
 
@@ -129,7 +134,7 @@ class BleService {
         }
       });
 
-      refreshModels(); // fire-and-forget inventory fetch
+      getStatus(); // one-shot pull of inventory + scan config on connect
       return true;
     } catch (_) {
       connected.value = false;
@@ -190,6 +195,13 @@ class BleService {
     await sendCommand(BleProtocol.cmdListModels());
   }
 
+  /// One-shot pull of the full device snapshot (model inventory + active model
+  /// + scan config). The firmware replies with a models list also carrying the
+  /// config, so a single call refreshes both `models` and `scanConfig`.
+  Future<void> getStatus() async {
+    await sendCommand(BleProtocol.cmdGetStatus());
+  }
+
   Future<void> activateModel(String name) async {
     await sendCommand(BleProtocol.cmdActivateModel(name));
   }
@@ -241,16 +253,12 @@ class BleService {
     switch (ResultsEvent.parse(bytes)) {
       case StatusEvent(:final status):
         _statuses.add(status);
-        // Firmware never pushes the inventory itself — re-pull on every
-        // model lifecycle event so the UI deck stays in sync.
-        if (status == 'model_activated' ||
-            status == 'model_saved' ||
-            status == 'model_deleted') {
-          refreshModels();
-        }
-      case ModelsListEvent(:final models, :final active):
+      case ModelsListEvent(:final models, :final active, :final config):
         this.models.value = models;
         activeModel.value = active;
+        if (config != null) scanConfig.value = config;
+      case ScanConfigEvent(:final data):
+        scanConfig.value = data;
       case ResultEvent(:final result):
         _results.add(result);
       case MsCapturedEvent(:final data):
@@ -399,6 +407,7 @@ class BleService {
     _msCaptured.close();    connected.dispose();
     models.dispose();
     activeModel.dispose();
+    scanConfig.dispose();
   }
 }
 

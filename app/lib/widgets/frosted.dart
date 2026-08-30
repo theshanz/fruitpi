@@ -77,7 +77,7 @@ class SectionLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     return Text(title,
         style: const TextStyle(
-            fontSize: 11,
+            fontSize: 15,
             fontWeight: FontWeight.bold,
             color: Color(0xFF8F8A82),
             letterSpacing: 1.1));
@@ -110,12 +110,12 @@ class MetricPill extends StatelessWidget {
         children: [
           Text(title,
               style:
-                  const TextStyle(fontSize: 11, color: Color(0xFF8F8A82))),
+                  const TextStyle(fontSize: 15, color: Color(0xFF8F8A82))),
           Flexible(
             child: Text(value,
                 textAlign: TextAlign.right,
                 style: TextStyle(
-                    fontSize: 12, fontWeight: FontWeight.bold, color: highlight)),
+                    fontSize: 16, fontWeight: FontWeight.bold, color: highlight)),
           ),
         ],
       ),

@@ -99,9 +99,21 @@ ColorFeatures HueExtractor::process_frame(camera_fb_t* fb, float cm_per_pixel) {
     uint32_t raw_counts[8] = {0};
     uint32_t total_valid_hue_pixels = 0;
 
-    int min_x = fb->width, max_x = 0;
-    int min_y = fb->height, max_y = 0;
-    bool foreground_detected = false;
+    // Outlier-filtered volume: projection histograms of hue-window pixels
+    // survive glare/shadow edges that a raw min/max bbox would chase. Held in
+    // PSRAM (falls back to internal heap) so a full-resolution frame fits.
+    uint32_t* proj_x = (uint32_t*)heap_caps_malloc(
+        (size_t)fb->width * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+    if (!proj_x)
+        proj_x = (uint32_t*)heap_caps_malloc(
+            (size_t)fb->width * sizeof(uint32_t), MALLOC_CAP_8BIT);
+    uint32_t* proj_y = (uint32_t*)heap_caps_malloc(
+        (size_t)fb->height * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+    if (!proj_y)
+        proj_y = (uint32_t*)heap_caps_malloc(
+            (size_t)fb->height * sizeof(uint32_t), MALLOC_CAP_8BIT);
+    if (proj_x) memset(proj_x, 0, (size_t)fb->width * sizeof(uint32_t));
+    if (proj_y) memset(proj_y, 0, (size_t)fb->height * sizeof(uint32_t));
 
     // The camera subsystem captures JPEG by default. Decode it to RGB888
     // (held in PSRAM) so the rest of the pipeline sees raw pixels regardless
@@ -150,24 +162,19 @@ ColorFeatures HueExtractor::process_frame(camera_fb_t* fb, float cm_per_pixel) {
             continue;
         }
 
-        // Track Bounding Box of valid foreground pixels
-        int x = i % fb->width;
-        int y = i / fb->width;
-
-        if (x < min_x) min_x = x;
-        if (x > max_x) max_x = x;
-        if (y < min_y) min_y = y;
-        if (y > max_y) max_y = y;
-        foreground_detected = true;
-
         // ─── Bin hues across the configured window ────────────────────
         if (h >= HUE_WINDOW_MIN && h <= HUE_WINDOW_MAX) {
+            int x = (int)(i % fb->width);
+            int y = (int)(i / fb->width);
+
             int bin_idx = (int)((h - HUE_WINDOW_MIN) / HUE_BIN_WIDTH);
             if (bin_idx < 0) bin_idx = 0;
             if (bin_idx > 7) bin_idx = 7;
 
             raw_counts[bin_idx]++;
             total_valid_hue_pixels++;
+            if (proj_x) proj_x[x]++;
+            if (proj_y) proj_y[y]++;
         }
     }
 
@@ -187,25 +194,43 @@ ColorFeatures HueExtractor::process_frame(camera_fb_t* fb, float cm_per_pixel) {
     // ─── Compute Chromatic Dispersion ─────────────────────────────
     features.chromatic_dispersion = calculate_chromatic_dispersion(features.hue_histogram);
 
-    // ─── Volume Estimation via Ellipsoid Bounding Box ─────────────
-    if (foreground_detected && max_x > min_x && max_y > min_y) {
-        float width_px  = (float)(max_x - min_x + 1);
-        float height_px = (float)(max_y - min_y + 1);
+    // ─── Outlier-Filtered Volume via Projection Histograms ──────────
+    // The fruit must own at least 3% of the frame before we trust the bbox.
+    // Bbox edges are placed where a projection histogram clears a 4-pixel
+    // noise floor, so a single stray glare pixel can't inflate the volume.
+    features.volume_cm3 = VOLUME_DEFAULT_CM3;
+    if (proj_x && proj_y &&
+        (float)total_valid_hue_pixels >= 0.03f * (float)total_pixels) {
+        const uint32_t NOISE_FLOOR = 4;
+        int min_x = -1, max_x = -1, min_y = -1, max_y = -1;
+        for (int x = 0; x < fb->width; x++)
+            if (proj_x[x] >= NOISE_FLOOR) {
+                if (min_x < 0) min_x = x;
+                max_x = x;
+            }
+        for (int y = 0; y < fb->height; y++)
+            if (proj_y[y] >= NOISE_FLOOR) {
+                if (min_y < 0) min_y = y;
+                max_y = y;
+            }
+        if (min_x >= 0 && max_x > min_x && min_y >= 0 && max_y > min_y) {
+            float width_cm  = (float)(max_x - min_x + 1) * cm_per_pixel;
+            float height_cm = (float)(max_y - min_y + 1) * cm_per_pixel;
 
-        float width_cm  = width_px * cm_per_pixel;
-        float height_cm = height_px * cm_per_pixel;
+            // Orientation-invariant prolate spheroid: V = (PI/6) * min² * max
+            float a = (width_cm < height_cm) ? width_cm : height_cm;
+            float b = (width_cm < height_cm) ? height_cm : width_cm;
+            constexpr float PI_OVER_6 = 0.5235987756f;
+            features.volume_cm3 = PI_OVER_6 * (a * a) * b;
 
-        // Prolate Spheroid / Ellipsoid Volume formula: V = (PI / 6) * W^2 * H
-        constexpr float PI_OVER_6 = 0.5235987756f;
-        features.volume_cm3 = PI_OVER_6 * (width_cm * width_cm) * height_cm;
-
-        // Sanity clamping for reasonable fruit sizes [10 cm³..500 cm³]
-        if (features.volume_cm3 < VOLUME_CM3_MIN) features.volume_cm3 = VOLUME_CM3_MIN;
-        if (features.volume_cm3 > VOLUME_CM3_MAX) features.volume_cm3 = VOLUME_CM3_MAX;
-    } else {
-        features.volume_cm3 = VOLUME_DEFAULT_CM3;  // fallback when bbox fails
+            // Sanity clamping for reasonable fruit sizes [10 cm³..500 cm³]
+            if (features.volume_cm3 < VOLUME_CM3_MIN) features.volume_cm3 = VOLUME_CM3_MIN;
+            if (features.volume_cm3 > VOLUME_CM3_MAX) features.volume_cm3 = VOLUME_CM3_MAX;
+        }
     }
 
+    if (proj_x) heap_caps_free(proj_x);
+    if (proj_y) heap_caps_free(proj_y);
     if (decoded_rgb) {
         heap_caps_free(decoded_rgb);
     }

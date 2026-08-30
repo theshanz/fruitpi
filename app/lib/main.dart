@@ -11,6 +11,12 @@ void main() {
 
 class CozySpectraApp extends StatelessWidget {
   final BleService bleService;
+
+  /// Global monospace text scale — Linux renders small monospace glyphs
+  /// hair-thin, so every Text (including graph/knob labels) is enlarged by
+  /// this factor on top of the (already bumped) theme sizes.
+  static const double _globalTextScale = 1.2;
+
   const CozySpectraApp({super.key, required this.bleService});
 
   @override
@@ -20,6 +26,11 @@ class CozySpectraApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       darkTheme: Cozy.darkTheme(),
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context)
+            .copyWith(textScaler: const TextScaler.linear(_globalTextScale)),
+        child: child ?? const SizedBox.shrink(),
+      ),
       home: CozySpectraDashboard(bleService: bleService),
     );
   }

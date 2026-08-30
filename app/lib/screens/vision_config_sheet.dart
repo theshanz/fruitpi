@@ -59,7 +59,7 @@ Future<void> showVisionConfigSheet(BuildContext context, BleService ble) {
             Text(
               'applied instantly over BLE · SAVE & CLOSE writes them to flash '
               '(NVS) so they survive ESP reboots.',
-              style: TextStyle(fontSize: 9.5, height: 1.5, color: Cozy.dimGray),
+              style: TextStyle(fontSize: 13.5, height: 1.5, color: Cozy.dimGray),
             ),
             const SizedBox(height: 10),
             Row(mainAxisAlignment: MainAxisAlignment.end, children: [
@@ -109,12 +109,12 @@ Widget _gateSlider({
         Expanded(
             child: Text(label,
                 style: TextStyle(
-                    fontSize: 11,
+                    fontSize: 15,
                     fontWeight: FontWeight.bold,
                     letterSpacing: 0.5,
                     color: color))),
         Text(value.toStringAsFixed(2),
-            style: TextStyle(fontSize: 11, color: Cozy.oatmeal)),
+            style: TextStyle(fontSize: 15, color: Cozy.oatmeal)),
       ]),
       SliderTheme(
         data: SliderThemeData(
@@ -135,7 +135,7 @@ Widget _gateSlider({
         ),
       ),
       Text(hint,
-          style: TextStyle(fontSize: 9.5, height: 1.4, color: Cozy.dimGray)),
+          style: TextStyle(fontSize: 13.5, height: 1.4, color: Cozy.dimGray)),
     ]),
   );
 }

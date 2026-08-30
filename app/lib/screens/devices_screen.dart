@@ -117,7 +117,7 @@ class _DevicesScreenState extends State<DevicesScreen> {
                   const SizedBox(width: 6),
                   Text(_scanning ? 'SCANNING' : 'IDLE',
                       style: TextStyle(
-                          fontSize: 10,
+                          fontSize: 14,
                           fontWeight: FontWeight.bold,
                           color: _scanning ? Cozy.matcha : Cozy.dimGray)),
                 ]),
@@ -128,7 +128,7 @@ class _DevicesScreenState extends State<DevicesScreen> {
                     padding: const EdgeInsets.only(bottom: 10),
                     child: Text(_hint,
                         style:
-                            TextStyle(fontSize: 11, color: Cozy.chamomile)),
+                            TextStyle(fontSize: 15, color: Cozy.chamomile)),
                   ),
 
                 if (fruits.isEmpty)
@@ -142,16 +142,16 @@ class _DevicesScreenState extends State<DevicesScreen> {
                           if (!_scanning) ...[
                             Text('scan paused — tap ↻',
                                 style: TextStyle(
-                                    fontSize: 11, color: Cozy.warmGray)),
+                                    fontSize: 15, color: Cozy.warmGray)),
                           ] else ...[
                             Text('searching for "Fruitipi"…',
                                 style: TextStyle(
-                                    fontSize: 11, color: Cozy.dimGray)),
+                                    fontSize: 15, color: Cozy.dimGray)),
                             const SizedBox(height: 4),
                             Text(
                                 '${all.length} BLE devices seen so far',
                                 style: TextStyle(
-                                    fontSize: 9.5, color: Cozy.dimGray)),
+                                    fontSize: 13.5, color: Cozy.dimGray)),
                           ],
                         ]),
                       ),
@@ -169,7 +169,7 @@ class _DevicesScreenState extends State<DevicesScreen> {
                 const SizedBox(height: 8),
                 if (others.isEmpty)
                   Text(_scanning ? 'listening…' : '—',
-                      style: TextStyle(fontSize: 10, color: Cozy.dimGray))
+                      style: TextStyle(fontSize: 14, color: Cozy.dimGray))
                 else
                   ...others.map((r) => ListTile(
                         dense: true,
@@ -181,10 +181,10 @@ class _DevicesScreenState extends State<DevicesScreen> {
                                     ? r.device.platformName
                                     : '(unnamed)'),
                             style: TextStyle(
-                                fontSize: 11, color: Cozy.warmGray)),
+                                fontSize: 15, color: Cozy.warmGray)),
                         subtitle: Text('${r.device.remoteId.str} · ${r.rssi} dBm',
                             style: TextStyle(
-                                fontSize: 9, color: Cozy.dimGray)),
+                                fontSize: 13, color: Cozy.dimGray)),
                         onTap: () => _pick(r), // allow manual try anyway
                       )),
                 const SizedBox(height: 30),
@@ -229,7 +229,7 @@ class _DevicesScreenState extends State<DevicesScreen> {
                           fontWeight: FontWeight.bold,
                           color: Cozy.oatmeal)),
                   Text('${r.device.remoteId.str} · ${r.rssi} dBm',
-                      style: TextStyle(fontSize: 9.5, color: Cozy.dimGray)),
+                      style: TextStyle(fontSize: 13.5, color: Cozy.dimGray)),
                 ]),
           ),
           const Icon(Icons.chevron_right_rounded,

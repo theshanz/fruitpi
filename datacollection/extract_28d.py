@@ -3,8 +3,7 @@
 sample sessions.
 
 Replicates EXACTLY the math in esp/main/piezo_acoustic.cpp and sci_28d.cpp so
-prototypes hard-coded into sci_28d_hardcoded.cpp match what the device
-computes at inference time:
+the prototypes it prints match what the device computes at inference time:
 
     state[0..7]  = hue_histogram            (averaged across hue_*.json)
     state[8]     = chromatic_dispersion     (averaged)
@@ -185,7 +184,7 @@ def print_c_array(name, state):
 
 def print_range_scale(unripe_state, ripe_state):
     """Per-dimension |ripe - unripe|, zeros replaced by 1.0 — the exact
-    normalization sci_28d_hardcoded.cpp dist_sq() divides by."""
+    normalization the prototype dist_sq() divides by."""
     scale = np.abs(ripe_state - unripe_state)
     scale[scale == 0.0] = 1.0
     print("static const float RANGE_SCALE[VECTOR_DIMENSIONS] = { "

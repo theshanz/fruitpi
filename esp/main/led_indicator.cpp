@@ -12,7 +12,7 @@
 #ifdef CONFIG_IDF_TARGET_ESP32S3
 #include <string.h>
 #include "rgb_led.h"
-#include "sci_28d.h"   // CLASS_LABELS — result mapped by index, not literals
+#include "sci_32d.h"   // CLASS_LABELS — result mapped by index, not literals
 
 enum class Pattern { SOLID, BREATH, BLINK, STROBE, DOUBLE_BLINK, FADE, RAINBOW };
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "sci_28d.h"
+#include "sci_32d.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include <freertos/FreeRTOS.h>
@@ -12,9 +12,9 @@ constexpr uint8_t MAX_CACHED_MODELS = 12;
 class FruitStore {
 private:
 #if defined(_MSC_VER)
-    __declspec(align(16)) Fruit28D active_model_ram;
+    __declspec(align(16)) Fruit32D active_model_ram;
 #else
-    alignas(16) Fruit28D active_model_ram;
+    alignas(16) Fruit32D active_model_ram;
 #endif
 
     bool is_model_loaded_in_ram;
@@ -36,13 +36,13 @@ public:
     FruitStore();
 
     bool init();
-    bool save_model(const Fruit28D& fruit);
-    bool get_model_wire(const char* fruit_name, uint8_t out[616]);
+    bool save_model(const Fruit32D& fruit);
+    bool get_model_wire(const char* fruit_name, uint8_t out[MODEL_WIRE_BYTES]);
     bool load_model_to_ram(const char* fruit_name);
     void unload_active_model();
     bool delete_model_from_flash(const char* fruit_name);
 
-    const Fruit28D* get_active_model_ptr() const {
+    const Fruit32D* get_active_model_ptr() const {
         return is_model_loaded_in_ram ? &active_model_ram : nullptr;
     }
 

@@ -47,4 +47,12 @@ datacollection/__pycache__/
 # Notes (local dev notes, not shared)
 notes/
 tests/
+
+# Old grounded dataset (kept on disk only, never in git)
+datacollection/dataset/Mango/Mango_1785891275/
+datacollection/dataset/Mango/Mango_1785891354/
+
+# Device-captured validation waveforms (not source of record)
+fruitpi_test/
+
 datacollection/dataset/Mango/Mango_1785790627/

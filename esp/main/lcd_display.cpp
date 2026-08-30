@@ -26,6 +26,19 @@
 static LiquidCrystal_I2C* lcd = nullptr;
 static bool lcd_ready = false;
 
+// ─── Cross-task safety ────────────────────────────────────────────────
+// LCD state + the PCF8574 I2C device are touched from TWO tasks that run at
+// the same time:
+//   • the Arduino loop task — lcd_display_update() repaints/animates, and
+//   • the NimBLE host task  — lcd_set_active_model()/lcd_idle() etc. when the
+//     mobile app activates, deletes or uploads a model (bt_manager onWrite).
+// Without a lock an app-driven model change races the loop's repaint, tearing
+// the screen structs and corrupting the I2C transaction -> blank/gibberish
+// display and a frozen menu. Every public lcd_*() now serializes on one mutex.
+static SemaphoreHandle_t lcd_lock = nullptr;
+static void lcd_lock_take() { if (lcd_lock) xSemaphoreTake(lcd_lock, portMAX_DELAY); }
+static void lcd_lock_give() { if (lcd_lock) xSemaphoreGive(lcd_lock); }
+
 // ─── Screen bookkeeping ──────────────────────────────────────────
 struct Screen {
   char l1[17];
@@ -48,24 +61,15 @@ static bool s_quiet = false;               // piezo listening: freeze the bus
 
 static const char SPINNER[4] = {'-', '/', char(0x5C), '|'};
 
-// ─── Idle mascot: 2x2 custom-char mango that blinks ─────────────
-// Four CGRAM slots (0-3); slot 7 stays reserved for the confidence bar.
-// Animation = reloading the two "eye" characters, ~16 bytes per blink,
-// no screen repaint.
-static uint8_t MANGO_TOP_L[8] = {0x00,0x03,0x07,0x0F,0x1F,0x1F,0x1F,0x1F};
-static uint8_t MANGO_TOP_R[8] = {0x00,0x10,0x1C,0x1E,0x1F,0x1F,0x1F,0x1F};
-static const uint8_t MANGO_BOT_L_OPEN[8] =
-  {0x1F,0x1F,0x1F,0x1D,0x1F,0x1F,0x1C,0x0E};          // eye open, grin left
-static const uint8_t MANGO_BOT_R_OPEN[8] =
-  {0x1F,0x1F,0x1F,0x17,0x1F,0x1F,0x07,0x07};          // eye open, grin right
-static const uint8_t MANGO_BOT_L_BLINK[8] =
-  {0x1F,0x1F,0x1F,0x11,0x1F,0x1F,0x1C,0x0E};          // eye = lash line
-static const uint8_t MANGO_BOT_R_BLINK[8] =
-  {0x1F,0x1F,0x1F,0x08,0x1F,0x1F,0x07,0x07};
-static bool    mango_blink = false;
+static uint8_t  scan_pos = 0;            // idle "scanning" sweep position (0..SCAN_WIN_W-1)
 static uint8_t menu_cell_col = 0;        // LCD column of the blinking bar cell
 static bool    menu_cell_on = false;
 static char    s_model_name[17] = {0};  // active model badge for idle screens
+
+// Idle "scanning" animation: a small block sweeps left->right across the
+// spare columns of line 2 (after "Press START"), implying ready + scanning.
+#define SCAN_WIN_COL 11          // first column of the sweep window (11..15)
+#define SCAN_WIN_W    5          // sweep width in columns
 
 // ─── Low-level write ─────────────────────────────────────────────
 static void paint(const Screen& s) {
@@ -127,13 +131,12 @@ static void set_base(const char* l1, const char* l2) {
 
 static void set_base_idle() {
   if (s_model_name[0]) {
-    // Default screen carries the active model badge (selector bar mirrors it).
-    snprintf(base_scr.l1, sizeof(base_scr.l1), "\x02\x03 %.13s OK", s_model_name);
-    strncpy(base_scr.l2, "\x02\x03 Ready  SCAN", 16); base_scr.l2[16] = '\0';
+    // Show just the active fruit — simple, no separator/truncation.
+    strncpy(base_scr.l1, s_model_name, 16);  base_scr.l1[16] = '\0';
   } else {
-    strncpy(base_scr.l1, "\x02\x03 Fruitipi", 16);  base_scr.l1[16] = '\0';
-    strncpy(base_scr.l2, "\x02\x03 Ready  SCAN", 16); base_scr.l2[16] = '\0';
+    strncpy(base_scr.l1, "Fruitipi", 16);  base_scr.l1[16] = '\0';
   }
+  strncpy(base_scr.l2, "Press START", 16); base_scr.l2[16] = '\0';
   base_is_idle = true;
   trans_active = false;
   cur_anim = Anim::NONE;
@@ -154,16 +157,23 @@ static void flash(const char* l1, const char* l2, uint32_t hold_ms) {
 }
 
 // ─── Public API ──────────────────────────────────────────────────
+// Every public entry point takes the mutex for the whole call. The internal
+// helpers (set_screen/set_base/paint/commit/flash) are NEVER called directly
+// from a task — only through a public lcd_*() — so there's no nesting.
 void lcd_set_quiet(bool quiet) {
-  if (quiet == s_quiet) return;
+  lcd_lock_take();
+  if (quiet == s_quiet) { lcd_lock_give(); return; }
   s_quiet = quiet;
   // Bus just went silent (piezo armed) or came back (capture done).
   // Repaint whatever belongs on screen now — the quiet window may have
   // swallowed requests or left a half-finished animation.
   if (!quiet) commit(trans_active ? Where::TRANSIENT : Where::BASE);
+  lcd_lock_give();
 }
 
 void lcd_display_init() {
+  if (!lcd_lock) lcd_lock = xSemaphoreCreateMutex();
+  lcd_lock_take();
   Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
   Wire.setClock(LCD_I2C_HZ);
 
@@ -175,6 +185,7 @@ void lcd_display_init() {
   }
   if (addr == 0) {
     Serial.println("[LCD] No display found");
+    lcd_lock_give();
     return;
   }
   Serial.printf("[LCD] Display found at 0x%02X\n", addr);
@@ -183,41 +194,42 @@ void lcd_display_init() {
   lcd->init();
   lcd->backlight();
 
-  lcd->createChar(0, MANGO_TOP_L);
-  lcd->createChar(1, MANGO_TOP_R);
-  lcd->createChar(2, const_cast<uint8_t*>(MANGO_BOT_L_OPEN));
-  lcd->createChar(3, const_cast<uint8_t*>(MANGO_BOT_R_OPEN));
-
-  // Custom character: solid block used by the confidence bar.
+  // Custom character: solid block used by the confidence bar + idle scan sweep.
   uint8_t block[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
   lcd->createChar(0xFF & 0x07, block);     // slot 7; we print char(0xFF)
   // NOTE: LiquidCrystal_I2C maps write(0xFF) to CGRAM slot 7 on HD44780.
 
   lcd_ready = true;
   set_base_idle();
+  lcd_lock_give();
 }
 
 void lcd_display_update() {
-  if (!lcd_ready || s_quiet) return;
+  lcd_lock_take();
+  if (!lcd_ready || s_quiet) { lcd_lock_give(); return; }
   uint32_t now = millis();
 
   if (trans_active && trans_until != 0 && now >= trans_until) {
     trans_active = false;                  // event expired — back to base
     commit(Where::BASE);
+    lcd_lock_give();
     return;
   }
 
-  // Idle mascot blink: eyes closed for a beat every couple of seconds.
+  // Idle "scanning" animation: a block sweeps left->right across the spare
+  // columns of line 2, implying the device is ready and scanning.
   if (!trans_active && base_is_idle) {
-    uint32_t interval = mango_blink ? 160UL : 1400UL;
+    uint32_t interval = 240U;                 // ~4 sweeps across 5 cols (plus wrap)
     if (now - last_anim_ms >= interval) {
       last_anim_ms = now;
-      mango_blink = !mango_blink;
-      lcd->createChar(2, const_cast<uint8_t*>(mango_blink ? MANGO_BOT_L_BLINK
-                                                          : MANGO_BOT_L_OPEN));
-      lcd->createChar(3, const_cast<uint8_t*>(mango_blink ? MANGO_BOT_R_BLINK
-                                                          : MANGO_BOT_R_OPEN));
+      // Clear the previous block, then draw the next one.
+      lcd->setCursor(SCAN_WIN_COL + scan_pos, 1);
+      lcd->print(' ');
+      scan_pos = (uint8_t)((scan_pos + 1) % SCAN_WIN_W);
+      lcd->setCursor(SCAN_WIN_COL + scan_pos, 1);
+      lcd->print(char(0xFF));
     }
+    lcd_lock_give();
     return;
   }
 
@@ -238,19 +250,21 @@ void lcd_display_update() {
     lcd->print(SPINNER[spinner_frame]);
     spinner_frame = (spinner_frame + 1) & 3;
   }
+  lcd_lock_give();
 }
 
 // Held states — the device's answer to "what are you waiting for?"
-void lcd_disarmed()         { set_base("Ready", "SCAN to arm"); }
-void lcd_armed()            { set_base("Listening...", "TAP NOW!"); }
+void lcd_disarmed()         { lcd_lock_take(); set_base("Ready", "SCAN to arm"); lcd_lock_give(); }
+void lcd_armed()            { lcd_lock_take(); set_base("Listening...", "TAP NOW!"); lcd_lock_give(); }
 void lcd_countdown(uint8_t sec) {
   char l2[17];
   snprintf(l2, sizeof(l2), "TAP in %us", (unsigned)sec);
-  set_base("Place fruit", l2);
+  lcd_lock_take(); set_base("Place fruit", l2); lcd_lock_give();
 }
-void lcd_place_fruit()      { set_base("Hold fruit up", "to camera..."); }
+void lcd_place_fruit()      { lcd_lock_take(); set_base("Hold fruit up", "to camera..."); lcd_lock_give(); }
 
 void lcd_menu(const char* name, uint8_t idx, uint8_t count, uint8_t active_idx) {
+  lcd_lock_take();
   char l1[17];
   snprintf(l1, sizeof(l1), ">%s", name ? name : "?");
   l1[16] = '\0';
@@ -275,35 +289,43 @@ void lcd_menu(const char* name, uint8_t idx, uint8_t count, uint8_t active_idx) 
   base_is_idle = false;
   trans_active = false;
   commit(Where::BASE);
+  lcd_lock_give();
 }
 
 void lcd_ready_model(const char* name) {
-  lcd_set_active_model(name);
-  set_base_idle();
-}
-void lcd_set_active_model(const char* name) {
+  lcd_lock_take();
   strncpy(s_model_name, (name && name[0]) ? name : "", 16);
   s_model_name[16] = '\0';
+  set_base_idle();
+  lcd_lock_give();
 }
-void lcd_idle() { set_base_idle(); }
+void lcd_set_active_model(const char* name) {
+  lcd_lock_take();
+  strncpy(s_model_name, (name && name[0]) ? name : "", 16);
+  s_model_name[16] = '\0';
+  lcd_lock_give();
+}
+void lcd_idle() { lcd_lock_take(); set_base_idle(); lcd_lock_give(); }
 void lcd_flash(const char* l1, const char* l2) {
-  set_screen(l1, l2, CUE_HOLD_MS);
+  lcd_lock_take(); set_screen(l1, l2, CUE_HOLD_MS); lcd_lock_give();
 }
-void lcd_place_on_piezo()   { set_base("Put fruit on", "piezo + SCAN"); }
+void lcd_place_on_piezo()   { lcd_lock_take(); set_base("Put fruit on", "piezo + SCAN"); lcd_lock_give(); }
 
 // Transient events — always auto-revert to the held state above.
-void lcd_connected()        { flash("BLE", "Connected", CUE_HOLD_MS); }
-void lcd_disconnected()     { flash("BLE lost", nullptr, CUE_HOLD_MS); }
-void lcd_tap_ok()           { finish_cycle("Tap captured!", "Analyzing...", RESULT_HOLD_MS, Anim::SPINNER); }
+void lcd_connected()        { lcd_lock_take(); flash("BLE", "Connected", CUE_HOLD_MS); lcd_lock_give(); }
+void lcd_disconnected()     { lcd_lock_take(); flash("BLE lost", nullptr, CUE_HOLD_MS); lcd_lock_give(); }
+void lcd_tap_ok()           { lcd_lock_take(); finish_cycle("Tap captured!", "Analyzing...", RESULT_HOLD_MS, Anim::SPINNER); lcd_lock_give(); }
 void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100) {
+  lcd_lock_take();
   char l1[17];
   strncpy(l1, decision ? decision : "RESULT", 16); l1[16] = '\0';
   set_base_idle();                         // scan cycle over — base goes idle
   if (is_anomaly) set_screen(l1, "ANOMALY!", RESULT_HOLD_MS, Anim::BAR, 0.0f);
   else            set_screen(l1, "", RESULT_HOLD_MS, Anim::BAR,
                              confidence_0_100 / 100.0f);
+  lcd_lock_give();
 }
-void lcd_timeout()          { finish_cycle("No tap", "SCAN again", RESULT_HOLD_MS); }
-void lcd_placement_timeout(){ finish_cycle("Waiting...", "Timed out", RESULT_HOLD_MS); }
-void lcd_camera_error()     { finish_cycle("Camera error!", "SCAN to retry", RESULT_HOLD_MS); }
+void lcd_timeout()          { lcd_lock_take(); finish_cycle("No tap", "SCAN again", RESULT_HOLD_MS); lcd_lock_give(); }
+void lcd_placement_timeout(){ lcd_lock_take(); finish_cycle("Waiting...", "Timed out", RESULT_HOLD_MS); lcd_lock_give(); }
+void lcd_camera_error()     { lcd_lock_take(); finish_cycle("Camera error!", "SCAN to retry", RESULT_HOLD_MS); lcd_lock_give(); }
 #endif

@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../core/cozy_palette.dart';
 import '../core/model_vault.dart';
-import '../core/rules_model.dart';
+import '../core/rules_model32d.dart';
 import '../services/ble_service.dart';
 import '../widgets/frosted.dart';
 import 'rule_builder_screen.dart';
@@ -34,16 +34,15 @@ Future<void> showAddModelFlow(BuildContext context, BleService ble) {
             title: const Text('RULE BUILDER',
                 style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
             subtitle: Text('knobs per ripeness class · built on-device',
-                style: TextStyle(fontSize: 11, color: Cozy.dimGray)),
+                style: TextStyle(fontSize: 15, color: Cozy.dimGray)),
             trailing: const Icon(Icons.chevron_right_rounded),
-            onTap: () async {
+            onTap: () {
               Navigator.pop(ctx);
-              final bin = await Navigator.push<Uint8List>(
+              Navigator.push(
                 ctx,
                 MaterialPageRoute(
                     builder: (_) => RuleBuilderScreen(bleService: ble)),
               );
-              if (bin != null) await uploadBinWithProgress(ctx, ble, bin);
             },
           ),
           const SizedBox(height: 6),
@@ -54,7 +53,7 @@ Future<void> showAddModelFlow(BuildContext context, BleService ble) {
             title: const Text('PASTE .BIN',
                 style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
             subtitle: Text('base64/hex blob from rules_engine.py',
-                style: TextStyle(fontSize: 11, color: Cozy.dimGray)),
+                style: TextStyle(fontSize: 15, color: Cozy.dimGray)),
             trailing: const Icon(Icons.chevron_right_rounded),
             onTap: () async {
               Navigator.pop(ctx);
@@ -79,15 +78,15 @@ Future<Uint8List?> showPasteBinDialog(BuildContext ctx) {
           style: TextStyle(fontFamily: Cozy.monoFamily, fontSize: 15)),
       content: Column(mainAxisSize: MainAxisSize.min, children: [
         Text(
-            'Export from rules_engine.py as base64 or hex.\n'
-            'Accepted: ${RulesModel.wireBytes} B (legacy 612 B).',
-            style: TextStyle(fontSize: 11, color: Cozy.warmGray)),
+            'Export from the fruit-profile engine as base64 or hex.\n'
+            'Accepted: ${RulesModel32D.wireBytes} B (legacy ${RulesModel32D.wireBytesLegacy} B).',
+            style: TextStyle(fontSize: 15, color: Cozy.warmGray)),
         const SizedBox(height: 12),
         TextField(
           controller: ctrl,
           maxLines: 6,
           autofocus: true,
-          style: const TextStyle(fontFamily: Cozy.monoFamily, fontSize: 11),
+          style: const TextStyle(fontFamily: Cozy.monoFamily, fontSize: 15),
           decoration: InputDecoration(
               border:
                   OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
@@ -107,12 +106,13 @@ Future<Uint8List?> showPasteBinDialog(BuildContext ctx) {
             final text = ctrl.text.trim().isNotEmpty
                 ? ctrl.text.trim()
                 : (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
-            final bin = RulesModel.tryParseBinText(text);
+            final bin = RulesModel32D.tryParseBinText(text);
             if (!dctx.mounted) return;
             if (bin == null) {
               ScaffoldMessenger.of(dctx).showSnackBar(const SnackBar(
                   behavior: SnackBarBehavior.floating,
-                  content: Text('Invalid blob — need 616/612-byte base64 or hex')));
+                  content: Text(
+                      'Invalid blob — need 852/848-byte base64 or hex')));
               return;
             }
             Navigator.pop(dctx, bin);
@@ -135,7 +135,7 @@ Future<void> uploadBinWithProgress(
       canPop: false,
       child: AlertDialog(
         backgroundColor: Cozy.surfaceCard,
-        title: Text('UPLOADING "${RulesModel.binName(bin).toUpperCase()}"',
+        title: Text('UPLOADING "${RulesModel32D.binName(bin).toUpperCase()}"',
             style: const TextStyle(
                 fontFamily: Cozy.monoFamily,
                 fontSize: 14,
@@ -148,7 +148,7 @@ Future<void> uploadBinWithProgress(
           ),
           const SizedBox(height: 12),
           Text('streaming to ESP32 flash…',
-              style: TextStyle(fontSize: 11, color: Cozy.warmGray)),
+              style: TextStyle(fontSize: 15, color: Cozy.warmGray)),
         ]),
       ),
     ),
@@ -170,7 +170,7 @@ Future<void> uploadBinWithProgress(
     behavior: SnackBarBehavior.floating,
     backgroundColor: ok ? Colors.green.shade800 : Colors.red.shade800,
     content: Text(ok
-        ? 'MODEL "${RulesModel.binName(bin)}" SAVED TO FLASH'
+        ? 'MODEL "${RulesModel32D.binName(bin)}" SAVED TO FLASH'
         : 'UPLOAD FAILED'),
   ));
 }

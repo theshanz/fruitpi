@@ -67,10 +67,48 @@ static void vision_save_nvs()
     Serial.println("[BTManager] vision gates saved to NVS");
 }
 
+// ─── Scan-config persistence (NVS namespace "scanconfig") ─────────────
+// tap_count + volume override survive a reboot (unlike vision gates these
+// are run-scope user settings the app sends once and expects to stick).
+static const char *SCANCONFIG_NS = "scanconfig";
+
+static void scanconfig_load_nvs(ScanConfig &cfg)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(SCANCONFIG_NS, NVS_READONLY, &nvs) != ESP_OK)
+        return; // first boot: keep defaults
+    uint8_t taps = 0;
+    if (nvs_get_u8(nvs, "tap_count", &taps) == ESP_OK && taps > 0)
+        cfg.target_tap_count = taps;
+    float vol = 0.0f;
+    size_t sz = sizeof(float);
+    if (nvs_get_blob(nvs, "volume_cm3", &vol, &sz) == ESP_OK && vol > 0.0f)
+    {
+        cfg.override_volume_cm3 = vol;
+        cfg.use_volume_override = true;
+    }
+    nvs_close(nvs);
+    Serial.printf("[BTManager] scan config loaded: taps=%u vol=%.0f override=%d\n",
+                  cfg.target_tap_count, cfg.override_volume_cm3,
+                  cfg.use_volume_override);
+}
+
+static void scanconfig_save_nvs(ScanConfig &cfg)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(SCANCONFIG_NS, NVS_READWRITE, &nvs) != ESP_OK)
+        return;
+    nvs_set_u8(nvs, "tap_count", cfg.target_tap_count);
+    nvs_set_blob(nvs, "volume_cm3", &cfg.override_volume_cm3, sizeof(float));
+    nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
 bool BTManager::init(const char *device_name, FruitStore *store)
 {
     store_ref = store;
     vision_load_nvs();
+    scanconfig_load_nvs(current_config);
 
     NimBLEDevice::init(device_name);
     NimBLEDevice::setMTU(512);
@@ -183,10 +221,12 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
             if (doc.containsKey("command"))
             {
                 const char *cmd = doc["command"];
-                if (strcmp(cmd, "list_models") == 0)
+                if (strcmp(cmd, "list_models") == 0 || strcmp(cmd, "get_status") == 0)
                 {
-                    // Full NVS inventory + which one is loaded right now.
-                    StaticJsonDocument<768> resp;
+                    // Full NVS inventory + which one is loaded right now, plus
+                    // the run-scope scan config (mode, tap count, volume).
+                    bool with_config = strcmp(cmd, "get_status") == 0;
+                    StaticJsonDocument<896> resp;
                     JsonArray arr = resp.createNestedArray("models");
                     if (store_ref)
                     {
@@ -200,8 +240,16 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                         if (store_ref->has_model())
                             resp["active"] = store_ref->get_loaded_fruit_name();
                     }
+                    if (with_config)
+                    {
+                        resp["mode"] = (current_mode == MODE_DATA_COLLECTION) ? "data_collection" :
+                                       (current_mode == MODE_DEBUG) ? "debug" : "inference";
+                        resp["tap_count"] = get_target_tap_count();
+                        resp["volume_cm3"] = get_override_volume_cm3();
+                        resp["volume_override"] = has_volume_override();
+                    }
 
-                    char output[768];
+                    char output[896];
                     size_t len = serializeJson(resp, output);
                     pCharScanResults->setValue((uint8_t *)output, len);
                     pCharScanResults->notify();
@@ -216,6 +264,7 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                         lcd_idle();   // badge cleared when active model died
                     }
                     notify_status_change("model_deleted");
+                    notify_models();
                 }
                 else if (strcmp(cmd, "resend") == 0 && doc.containsKey("id") && doc.containsKey("ranges"))
                 {
@@ -342,6 +391,7 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                     lcd_set_active_model(store_ref->get_loaded_fruit_name());
                     lcd_idle();   // default screen shows the new badge
                     notify_status_change("model_activated");
+                    notify_models();
                 }
             }
 
@@ -349,6 +399,21 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
             {
                 current_config.override_volume_cm3 = doc["volume_cm3"];
                 current_config.use_volume_override = true;
+                scanconfig_save_nvs(current_config);
+                Serial.printf("[BTManager] Volume override set to %.0f cm^3.\n",
+                              current_config.override_volume_cm3);
+                notify_scan_config();
+            }
+
+            if (doc.containsKey("tap_count"))
+            {
+                uint8_t taps = doc["tap_count"].as<uint8_t>();
+                if (taps < 1) taps = 1;
+                if (taps > MAX_CONSENSUS_TAPS) taps = MAX_CONSENSUS_TAPS;
+                current_config.target_tap_count = taps;
+                scanconfig_save_nvs(current_config);
+                Serial.printf("[BTManager] N-tap consensus set to %u.\n", taps);
+                notify_scan_config();
             }
 
             if (doc.containsKey("mode"))
@@ -363,6 +428,7 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 Serial.printf("[BTManager] Mode set to: %s\n",
                               (current_mode == MODE_DATA_COLLECTION) ? "DATA COLLECTION" :
                               (current_mode == MODE_DEBUG) ? "DEBUG" : "INFERENCE");
+                notify_scan_config();
             }
         }
     }
@@ -576,9 +642,13 @@ void BTManager::free_tx()
 void BTManager::start_rx(uint16_t id, size_t total, uint8_t type)
 {
     free_rx();
-    if (total == 0 || total > sizeof(Fruit28D))
+    // Only the exact 852-byte model wire is accepted for uploads — a legacy
+    // (616-byte 28D / 848-byte pre-852) or truncated run must never be padded
+    // into a valid-looking slot.
+    if (total != MODEL_WIRE_BYTES)
     {
-        Serial.printf("[BTManager] RX reject: bad total %u.\n", (unsigned)total);
+        Serial.printf("[BTManager] RX reject: expected %u bytes, got %u.\n",
+                      (unsigned)MODEL_WIRE_BYTES, (unsigned)total);
         return;
     }
     rx_id = id;
@@ -685,8 +755,8 @@ uint32_t BTManager::inter_chunk_delay_ms()
 // ─── Save Received Model to NVS ──────────────────────────────────────
 void BTManager::process_incoming_model()
 {
-    Fruit28D incoming_model;
-    memcpy(&incoming_model, model_rx_buffer, sizeof(Fruit28D));
+    Fruit32D incoming_model;
+    memcpy(&incoming_model, model_rx_buffer, sizeof(Fruit32D));
 
     Serial.printf("[BTManager] Completed Binary Model Upload: '%s'\n", incoming_model.fruit_name);
 
@@ -697,6 +767,7 @@ void BTManager::process_incoming_model()
         lcd_set_active_model(store_ref->get_loaded_fruit_name());
         lcd_idle();
         notify_status_change("model_saved");
+        notify_models();
         Serial.println("[BTManager] New Model Saved to Flash & Loaded to RAM!");
     }
     else
@@ -765,21 +836,21 @@ void BTManager::notify_ms_features(const ColorFeatures &f)
     pCharScanResults->notify();
 }
 
-// Full pipeline telemetry: the exact 28-D state the classifier saw,
+// Full pipeline telemetry: the exact 32-D state the classifier saw,
 // plus the raw tap peak. One notify per inference — the app records it.
-void BTManager::notify_debug_state(const float state[28], float peak_adc)
+void BTManager::notify_debug_state(const float state[VECTOR_DIMENSIONS], float peak_adc)
 {
     if (!device_connected)
         return;
 
-    DynamicJsonDocument doc(1280);
+    DynamicJsonDocument doc(1600);
     doc["status"] = "debug_state";
     doc["peak"] = roundf(peak_adc * 1000.0f) / 1000.0f;
     JsonArray st = doc.createNestedArray("state");
-    for (int i = 0; i < 28; i++)
+    for (int i = 0; i < VECTOR_DIMENSIONS; i++)
         st.add(roundf(state[i] * 1000.0f) / 1000.0f);
 
-    char output[1400];
+    char output[1700];
     size_t n = serializeJson(doc, output, sizeof(output));
     pCharScanResults->setValue((uint8_t *)output, n);
     pCharScanResults->notify();
@@ -795,6 +866,57 @@ void BTManager::notify_status_change(const char *status_msg)
 
     char output[128];
     size_t len = serializeJson(doc, output);
+    pCharScanResults->setValue((uint8_t *)output, len);
+    pCharScanResults->notify();
+}
+
+// Pushed scan-config snapshot: sent back to the app after the app writes
+// volume_cm3 / tap_count / mode so the UI selects stick to authoritative state.
+// Also used on connect so a reconnecting client re-learns the persisted values.
+void BTManager::notify_scan_config()
+{
+    if (!device_connected)
+        return;
+
+    StaticJsonDocument<128> doc;
+    doc["status"] = "scan_config";
+    doc["mode"] = (current_mode == MODE_DATA_COLLECTION) ? "data_collection" :
+                  (current_mode == MODE_DEBUG) ? "debug" : "inference";
+    doc["tap_count"] = get_target_tap_count();
+    doc["volume_cm3"] = get_override_volume_cm3();
+    doc["volume_override"] = has_volume_override();
+
+    char output[128];
+    size_t len = serializeJson(doc, output);
+    pCharScanResults->setValue((uint8_t *)output, len);
+    pCharScanResults->notify();
+}
+
+// Pushed inventory snapshot: identical payload to the `list_models` reply,
+// triggered by the firmware after save/delete/activate so the app deck stays
+// in sync without a poll or a fragile status-then-poll round trip.
+void BTManager::notify_models()
+{
+    if (!device_connected)
+        return;
+
+    StaticJsonDocument<768> resp;
+    JsonArray arr = resp.createNestedArray("models");
+    if (store_ref)
+    {
+        const uint8_t n = store_ref->model_count();
+        char name[MAX_MODEL_NAME_LEN];
+        for (uint8_t i = 0; i < n; i++)
+        {
+            if (store_ref->model_name_at(i, name))
+                arr.add(name);
+        }
+        if (store_ref->has_model())
+            resp["active"] = store_ref->get_loaded_fruit_name();
+    }
+
+    char output[768];
+    size_t len = serializeJson(resp, output);
     pCharScanResults->setValue((uint8_t *)output, len);
     pCharScanResults->notify();
 }

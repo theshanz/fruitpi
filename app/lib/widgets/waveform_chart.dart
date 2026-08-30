@@ -37,7 +37,7 @@ class _WaveformPainter extends CustomPainter {
         text: TextSpan(
             text: 'no tap yet — arm and tap when prompted',
             style: TextStyle(
-                fontSize: 10, color: Colors.white.withValues(alpha: 0.3))),
+                fontSize: 14, color: Colors.white.withValues(alpha: 0.3))),
         textDirection: TextDirection.ltr,
       )..layout();
       tp.paint(canvas,
@@ -95,7 +95,7 @@ class _WaveformPainter extends CustomPainter {
       text: TextSpan(
         text: 'peak Δ ${peak.round()}',
         style: const TextStyle(
-            fontSize: 9, color: Cozy.matcha, fontWeight: FontWeight.bold),
+            fontSize: 13, color: Cozy.matcha, fontWeight: FontWeight.bold),
       ),
       textDirection: TextDirection.ltr,
     )..layout();

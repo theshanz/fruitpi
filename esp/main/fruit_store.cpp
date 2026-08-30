@@ -5,10 +5,19 @@
 
 constexpr const char* NVS_NAMESPACE = "fruit_models";
 constexpr const char* ACTIVE_NAME_KEY = "active_name";
+constexpr const char* STORE_FORMAT_KEY = "mmd_fmt";
+
+// NVS format marker: magic "2FRT" + wire-format version. Verified on boot; a
+// mismatch means the flash holds pre-852 (616/848-byte) models and must be
+// re-initialized before the menu can trust any listing.
+struct StoreFormatMarker {
+    uint32_t magic;
+    uint8_t version;
+};
 
 FruitStore::FruitStore()
     : is_model_loaded_in_ram(false), cached_count(0), store_mutex(nullptr) {
-    memset(&active_model_ram, 0, sizeof(Fruit28D));
+    memset(&active_model_ram, 0, sizeof(Fruit32D));
     memset(loaded_fruit_name, 0, sizeof(loaded_fruit_name));
     memset(cached_names, 0, sizeof(cached_names));
 }
@@ -19,29 +28,39 @@ FruitStore::FruitStore()
 void FruitStore::rebuild_cache_locked() {
     cached_count = 0;
     nvs_iterator_t it = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_NAMESPACE,
-                                      NVS_TYPE_BLOB);
+                                       NVS_TYPE_BLOB);
+    if (it == nullptr) return;
+    nvs_handle_t nvs;
+    const bool can_write =
+        (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK);
     while (it != nullptr && cached_count < MAX_CACHED_MODELS) {
         nvs_entry_info_t info;
         nvs_entry_info(it, &info);
-        if (strncmp(info.key, "m_", 2) == 0) {
-            // decode real fruit name from the blob's first bytes
-            nvs_handle_t nvs;
-            if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
-                Fruit28D tmp{};
-                size_t len = sizeof(tmp);
-                if (nvs_get_blob(nvs, info.key, &tmp, &len) == ESP_OK &&
-                    tmp.fruit_name[0] != '\0') {
-                    strncpy(cached_names[cached_count], tmp.fruit_name,
-                            MAX_MODEL_NAME_LEN - 1);
-                    cached_names[cached_count][MAX_MODEL_NAME_LEN - 1] = '\0';
-                    cached_count++;
-                }
-                nvs_close(nvs);
+        if (strncmp(info.key, "m_", 2) == 0 && can_write) {
+            // decode real fruit name from the blob's first bytes; a
+            // corrupt/legacy blob must never surface in the menu
+            Fruit32D tmp{};
+            size_t len = sizeof(tmp);
+            const bool usable =
+                nvs_get_blob(nvs, info.key, &tmp, &len) == ESP_OK &&
+                len == MODEL_WIRE_BYTES &&
+                model_blob_is_valid(tmp);
+            if (usable) {
+                strncpy(cached_names[cached_count], tmp.fruit_name,
+                        MAX_MODEL_NAME_LEN - 1);
+                cached_names[cached_count][MAX_MODEL_NAME_LEN - 1] = '\0';
+                cached_count++;
+            } else {
+                Serial.printf("[FruitStore] Dropped corrupt/legacy entry '%s'\n",
+                              info.key);
+                nvs_erase_key(nvs, info.key);
+                nvs_commit(nvs);
             }
         }
         it = nvs_entry_next(it);
     }
     if (it != nullptr) nvs_release_iterator(it);
+    if (can_write) nvs_close(nvs);
 }
 
 void FruitStore::cache_remove_locked(const char* nvs_key) {
@@ -86,6 +105,28 @@ void FruitStore::get_nvs_key(const char* fruit_name, char key_out[16]) const {
     }
 }
 
+// Erases every model blob (keys "m_*") from the namespace. Used on first boot
+// after a format bump to drop pre-852 legacy entries (616-byte 28D / 848-byte
+// old-wire) that NVS would otherwise surface as selectable "models".
+static size_t wipe_all_model_blobs(nvs_handle_t nvs) {
+    size_t wiped = 0;
+    nvs_iterator_t it = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_NAMESPACE,
+                                       NVS_TYPE_BLOB);
+    while (it != nullptr) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        if (strncmp(info.key, "m_", 2) == 0 &&
+            nvs_erase_key(nvs, info.key) == ESP_OK) {
+            wiped++;
+            Serial.printf("[FruitStore] Wiped legacy entry '%s'\n", info.key);
+        }
+        it = nvs_entry_next(it);
+    }
+    if (it != nullptr) nvs_release_iterator(it);
+    if (wiped > 0) nvs_commit(nvs);
+    return wiped;
+}
+
 bool FruitStore::init() {
     if (store_mutex == nullptr) {
         store_mutex = xSemaphoreCreateMutex();
@@ -100,6 +141,36 @@ bool FruitStore::init() {
     if (err != ESP_OK) {
         Serial.printf("[FruitStore] Error: NVS Flash initialization failed (0x%X)\n", err);
         return false;
+    }
+
+    // ── Format version gate ─────────────────────────────────────────
+    // The 852-byte ManifoldModel32D is wire-locked. Boot verifies the store's
+    // format marker (magic "2FRT" + v2) and wipes any legacy model blobs when
+    // it is absent or stale, so the menu only ever lists blobs the classifier
+    // can actually load. Individual corrupt entries are dropped during
+    // rebuild_cache_locked() below.
+    nvs_handle_t fmt;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &fmt) == ESP_OK) {
+        StoreFormatMarker marker{};
+        size_t mlen = sizeof(marker);
+        const bool matches =
+            nvs_get_blob(fmt, STORE_FORMAT_KEY, &marker, &mlen) == ESP_OK &&
+            mlen == sizeof(marker) &&
+            marker.magic == FRUIT32D_MAGIC &&
+            marker.version == MODEL_STORE_VERSION;
+        if (!matches) {
+            const size_t wiped = wipe_all_model_blobs(fmt);
+            nvs_erase_key(fmt, ACTIVE_NAME_KEY);
+            marker.magic = FRUIT32D_MAGIC;
+            marker.version = MODEL_STORE_VERSION;
+            nvs_set_blob(fmt, STORE_FORMAT_KEY, &marker, sizeof(marker));
+            nvs_commit(fmt);
+            Serial.printf("[FruitStore] Store format v%u ('2FRT') initialized "
+                          "(wiped %u legacy blob%s).\n",
+                          (unsigned)MODEL_STORE_VERSION, (unsigned)wiped,
+                          wiped == 1 ? "" : "s");
+        }
+        nvs_close(fmt);
     }
 
     // Restore last user-selected model so a reboot lands ready-to-scan.
@@ -123,9 +194,13 @@ bool FruitStore::init() {
     return true;
 }
 
-bool FruitStore::save_model(const Fruit28D& fruit) {
+bool FruitStore::save_model(const Fruit32D& fruit) {
     if (fruit.fruit_name[0] == '\0') {
         Serial.println("[FruitStore] Refusing to save unnamed model.");
+        return false;
+    }
+    if (!model_blob_is_valid(fruit)) {
+        Serial.println("[FruitStore] Refusing to save malformed model blob.");
         return false;
     }
 
@@ -137,7 +212,7 @@ bool FruitStore::save_model(const Fruit28D& fruit) {
         Serial.println("[FruitStore] Error: cannot open NVS namespace.");
         return false;
     }
-    esp_err_t err = nvs_set_blob(nvs, key, &fruit, sizeof(Fruit28D));
+    esp_err_t err = nvs_set_blob(nvs, key, &fruit, sizeof(Fruit32D));
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
 
@@ -146,16 +221,16 @@ bool FruitStore::save_model(const Fruit28D& fruit) {
         return false;
     }
     Serial.printf("[FruitStore] Saved model '%s' (%u bytes)\n",
-                  fruit.fruit_name, (unsigned)sizeof(Fruit28D));
+                  fruit.fruit_name, (unsigned)sizeof(Fruit32D));
     if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
     cache_add_locked(fruit.fruit_name);
     if (store_mutex) xSemaphoreGive(store_mutex);
     return true;
 }
 
-// Reads one model back in 616-byte wire format (struct padding excluded).
+// Reads one model back in 852-byte wire format (struct padding excluded).
 // Does NOT touch the active-model RAM slot.
-bool FruitStore::get_model_wire(const char* fruit_name, uint8_t out[616]) {
+bool FruitStore::get_model_wire(const char* fruit_name, uint8_t out[MODEL_WIRE_BYTES]) {
     if (fruit_name == nullptr || fruit_name[0] == '\0') return false;
     if (store_mutex) xSemaphoreTake(store_mutex, portMAX_DELAY);
 
@@ -165,11 +240,11 @@ bool FruitStore::get_model_wire(const char* fruit_name, uint8_t out[616]) {
     nvs_handle_t nvs;
     bool ok = false;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
-        Fruit28D tmp{};
+        Fruit32D tmp{};
         size_t len = sizeof(tmp);
         if (nvs_get_blob(nvs, key, &tmp, &len) == ESP_OK &&
-            len >= MODEL_WIRE_BYTES_LEGACY) {
-            // blob head is wire-identical: name[32] | W | b | mask+pad
+            len == MODEL_WIRE_BYTES && model_blob_is_valid(tmp)) {
+            // blob head is wire-identical: name[32] | header | W | b
             memcpy(out, &tmp, MODEL_WIRE_BYTES);
             ok = true;
         }
@@ -192,19 +267,19 @@ bool FruitStore::load_model_to_ram(const char* fruit_name) {
         return false;
     }
 
-    Fruit28D tmp{};
+    Fruit32D tmp{};
     size_t len = sizeof(tmp);
     esp_err_t err = nvs_get_blob(nvs, key, &tmp, &len);
     nvs_close(nvs);
     // NOTE: mutex released on all exits below via helper lambda-free pattern
 
-    // Accept new (mask-carrying) and legacy 612-byte blobs alike; the
-    // zeroed tail leaves active_class_mask = 0 -> firmware default classes.
-    // A truncated/corrupt entry must never become the active classifier.
-    if (err != ESP_OK || len < MODEL_WIRE_BYTES_LEGACY) {
+    // The 852-byte blob must be complete and structurally valid; a
+    // truncated/corrupt/legacy entry must never become the active classifier.
+    if (err != ESP_OK || len != MODEL_WIRE_BYTES ||
+        !model_blob_is_valid(tmp)) {
         Serial.printf("[FruitStore] Load '%s' failed (0x%X, %u/%u bytes)\n",
                       fruit_name, err, (unsigned)len,
-                      (unsigned)sizeof(Fruit28D));
+                      (unsigned)sizeof(Fruit32D));
         if (store_mutex) xSemaphoreGive(store_mutex);
         return false;
     }
@@ -219,7 +294,7 @@ bool FruitStore::load_model_to_ram(const char* fruit_name) {
 }
 
 void FruitStore::unload_active_model() {
-    memset(&active_model_ram, 0, sizeof(Fruit28D));
+    memset(&active_model_ram, 0, sizeof(Fruit32D));
     memset(loaded_fruit_name, 0, sizeof(loaded_fruit_name));
     is_model_loaded_in_ram = false;
 }

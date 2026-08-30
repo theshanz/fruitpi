@@ -8,8 +8,11 @@
 #include <driver/adc.h>
 
 // ─── Buttons ──────────────────────────────────────────────────────
-constexpr uint8_t BOOT_BUTTON_PIN   = 0;   // strapping pin, active-low (INPUT_PULLUP)
-constexpr uint8_t SCAN_BUTTON_PIN   = 14;  // active-high, wired to 5V (prefer 3.3V!)
+// The physical START (inference) and SCAN buttons are merged onto ONE pin
+// (GPIO14, active-high, INPUT_PULLDOWN): tap = inference/scan, hold = open
+// the model selector. There is no button on GPIO0 in the current wiring.
+constexpr uint8_t BOOT_BUTTON_PIN   = 14;  // START, active-high (INPUT_PULLDOWN)
+constexpr uint8_t SCAN_BUTTON_PIN   = 14;  // SCAN — same physical button as START
 constexpr uint8_t CANCEL_BUTTON_PIN = 21;  // active-high, wired to 5V (prefer 3.3V!)
                                      // WARNING: GPIO12 = CAM_PIN_Y6 — reads permanently
                                      // pressed if wired. Never use it for a button.
@@ -27,13 +30,36 @@ constexpr adc1_channel_t PIEZO_ADC_CHANNEL = ADC1_CHANNEL_1; // GPIO2 on ESP32-S
 
 #define FFT_SIZE            512      // must be 2^N
 #define SAMPLING_FREQ_HZ    8820     // Nyquist 4410 Hz
-#define N_FFT_BINS          15       // 15 band slots in the 28-D state vector
+#define N_FFT_BINS          15       // legacy bins (deprecated; see STFT grid)
 #define F2_NORM             441000.0f// frequency² conditioning normalizer
 #define EPS_LOG             1e-10f   // log() guard
 #define FFT_CLAMP_MIN       -10.0f   // conditioned-bin floor
 #define PRE_TRIGGER_SAMPLES 64       // pre-tap samples kept in each window
 #define RING_BUFFER_SIZE    1024     // circular buffer (2× FFT_SIZE)
 #define PIEZO_FLUSH_SAMPLES 256      // ~29 ms discarded after arm(): stale ring bleed-off
+
+// ─── 32D Fruit Profile audio image (STFT) ─────────────────────────
+// Peak-aligned 384-sample window, n_fft=128, hop=32 -> 9 frames, pooled
+// into a 4x4 time-frequency grid. Bands match the validated engine.
+#define STFT_FFT_N        128
+#define STFT_HOP          32
+#define STFT_ALIGN_PRE    16          // samples before peak in window
+#define STFT_WINDOW       384         // aligned window length
+#define STFT_FRAMES       9           // (384-128)/32 + 1
+#define STFT_FREQ_BANDS   4           // 4 frequency bands per time slice
+#define STFT_TIME_BINS    4           // pooled time slices
+constexpr float STFT_BAND_HZ[STFT_FREQ_BANDS][2] = {
+    {100.0f, 250.0f}, {250.0f, 500.0f},
+    {500.0f, 850.0f}, {850.0f, 1400.0f}
+};
+constexpr float STFT_CONTRAST_DB = 1.5f;  // dynamic-range floor (dB)
+
+// Bio-moment extraction (dim 26..31)
+constexpr float TAIL_WINDOW_S   = 0.020f; // late-tail region after this much time
+constexpr int   RMS_ENVELOPE_N  = 16;     // RMS envelope window
+constexpr float DECAY_NOISE_GATE = 0.05f; // decay fit above this level
+constexpr float DAMPING_SCALE    = 10.0f; // log-slope -> dim 31 scale
+constexpr float HARMONIC_CLIP    = 3.0f;  // harmonic/fortitude clip then /3
 
 constexpr uint32_t ARM_SETTLE_MS  = 800;    // ignore triggers this long after arming
                                      // (button/placement/LCD bursts decay)
@@ -82,7 +108,7 @@ constexpr int   HUE_BIN_COUNT      = 8;      // bins across the window
 constexpr float CM_PER_PIXEL_FULL  = 0.05f;  // calibration at native resolution
 constexpr float VOLUME_CM3_MIN     = 10.0f;  // sanity clamp for estimated volume
 constexpr float VOLUME_CM3_MAX     = 500.0f;
-constexpr float VOLUME_DEFAULT_CM3 = 50.0f;  // fallback when bbox fails
+constexpr float VOLUME_DEFAULT_CM3 = 350.0f; // fallback when bbox criteria fail
 
 // ─── Multispectral scan ───────────────────────────────────────────
 constexpr int    MS_DECODE_SCALE        = 2;    // TJpgDec 1/4: SXGA → 320×256
@@ -107,11 +133,15 @@ constexpr uint32_t LCD_FRAME_MS          = 4;     // min gap between LED frame w
 constexpr uint32_t LCD_ANIM_MS           = 180;   // LCD animation frame interval
 
 // ─── Classifier ───────────────────────────────────────────────────
-// Force-invariant acoustics: subtract 2*ln(amp)*f^2/NORM from each band so
-// tap strength cancels (power was ~amp^2); dim 26 then carries no class
-// signal and is zeroed. Prototypes/models MUST be built with the same flag
-// (extract_28d.py / rules_to_model.py mirror it).
-constexpr bool  ACOUSTIC_FORCE_INVARIANT = true;
+// 32D Fruit Profile v3: RAW states keep absolute physical scale (acoustic
+// amplitude survives — the cue that separates ripe/unripe). Blocks are NOT
+// L2-normalized (that was the ~51% coin-flip bug). Scoring is a
+// Diagonal-Gaussian (Mahalanobis):
+//   score[c] = bias[c] - 0.5 * sum_d inv_var[d]*(state[d]-mean[c][d])^2
+// where feature_weights[32] = pooled per-feature inverse-variance (floor 1e-3,
+// James-Stein shrink ~0.3) and prototypes[5][32] = per-class raw means.
+// (Mirrored by the app Rule Compiler rules_model32d.dart.)
+constexpr bool  ACOUSTIC_FORCE_INVARIANT = false;  // v3: amplitude is a real cue
 constexpr float IMPACT_AMP_FLOOR         = 0.004f; // div-by-zero guard for weak taps
 // Bit i enables class i: bit0=UNRIPE bit1=PERFECTLY_RIPE bit2=OVERRIPE
 // bit3=ROTTEN_OR_HOLLOW bit4=ARTIFICIALLY_RIPENED.

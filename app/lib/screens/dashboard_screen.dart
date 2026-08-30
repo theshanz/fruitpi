@@ -9,6 +9,8 @@ import '../core/model_vault.dart';
 import '../core/protocol.dart';
 import '../services/ble_service.dart';
 import '../widgets/frosted.dart';
+import '../widgets/tap_count_selector.dart';
+import '../widgets/volume_selector.dart';
 import 'add_model_flow.dart';
 import 'devices_screen.dart';
 import 'vision_config_sheet.dart';
@@ -32,6 +34,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
   bool _running = false;
   StreamSubscription? _statusSub;
   StreamSubscription? _resultSub;
+  void Function()? _configSync;
 
   /// firmware status -> terminal copy
   static const _phaseCopy = {
@@ -81,6 +84,22 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
         _phase = '';
       });
     });
+
+    // Reflect the firmware's authoritative scan config (pushed on change and
+    // re-polled on connect) into the selectors, so the UI never drifts from
+    // what the device actually holds.
+    void syncConfig() {
+      final cfg = widget.bleService.scanConfig.value;
+      if (!mounted || cfg == null) return;
+      setState(() {
+        _scanTapCount = cfg.tapCount;
+        if (cfg.volumeOverride) _scanVolumeCm3 = cfg.volumeCm3;
+      });
+    }
+
+    widget.bleService.scanConfig.addListener(syncConfig);
+    _configSync = syncConfig;
+    syncConfig();
   }
 
   @override
@@ -88,6 +107,9 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
     _cursorController.dispose();
     _statusSub?.cancel();
     _resultSub?.cancel();
+    if (_configSync != null) {
+      widget.bleService.scanConfig.removeListener(_configSync!);
+    }
     super.dispose();
   }
 
@@ -98,15 +120,35 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
         MaterialPageRoute(builder: (_) => DevicesScreen(bleService: widget.bleService)));
   }
 
-  void _startScan() {
+  Future<void> _startScan() async {
     if (!widget.bleService.isConnected || _running) return;
     setState(() => _running = true);
+    // Ensure the device is in INFERENCE mode first — a data-collection
+    // session leaves it in DATA_COLLECTION, and `inference_request` alone
+    // won't switch modes. Only infer when the device is on the inference/
+    // debug screens.
+    await widget.bleService.setInferenceMode();
     widget.bleService.startInference();
   }
 
   void _cancelScan() {
     widget.bleService.cancel();
     setState(() => _running = false);
+  }
+
+  // Run-scope sensors pushed to the device over BLE before each inference:
+  // container volume override + N-tap consensus count.
+  double _scanVolumeCm3 = 350.0;
+  int _scanTapCount = 3;
+
+  void _setScanVolume(double v) {
+    setState(() => _scanVolumeCm3 = v);
+    widget.bleService.sendCommand({'volume_cm3': v});
+  }
+
+  void _setScanTapCount(int n) {
+    setState(() => _scanTapCount = n);
+    widget.bleService.sendCommand({'tap_count': n});
   }
 
   Future<void> _activateModel(String name) async {
@@ -122,7 +164,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
         title: Text('delete "$name"?',
             style: const TextStyle(fontFamily: Cozy.monoFamily, fontSize: 15)),
         content: Text('erased from ESP32 flash permanently.',
-            style: TextStyle(fontSize: 12, color: Cozy.warmGray)),
+            style: TextStyle(fontSize: 16, color: Cozy.warmGray)),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -158,7 +200,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                   color: Cozy.matcha),
               title: const Text('ACTIVATE',
                   style:
-                      TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                      TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
               onTap: () {
                 Navigator.pop(ctx);
                 _activateModel(name);
@@ -168,7 +210,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
               leading: const Icon(Icons.edit_rounded, color: Cozy.chamomile),
               title: const Text('EDIT (rename / classes / sharpness)',
                   style:
-                      TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                      TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
               onTap: () => Navigator.pop(ctx, 'edit'),
             ),
             ListTile(
@@ -176,7 +218,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                   const Icon(Icons.delete_outline_rounded, color: Cozy.roseError),
               title: const Text('DELETE',
                   style:
-                      TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                      TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
               onTap: () {
                 Navigator.pop(ctx);
                 _deleteModel(name);
@@ -244,7 +286,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                               Expanded(
                                 child: Text(phaseText.toUpperCase(),
                                     style: TextStyle(
-                                        fontSize: 11,
+                                        fontSize: 15,
                                         letterSpacing: 1.2,
                                         fontWeight: FontWeight.bold,
                                         color: _accent)),
@@ -272,7 +314,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                                     : '${_selected + 1}/${models.length}',
                                 style: TextStyle(
                                     color: _accent,
-                                    fontSize: 12,
+                                    fontSize: 16,
                                     fontWeight: FontWeight.bold)),
                           ),
                           const SizedBox(width: 12),
@@ -297,7 +339,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                                 Text('ENROLL',
                                     style: TextStyle(
                                         color: Cozy.matcha,
-                                        fontSize: 10,
+                                        fontSize: 14,
                                         fontWeight: FontWeight.bold)),
                               ]),
                             ),
@@ -329,11 +371,13 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                                 Text('SPECTROMETER READY.',
                                     textAlign: TextAlign.center,
                                     style: TextStyle(
-                                        fontSize: 11, color: Cozy.dimGray)),
+                                        fontSize: 15, color: Cozy.dimGray)),
                               ]),
                             ),
                           ),
                         ),
+                      const SizedBox(height: 16),
+                      _scanControlsCard(),
                       const SizedBox(height: 16),
                       _scanButton(),
                     ],
@@ -438,7 +482,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                   const SizedBox(width: 6),
                   Text(connected ? 'FRUITPI_BLE [READY]' : 'UNLINKED',
                       style: TextStyle(
-                          fontSize: 10,
+                          fontSize: 14,
                           fontWeight: FontWeight.bold,
                           color: connected ? Cozy.matcha : Cozy.warmGray)),
                 ]),
@@ -456,7 +500,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                   ),
                   child: Text(connected ? 'DEVICES' : 'CONNECT',
                       style: TextStyle(
-                          fontSize: 10,
+                          fontSize: 14,
                           fontWeight: FontWeight.bold,
                           color: connected ? Cozy.oatmeal : Cozy.deepBg)),
                 ),
@@ -481,10 +525,10 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                 Icon(Icons.inventory_2_outlined, size: 40, color: Cozy.dimGray),
                 const SizedBox(height: 10),
                 Text('NO MODELS ON DEVICE',
-                    style: TextStyle(fontSize: 11, color: Cozy.dimGray, letterSpacing: 1)),
+                    style: TextStyle(fontSize: 15, color: Cozy.dimGray, letterSpacing: 1)),
                 const SizedBox(height: 4),
                 Text('tap [ENROLL] to add one via rule builder or .bin paste',
-                    style: TextStyle(fontSize: 10, color: Cozy.dimGray)),
+                    style: TextStyle(fontSize: 14, color: Cozy.dimGray)),
               ]),
             ),
           );
@@ -525,7 +569,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                           children: [
                             Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
                               Text('MDL-${i.toString().padLeft(2, '0')}',
-                                  style: TextStyle(fontSize: 10, color: Cozy.dimGray, letterSpacing: 1.2)),
+                                  style: TextStyle(fontSize: 14, color: Cozy.dimGray, letterSpacing: 1.2)),
                               GestureDetector(
                                 onTap: () => _deleteModel(name),
                                 child: Container(
@@ -535,7 +579,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                                     borderRadius: BorderRadius.circular(6),
                                   ),
                                   child: const Text('DELETE',
-                                      style: TextStyle(color: Cozy.roseError, fontSize: 9, fontWeight: FontWeight.bold)),
+                                      style: TextStyle(color: Cozy.roseError, fontSize: 13, fontWeight: FontWeight.bold)),
                                 ),
                               ),
                             ]),
@@ -552,12 +596,12 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                             Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
                               Text(isActive ? 'ACTIVE · LOADED IN RAM' : 'TAP TO ACTIVATE',
                                   style: TextStyle(
-                                      fontSize: 10.5,
+                                      fontSize: 14.5,
                                       fontWeight: FontWeight.bold,
                                       letterSpacing: 0.8,
                                       color: isActive ? _accent : Cozy.dimGray)),
                               const Text('Fruit28D',
-                                  style: TextStyle(fontSize: 10, color: Cozy.dimGray)),
+                                  style: TextStyle(fontSize: 14, color: Cozy.dimGray)),
                             ]),
                           ],
                         ),
@@ -575,6 +619,31 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
 
   /// Mirrors the device LCD flow: SCAN → hold to camera → PLACE ON PIEZO →
   /// SCAN again (device button OR this button) → TAP NOW → result.
+  Widget _scanControlsCard() {
+    return FrostedBox(
+      padding: const EdgeInsets.all(16),
+      borderRadius: BorderRadius.circular(20),
+      child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SectionLabel(title: '// RUN SENSORS'),
+            const SizedBox(height: 4),
+            Text('pushed to the device over BLE before each inference',
+                style: TextStyle(fontSize: 14, color: Cozy.dimGray)),
+            const SizedBox(height: 12),
+            VolumeSelector(
+              volumeCm3: _scanVolumeCm3,
+              onChanged: _setScanVolume,
+            ),
+            const SizedBox(height: 16),
+            TapCountSelector(
+              tapCount: _scanTapCount,
+              onChanged: _setScanTapCount,
+            ),
+          ]),
+    );
+  }
+
   Widget _scanButton() {
     final confirming = _phase == 'place_on_piezo';
     final armed = _phase == 'acoustic_armed';
@@ -637,7 +706,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
               Text(label,
                   style: TextStyle(
                       color: fg,
-                      fontSize: 12,
+                      fontSize: 16,
                       fontWeight: FontWeight.bold,
                       letterSpacing: 0.8)),
             ]),
@@ -670,7 +739,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                 color: Colors.white.withValues(alpha: 0.06),
                 borderRadius: BorderRadius.circular(6)),
             child: Text(r.decision,
-                style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: accentColor)),
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: accentColor)),
           ),
         ]),
         const SizedBox(height: 16),
@@ -694,7 +763,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
               SizedBox(
                 width: 150,
                 child: Text(e.key.toLowerCase().replaceAll('_', ' '),
-                    style: TextStyle(fontSize: 10, color: Cozy.dimGray)),
+                    style: TextStyle(fontSize: 14, color: Cozy.dimGray)),
               ),
               Expanded(
                 child: ClipRRect(
@@ -715,7 +784,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
                 width: 42,
                 child: Text('${(e.value * 100).toStringAsFixed(0)}%',
                     textAlign: TextAlign.right,
-                    style: TextStyle(fontSize: 10, color: Cozy.warmGray)),
+                    style: TextStyle(fontSize: 14, color: Cozy.warmGray)),
               ),
             ]),
           ),

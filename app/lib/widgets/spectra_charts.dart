@@ -99,7 +99,7 @@ class _HueBarsPainter extends CustomPainter {
       text: TextSpan(
           text: msg,
           style:
-              TextStyle(fontSize: 10, color: Colors.white.withValues(alpha: 0.3))),
+              TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.3))),
       textDirection: TextDirection.ltr,
     )..layout();
     tp.paint(canvas,
@@ -112,7 +112,7 @@ class _HueBarsPainter extends CustomPainter {
       text: TextSpan(
           text: msg,
           style:
-              TextStyle(fontSize: 9, color: Colors.white.withValues(alpha: 0.35))),
+              TextStyle(fontSize: 13, color: Colors.white.withValues(alpha: 0.35))),
       textDirection: TextDirection.ltr,
     )..layout();
     tp.paint(canvas, Offset(center ? x - tp.width / 2 : x, y));
@@ -186,7 +186,7 @@ class _SpectrumPainter extends CustomPainter {
         text: TextSpan(
             text: 'enable a class to see its tap spectrum',
             style: TextStyle(
-                fontSize: 10, color: Colors.white.withValues(alpha: 0.3))),
+                fontSize: 14, color: Colors.white.withValues(alpha: 0.3))),
         textDirection: TextDirection.ltr,
       )..layout();
       tp.paint(canvas,
@@ -299,7 +299,7 @@ class _SpectrumPainter extends CustomPainter {
       text: TextSpan(
           text: msg,
           style: TextStyle(
-              fontSize: 9, color: Colors.white.withValues(alpha: 0.35))),
+              fontSize: 13, color: Colors.white.withValues(alpha: 0.35))),
       textDirection: TextDirection.ltr,
     )..layout();
     tp.paint(canvas, Offset(center ? x - tp.width / 2 : x, y));

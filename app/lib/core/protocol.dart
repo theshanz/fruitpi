@@ -20,8 +20,8 @@ class BleProtocol {
   static const pktPassDone = 0x05;
 
   static const chunkSize = 500; // payload bytes per chunk
-  static const modelWireBytes = 616;
-  static const modelWireBytesLegacy = 612;
+  static const modelWireBytes = 852; // 32-D Model32D wire blob
+  static const modelWireBytesLegacy = 848; // legacy slot offset lower bound
 
   // ── Class labels (sci_28d.cpp order) ───────────────────────────────
   static const classLabels = [
@@ -64,6 +64,7 @@ class BleProtocol {
 
   // ── JSON commands (char 03) ────────────────────────────────────────
   static Map<String, dynamic> cmdListModels() => {'command': 'list_models'};
+  static Map<String, dynamic> cmdGetStatus() => {'command': 'get_status'};
   static Map<String, dynamic> cmdDeleteModel(String fruit) =>
       {'command': 'delete_model', 'fruit': fruit};
   static Map<String, dynamic> cmdActivateModel(String fruit) =>
@@ -160,6 +161,40 @@ class MsCapturedData {
       v is num ? v.toDouble() : double.tryParse('$v') ?? 0.0;
 }
 
+/// Run-scope scan config snapshot pushed by the firmware (status `scan_config`)
+/// or embedded in a `get_status` reply: mode + N-tap count + volume override.
+class ScanConfigData {
+  final String mode;
+  final int tapCount;
+  final double volumeCm3;
+  final bool volumeOverride;
+
+  const ScanConfigData({
+    required this.mode,
+    required this.tapCount,
+    required this.volumeCm3,
+    required this.volumeOverride,
+  });
+
+  static ScanConfigData? tryParse(Map<String, dynamic> j) {
+    if (!j.containsKey('tap_count') &&
+        !j.containsKey('volume_cm3') &&
+        !j.containsKey('mode') &&
+        !j.containsKey('volume_override')) {
+      return null;
+    }
+    return ScanConfigData(
+      mode: (j['mode'] as String?) ?? 'inference',
+      tapCount: (j['tap_count'] as num?)?.toInt() ?? 3,
+      volumeCm3: _d(j['volume_cm3']),
+      volumeOverride: j['volume_override'] == true || j['volume_override'] == 1,
+    );
+  }
+
+  static double _d(dynamic v) =>
+      v is num ? v.toDouble() : double.tryParse('$v') ?? 0.0;
+}
+
 /// Progress of a model upload acknowledged by the firmware.
 class TransferProgress {
   final int id;
@@ -203,6 +238,10 @@ sealed class ResultsEvent {
                 (j['total'] as num?)?.toInt() ?? 0),
           );
         }
+        if (status == 'scan_config') {
+          final cfg = ScanConfigData.tryParse(j);
+          if (cfg != null) return ScanConfigEvent(cfg);
+        }
         return StatusEvent(status);
       }
       final result = ScanResultData.tryParse(j);
@@ -211,6 +250,7 @@ sealed class ResultsEvent {
         return ModelsListEvent(
           (j['models'] as List).map((e) => e.toString()).toList(),
           active: j['active']?.toString(),
+          config: ScanConfigData.tryParse(j),
         );
       }
     } catch (_) {}
@@ -236,7 +276,13 @@ class ResultEvent extends ResultsEvent {
 class ModelsListEvent extends ResultsEvent {
   final List<String> models;
   final String? active;
-  ModelsListEvent(this.models, {this.active});
+  final ScanConfigData? config;
+  ModelsListEvent(this.models, {this.active, this.config});
+}
+
+class ScanConfigEvent extends ResultsEvent {
+  final ScanConfigData data;
+  ScanConfigEvent(this.data);
 }
 
 class TransferProgressEvent extends ResultsEvent {

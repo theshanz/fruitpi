@@ -8,7 +8,9 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'rules_model.dart';
+import 'rules_model32d.dart';
 import 'training_extractor.dart';
+import 'training_extractor32d.dart';
 
 /// One multispectral hue capture (ms_captured): histogram + dispersion + volume.
 @immutable
@@ -114,6 +116,12 @@ class TrainingRepository extends ChangeNotifier {
   final Map<String, List<SampleSession>> _sessions = {};
   String? _pickedBaseDir;
 
+  /// Explicit session -> assigned category. When a session is recorded it is
+  /// auto-assigned to its category, but the user can reassign it (in the
+  /// Datasets screen or the category sheet) so it feeds a different class.
+  /// Persisted to `<base>/dataset/assignments.json` as id -> category.
+  final Map<String, String> _assignments = {};
+
   Map<String, List<SampleSession>> get sessions => _sessions;
 
   /// Categories that have at least one connected session.
@@ -122,10 +130,87 @@ class TrainingRepository extends ChangeNotifier {
       .map((e) => e.key)
       .toSet();
 
-  List<SampleSession> sessionsFor(String category) =>
-      List.unmodifiable(_sessions[category] ?? const []);
+  /// Every session across all categories, flat — for the Datasets manager.
+  List<SampleSession> get allSessions => _sessions.values
+      .expand((list) => list)
+      .toList(growable: true)
+    ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
 
-  bool hasData(String category) => (_sessions[category]?.isNotEmpty) ?? false;
+  /// Sessions explicitly assigned to [category].
+  List<SampleSession> sessionsFor(String category) => List.unmodifiable(
+      (_sessions[category] ?? const []).where((s) => assignedCategory(s.id) == category));
+
+  /// The category a session currently feeds (explicit assignment if set,
+  /// otherwise its stored/folder category).
+  String assignedCategory(String sessionId) =>
+      _assignments[sessionId] ?? _sessionById(sessionId)?.category ?? '';
+
+  SampleSession? _sessionById(String id) {
+    for (final list in _sessions.values) {
+      for (final s in list) {
+        if (s.id == id) return s;
+      }
+    }
+    return null;
+  }
+
+  /// Assign (reassign) a session to [category]. Returns true on success.
+  Future<bool> assignSession(String sessionId, String category) async {
+    final s = _sessionById(sessionId);
+    if (s == null) return false;
+    final old = assignedCategory(sessionId);
+    if (old == category) {
+      _assignments.remove(sessionId);
+    } else {
+      _assignments[sessionId] = category;
+    }
+    _reindex();
+    notifyListeners();
+    await _persistAssignments();
+    return true;
+  }
+
+  void _reindex() {
+    final regrouped = <String, List<SampleSession>>{};
+    for (final list in _sessions.values) {
+      for (final s in list) {
+        final cat = assignedCategory(s.id);
+        (regrouped[cat] ??= []).add(s);
+      }
+    }
+    _sessions
+      ..clear()
+      ..addAll(regrouped);
+  }
+
+  Future<Directory> _assignmentsFile() async {
+    final base = _pickedBaseDir != null
+        ? Directory(_pickedBaseDir!)
+        : await _defaultDocsDir();
+    return Directory('${base.path}/dataset');
+  }
+
+  Future<void> _persistAssignments() async {
+    try {
+      final dir = await _assignmentsFile();
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      File('${dir.path}/assignments.json')
+          .writeAsStringSync(jsonEncode(_assignments));
+    } catch (_) {}
+  }
+
+  Future<void> _loadAssignments() async {
+    try {
+      final dir = await _assignmentsFile();
+      final f = File('${dir.path}/assignments.json');
+      if (!f.existsSync()) return;
+      final j = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
+      _assignments.clear();
+      j.forEach((k, v) => _assignments[k] = v as String);
+    } catch (_) {}
+  }
+
+  bool hasData(String category) => sessionsFor(category).isNotEmpty;
 
   void setPickedBaseDir(String dir) {
     _pickedBaseDir = dir;
@@ -177,12 +262,14 @@ class TrainingRepository extends ChangeNotifier {
       taps: List.unmodifiable(taps),
       timestamp: DateTime.now(),
     );
+    _assignments[id] = category;
     (_sessions[category] ??= []).add(s);
     notifyListeners();
 
     if (persist) {
       try {
         await _persist(s, fruit.trim());
+        await _persistAssignments();
       } catch (_) {}
     }
     return s;
@@ -193,7 +280,53 @@ class TrainingRepository extends ChangeNotifier {
     if (list == null) return;
     list.removeWhere((s) => s.id == id);
     if (list.isEmpty) _sessions.remove(category);
+    _assignments.remove(id);
     notifyListeners();
+  }
+
+  /// Remove [id] from every category bucket and delete its on-disk folder.
+  Future<bool> deleteSession(String id) async {
+    final s = _sessionById(id);
+    if (s == null) return false;
+    removeSession(s.category, id);
+    try {
+      final dir = await _sessionDir(s.fruit, id);
+      if (dir.existsSync()) dir.deleteSync(recursive: true);
+    } catch (_) {}
+    try {
+      await _persistAssignments();
+    } catch (_) {}
+    return true;
+  }
+
+  /// Rename the fruit of a session (its persisted folder name). The session
+  /// keeps its assigned category.
+  Future<bool> renameSession(String id, String newFruit) async {
+    final s = _sessionById(id);
+    final fruit = newFruit.trim();
+    if (s == null || fruit.isEmpty || fruit == s.fruit) return false;
+    final cat = assignedCategory(id);
+    try {
+      final oldDir = await _sessionDir(s.fruit, id);
+      if (oldDir.existsSync()) oldDir.deleteSync(recursive: true);
+    } catch (_) {}
+    final ns = SampleSession(
+      id: '${fruit}_${DateTime.now().millisecondsSinceEpoch ~/ 1000}',
+      category: s.category,
+      hues: s.hues,
+      taps: s.taps,
+      timestamp: s.timestamp,
+    );
+    _assignments.remove(s.id);
+    removeSession(s.category, s.id);
+    _assignments[ns.id] = cat;
+    (_sessions[cat] ??= []).add(ns);
+    try {
+      await _persist(ns, fruit);
+      await _persistAssignments();
+    } catch (_) {}
+    notifyListeners();
+    return true;
   }
 
   /// Replace an existing session in memory + on disk with new hues/taps, and
@@ -238,8 +371,10 @@ class TrainingRepository extends ChangeNotifier {
       timestamp: DateTime.now(),
     );
     (_sessions[cat] ??= []).add(ns);
+    _assignments[ns.id] = cat;
     try {
       await _persist(ns, fruit);
+      await _persistAssignments();
     } catch (_) {}
     notifyListeners();
     return ns;
@@ -260,6 +395,7 @@ class TrainingRepository extends ChangeNotifier {
       for (final list in _sessions.values)
         for (final s in list) s.id,
     };
+    await _loadAssignments();
     final loaded = <SampleSession>[];
     for (final fruitDir in dataset.listSync().whereType<Directory>()) {
       final fruit = fruitDir.path
@@ -275,7 +411,8 @@ class TrainingRepository extends ChangeNotifier {
       }
     }
     for (final s in loaded) {
-      (_sessions[s.category] ??= []).add(s);
+      final cat = _assignments[s.id] ?? s.category;
+      (_sessions[cat] ??= []).add(s);
     }
     if (loaded.isNotEmpty) notifyListeners();
     return loaded.length;
@@ -305,7 +442,7 @@ class TrainingRepository extends ChangeNotifier {
                   .map((x) => (x as num).toDouble())),
           chromaticDispersion:
               (m['chromatic_dispersion'] as num?)?.toDouble() ?? 1.0,
-          volumeCm3: (m['volume_cm3'] as num?)?.toDouble() ?? 150.0,
+          volumeCm3: (m['volume_cm3'] as num?)?.toDouble() ?? 350.0,
         ));
         hueIdx++;
       }
@@ -360,6 +497,7 @@ class TrainingRepository extends ChangeNotifier {
 
   void clearAll() {
     _sessions.clear();
+    _assignments.clear();
     notifyListeners();
   }
 
@@ -369,8 +507,8 @@ class TrainingRepository extends ChangeNotifier {
   /// every session of [category]. Aggregates raw FFT bins + hue exactly like
   /// extract_28d (averages all hue_*.json and all waveform_*.csv).
   List<double>? prototypeOf(String category) {
-    final list = _sessions[category];
-    if (list == null || list.isEmpty) return null;
+    final list = sessionsFor(category);
+    if (list.isEmpty) return null;
 
     final taps = <({List<double> fftBins, double entropy, double impactAmp})>[];
     final hueRecs = <HueRecord>[];
@@ -414,6 +552,129 @@ class TrainingRepository extends ChangeNotifier {
       if (!hasData(l)) continue;
       final p = prototypeOf(l);
       if (p != null) out[l] = p;
+    }
+    return out;
+  }
+
+  /// Robust mean 32-D prototype (`extractState32dBalanced`, force-invariant)
+  /// across every tap of every session of [category]. Mirrors the canonical
+  /// engine's centroid for the 32-D Fruit Profile path.
+  List<double>? centroid32dOf(String category) {
+    final list = sessionsFor(category);
+    if (list.isEmpty) return null;
+
+    final taps = <List<double>>[];
+    final hueRecs = <HueRecord>[];
+    for (final s in list) {
+      for (final t in s.taps) {
+        taps.add(t.waveform);
+      }
+      hueRecs.addAll(s.hues);
+    }
+    if (taps.isEmpty) return null; // need at least one tap spectrum
+
+    // Average hue across every hue capture; a tap-only session (no camera
+    // captures) still forms a valid prototype using a uniform hue (1/8 per
+    // bin) and the nominal 350 cm³ volume.
+    var hist = List<double>.filled(8, 0);
+    var vol = 0.0;
+    for (final h in hueRecs) {
+      for (var i = 0; i < 8; i++) {
+        hist[i] += h.hueHistogram[i];
+      }
+      vol += h.volumeCm3;
+    }
+    if (hueRecs.isEmpty) {
+      for (var i = 0; i < 8; i++) {
+        hist[i] = 1.0 / 8.0;
+      }
+      vol = 350.0;
+    } else {
+      final n = hueRecs.length.toDouble();
+      for (var i = 0; i < 8; i++) {
+        hist[i] /= n;
+      }
+      vol /= n;
+    }
+
+    // mean of the block-normalized 32-D per-tap states (scale-free already).
+    final sum = List<double>.filled(
+        RulesModel32D.dims, 0.0);
+    for (final wave in taps) {
+      final s = TrainingExtractor32D.extractState32dBalanced(
+          wave: wave, visionHues: hist, volumeCm3: vol);
+      for (var d = 0; d < RulesModel32D.dims; d++) {
+        sum[d] += s[d];
+      }
+    }
+    final m = taps.length.toDouble();
+    return List<double>.generate(
+        RulesModel32D.dims, (d) => sum[d] / m);
+  }
+
+  /// 32-D centroids for the enabled categories that have connected data.
+  Map<String, List<double>> centroids32dFor(Iterable<String> enabledLabels) {
+    final out = <String, List<double>>{};
+    for (final l in enabledLabels) {
+      if (!hasData(l)) continue;
+      final c = centroid32dOf(l);
+      if (c != null) out[l] = c;
+    }
+    return out;
+  }
+
+  /// RAW (non-normalized) per-tap 32-D states for [category], as the v3
+  /// firmware's `assemble_state_32d` now produces (no block L2). The
+  /// Diagonal-Gaussian compiler needs these to estimate per-feature variance
+  /// AND to keep the absolute amplitude that separates ripe from unripe.
+  List<List<double>> rawStates32dOf(String category) {
+    final list = sessionsFor(category);
+    if (list.isEmpty) return const [];
+
+    final taps = <List<double>>[];
+    final hueRecs = <HueRecord>[];
+    for (final s in list) {
+      for (final t in s.taps) {
+        taps.add(t.waveform);
+      }
+      hueRecs.addAll(s.hues);
+    }
+    if (taps.isEmpty) return const [];
+
+    var hist = List<double>.filled(8, 0);
+    var vol = 0.0;
+    for (final h in hueRecs) {
+      for (var i = 0; i < 8; i++) {
+        hist[i] += h.hueHistogram[i];
+      }
+      vol += h.volumeCm3;
+    }
+    if (hueRecs.isEmpty) {
+      for (var i = 0; i < 8; i++) {
+        hist[i] = 1.0 / 8.0;
+      }
+      vol = 350.0;
+    } else {
+      final n = hueRecs.length.toDouble();
+      for (var i = 0; i < 8; i++) {
+        hist[i] /= n;
+      }
+      vol /= n;
+    }
+
+    return taps
+        .map((wave) => TrainingExtractor32D.extractState32d(
+            wave: wave, visionHues: hist, volumeCm3: vol))
+        .toList();
+  }
+
+  /// RAW per-tap states for the enabled categories that have connected data.
+  Map<String, List<List<double>>> states32dFor(Iterable<String> enabledLabels) {
+    final out = <String, List<List<double>>>{};
+    for (final l in enabledLabels) {
+      if (!hasData(l)) continue;
+      final s = rawStates32dOf(l);
+      if (s.isNotEmpty) out[l] = s;
     }
     return out;
   }
@@ -482,7 +743,7 @@ class TrainingRepository extends ChangeNotifier {
 
   /// Absolute path of the persisted folder for a session (for UI display).
   Future<String?> persistedPath(String category, String id) async {
-    final s = (_sessions[category] ?? const []).where((x) => x.id == id).firstOrNull;
+    final s = _sessionById(id);
     if (s == null) return null;
     try {
       final dir = await _sessionDir(s.fruit, s.id);
@@ -490,14 +751,5 @@ class TrainingRepository extends ChangeNotifier {
     } catch (_) {
       return null;
     }
-  }
-}
-
-extension _FirstOrNull<T> on Iterable<T> {
-  T? get firstOrNull {
-    for (final e in this) {
-      return e;
-    }
-    return null;
   }
 }

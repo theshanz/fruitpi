@@ -18,6 +18,12 @@ struct AcousticFeatures {
     float impact_amplitude;   // Peak |sample - window mean| (0-1) — true tap strength
     float fft_bins[N_FFT_BINS]; //15 f^2 - conditioned log power bins
     float spectral_entropy; //Normalized s.e.
+    // ── 32D Fruit Profile additions ───────────────────────────────
+    float stft_grid[16];      // 4x4 time-frequency image (log1p band power),
+                              // contrast-normalized to 0..1 in [10..25]
+    float bio_moments[6];     // dim 26..31: temporal centroid, tail energy,
+                              // harmonic absorption, abbott stiffness,
+                              // spectral entropy, dynamic damping
 };
 
 enum SamplingState {
@@ -45,6 +51,24 @@ class PiezoAcoustic {
 
         void generate_hanning_window();
         float compute_spectral_entropy(const float raw_power[N_FFT_BINS]);
+
+        // 32D Fruit Profile DSP: STFT 4x4 grid + 6 bio-moments, computed
+        // from the full centered window during process_captured_buffer().
+        alignas(16) float stft_fft[STFT_FFT_N * 2]; // per-frame FFT workspace
+        alignas(16) float stft_win[STFT_FFT_N];     // Hanning for n_fft=128
+        // Large working buffers kept as members (NOT stack) so the 4KB
+        // sampler task never overflows: e_t/rms_env/centered are 512 floats.
+        alignas(16) float dsp_centered[FFT_SIZE];
+        alignas(16) float dsp_energy[FFT_SIZE];
+        alignas(16) float dsp_rms_env[FFT_SIZE];
+        void build_stft_grid(const float centered[FFT_SIZE],
+                             float out[16],
+                             float raw_psd_mean[STFT_FFT_N / 2 + 1]);
+        void compute_bio_moments(const float centered[FFT_SIZE],
+                                 const float grid[16],
+                                 const float raw_psd_mean[STFT_FFT_N / 2 + 1],
+                                 float volume_norm,
+                                 float moments[6]);
 
         // Continuous Background Recording Extensions
         alignas(16) float ring_buffer[RING_BUFFER_SIZE];
