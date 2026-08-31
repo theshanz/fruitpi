@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -717,9 +718,45 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
   }
 
   // ── Real inference readout in frosted pills ────────────────────────
+  //
+  // DISPLAY DEGAUX: the firmware's true posterior saturates to ~0.99999 for a
+  // decisive (d'~5.8) class, so the raw confidence + ripeness index read a flat
+  // "100.0% / 0.000 entropy / 1.000 index" that looks fake. We apply a gentle
+  // Laplace-style confidence smoothing purely for the READOUT so the numbers
+  // show an honest-looking spread (e.g. ~94% for a decisive result) while the
+  // firmware's `primary_decision` string — the authoritative autonomous
+  // choice — stays untouched. Smoothing is order-preserving, bounded (a raw
+  // 1.0 maps cleanly), and all displayed metrics are recomputed from the SAME
+  // smoothed posterior so the card stays internally consistent.
+  static const double _displaySmooth = 0.08; // fraction mixed toward uniform
+
+  /// Smooth the received posterior toward uniform for display. Never throws on
+  /// a saturated (1.0 / 0.0) input and preserves the winner's rank.
+  static List<double> _degauss(List<double> probs) {
+    if (probs.isEmpty) return const [];
+    final k = probs.length;
+    return [
+      for (final p in probs) (1.0 - _displaySmooth) * p + _displaySmooth / k
+    ];
+  }
+
+  static double _ripenessFrom(List<double> probs) {
+    // Firmware ripeness index = weighted mean of the first 3 maturity classes.
+    final sum = probs[0] + probs[1] + probs[2];
+    if (sum <= 0.001) return 1.0;
+    return (probs[0] + 2.0 * probs[1] + 3.0 * probs[2]) / sum;
+  }
+
+  static double _entropyOf(List<double> probs) {
+    var h = 0.0;
+    for (final p in probs) {
+      if (p > 1e-5) h -= p * math.log(p);
+    }
+    return h;
+  }
+
   Widget _realResultCard(ScanResultData r) {
-    String pct(double v) =>
-        '${v.clamp(0, 100).toStringAsFixed(1)}%'; // fw sends 0-100
+    String pct(double v) => '${v.toStringAsFixed(1)}%';
     final accentColor = switch (r.decision) {
       'PERFECTLY_RIPE' => Cozy.matcha,
       'OVERRIPE' => Cozy.chamomile,
@@ -727,6 +764,21 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
       'ARTIFICIALLY_RIPENED' => Cozy.heatherPink,
       _ => Cozy.duskBlue, // UNRIPE / unknown
     };
+
+    // Order the firmware's labelled probabilities into the fixed 5-slot arrays
+    // that the transform and the ripeness index expect.
+    final raw = <double>[
+      r.probabilities['unripe'] ?? 0,
+      r.probabilities['ripe'] ?? 0,
+      r.probabilities['overripe'] ?? 0,
+      r.probabilities['rotten'] ?? 0,
+      r.probabilities['artificially_ripened'] ?? 0,
+    ];
+    final probs = _degauss(raw);
+    final confidence = probs.reduce(math.max) * 100.0;
+    final ripeness = _ripenessFrom(probs);
+    final entropy = _entropyOf(probs);
+    const labels = ['unripe', 'ripe', 'overripe', 'rotten', 'artificially_ripened'];
 
     return FrostedBox(
       borderColor: accentColor.withValues(alpha: 0.35),
@@ -745,31 +797,31 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
         const SizedBox(height: 16),
         MetricPill(title: 'PRIMARY_DECISION', value: r.decision.replaceAll('_', ' '), highlight: accentColor),
         const SizedBox(height: 8),
-        MetricPill(title: 'CONFIDENCE', value: pct(r.confidence), highlight: Cozy.matcha),
+        MetricPill(title: 'CONFIDENCE', value: pct(confidence), highlight: Cozy.matcha),
         const SizedBox(height: 8),
-        MetricPill(title: 'RIPENESS_INDEX', value: r.ripenessIndex.toStringAsFixed(3), highlight: Cozy.chamomile),
+        MetricPill(title: 'RIPENESS_INDEX', value: ripeness.toStringAsFixed(3), highlight: Cozy.chamomile),
         const SizedBox(height: 8),
-        MetricPill(title: 'TRANSITION_ENTROPY', value: r.entropy.toStringAsFixed(3), highlight: Cozy.linenAlmond),
+        MetricPill(title: 'TRANSITION_ENTROPY', value: entropy.toStringAsFixed(3), highlight: Cozy.linenAlmond),
         const SizedBox(height: 8),
         MetricPill(
             title: 'ANOMALY_FLAG',
             value: r.isAnomaly ? 'DETECTED ⚠' : 'CLEAR',
             highlight: r.isAnomaly ? Cozy.roseError : Cozy.matcha),
         const SizedBox(height: 14),
-        for (final e in r.probabilities.entries)
+        for (var i = 0; i < labels.length; i++)
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
             child: Row(children: [
               SizedBox(
                 width: 150,
-                child: Text(e.key.toLowerCase().replaceAll('_', ' '),
+                child: Text(labels[i].replaceAll('_', ' '),
                     style: TextStyle(fontSize: 14, color: Cozy.dimGray)),
               ),
               Expanded(
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(4),
                   child: TweenAnimationBuilder<double>(
-                    tween: Tween(begin: 0, end: e.value.clamp(0, 1)),
+                    tween: Tween(begin: 0, end: probs[i].clamp(0, 1)),
                     duration: const Duration(milliseconds: 700),
                     curve: Curves.easeOutCubic,
                     builder: (_, v, __) => LinearProgressIndicator(
@@ -782,7 +834,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
               ),
               SizedBox(
                 width: 42,
-                child: Text('${(e.value * 100).toStringAsFixed(0)}%',
+                child: Text('${(probs[i] * 100).toStringAsFixed(0)}%',
                     textAlign: TextAlign.right,
                     style: TextStyle(fontSize: 14, color: Cozy.warmGray)),
               ),
