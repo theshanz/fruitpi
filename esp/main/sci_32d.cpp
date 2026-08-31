@@ -252,9 +252,7 @@ static BiologicalStatus evaluate_scores(
     float raw_scores[NUM_CLASSES];
     score_logits_32d(state, model, raw_scores);
     return decide_32d(raw_scores);
-}
-
-BiologicalStatus evaluate_fruit_single_32d(
+}BiologicalStatus evaluate_fruit_single_32d(
     const float state[VECTOR_DIMENSIONS],
     const ManifoldModel32D& model
 ){
@@ -285,4 +283,24 @@ BiologicalStatus evaluate_fruit_ntap_32d(
     }
 
     return decide_32d(summed_logits);
+}
+
+// DISPLAY-ONLY confidence for the LCD. Smooths the posterior toward uniform
+// (Laplace, alpha=0.08) so a decisive result reads ~94% instead of a flat full
+// bar, then returns the softened winner probability as 0-100%. The decision
+// itself is untouched.
+float display_confidence_32d(const BiologicalStatus& status) {
+    const float alpha = 0.08f;
+    float p_max = 0.0f;
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        float p = status.probabilities[c];
+        if (p < 0.0f) p = 0.0f;
+        if (p > 1.0f) p = 1.0f;
+        float softened = (1.0f - alpha) * p + alpha / (float)NUM_CLASSES;
+        if (softened > p_max) p_max = softened;
+    }
+    float conf = p_max * 100.0f;
+    if (conf < 0.0f) conf = 0.0f;
+    if (conf > 100.0f) conf = 100.0f;
+    return conf;
 }

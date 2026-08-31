@@ -581,8 +581,11 @@ void loop() {
             evaluate_fruit_ntap_32d(tap_states, total_taps, *model);
         bt.notify_scan_result(status);
         led_pet_result(status.primary_decision, status.is_anomaly);
+        // LCD meter uses the DISPLAY-ONLY degaussed confidence so a decisive
+        // result doesn't render as a flat full bar (raw ~100%). The decision
+        // and BLE-published posterior are untouched.
         lcd_result(status.primary_decision, status.is_anomaly,
-                   status.confidence);
+                   display_confidence_32d(status));
         tap_capture_running = false;
         current_tap_idx = 0;
         have_ms_features = false;

@@ -114,3 +114,11 @@ BiologicalStatus evaluate_fruit_ntap_32d(
     uint8_t n_taps,
     const ManifoldModel32D& model
 );
+
+// DISPLAY-ONLY confidence for the LCD: a decisive posterior saturates
+// (d'~5.8) to ~0.99999, so a raw bar reads as a flat full 100%. Smooth the
+// posterior toward uniform (Laplace, alpha=0.08 — matching the app's readout)
+// and return the softened max-probability in percent. The authoritative
+// classification/decision is unaffected; this only makes the meter legible.
+float display_confidence_32d(const BiologicalStatus& status);
+
