@@ -17,6 +17,19 @@ build/
 dist/
 *.log
 
+# Flutter / Dart generated artifacts (machine-local, not source of record)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.dart_tool/
+**/.dart_tool/
+.packages
+app/android/local.properties
+app/android/.gradle/
+app/android/app/.cxx/
+*.jks
+*.keystore
+
 # Temp
 *.tmp
 *.temp

@@ -49,11 +49,12 @@ class VolumeSelector extends StatelessWidget {
                 fontFamily: 'monospace', fontSize: 16, color: Colors.white)),
       ]),
       const SizedBox(height: 6),
-      Row(children: [
-        for (final (label, value) in _tiers)
-          Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: ChoiceChip(
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (final (label, value) in _tiers)
+            ChoiceChip(
               label: Text('$label (${value.round()})',
                   style: const TextStyle(fontSize: 15)),
               selected: tier.$2 == value,
@@ -63,8 +64,8 @@ class VolumeSelector extends StatelessWidget {
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(14)),
             ),
-          ),
-      ]),
+        ],
+      ),
       Slider(
         value: volumeCm3.clamp(_min, _max),
         min: _min,
