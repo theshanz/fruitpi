@@ -18,7 +18,7 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <application
-        android:label="esp32_connector"
+        android:label="fruitpi"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true"> <!-- Allows plain HTTP calls to 192.168.4.1 -->
