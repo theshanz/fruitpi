@@ -498,10 +498,19 @@ static void fit_fruit_ellipse(const uint8_t* mask, uint16_t w, uint16_t h,
         if (iy > max_y) max_y = iy;
     }
     constexpr float EDGE_FRAC = 0.02f;  // within 2% of an edge => hugging it
-    if (min_x <= (int)(EDGE_FRAC * w)) *overflow |= 0x01;                       // left
-    if (max_x >= (int)(w - 1) - (int)(EDGE_FRAC * w)) *overflow |= 0x02;         // right
-    if (min_y <= (int)(EDGE_FRAC * h)) *overflow |= 0x04;                       // top
-    if (max_y >= (int)(h - 1) - (int)(EDGE_FRAC * h)) *overflow |= 0x08;         // bottom
+    if (min_x <= (int)(EDGE_FRAC * w)) *overflow |= OVERFLOW_LEFT;
+    if (max_x >= (int)(w - 1) - (int)(EDGE_FRAC * w)) *overflow |= OVERFLOW_RIGHT;
+    if (min_y <= (int)(EDGE_FRAC * h)) *overflow |= OVERFLOW_TOP;
+    if (max_y >= (int)(h - 1) - (int)(EDGE_FRAC * h)) *overflow |= OVERFLOW_BOTTOM;
+}
+
+// Opposite-border glare rejection: overflow bits set for BOTH a row pair
+// (top+bottom) or column pair (left+right) mean the segmented blob spans the
+// full sensor — a dark-room flash flood / glossy-glare band that no real fruit
+// can span. Mirrors the canonical final_pipeline._segment rule (single source).
+static bool spans_opposite_borders(uint8_t overflow) {
+    return ((overflow & (OVERFLOW_TOP | OVERFLOW_BOTTOM)) == (OVERFLOW_TOP | OVERFLOW_BOTTOM))
+        || ((overflow & (OVERFLOW_LEFT | OVERFLOW_RIGHT)) == (OVERFLOW_LEFT | OVERFLOW_RIGHT));
 }
 
 // Bounds an already-selected binary mask to the natural oval estimated from its
@@ -663,6 +672,24 @@ ColorFeatures HueExtractor::process_differential(const uint16_t* flash, const ui
             out_mask[i] = 0;   // visited / output, initially empty
         }
 
+        // Strict foveal fail-fast (item 2, mirrors final_pipeline._FOVEAL_FG_MIN):
+        // the central foveal seed box must itself yield a confident fruit-like
+        // foreground. Edge/border washes read 0-140 foveal px and are reported
+        // empty instead of being guessed at by the notch/CCL machinery.
+        uint32_t foveal_fg = 0;
+        for (int y = seed_y0; y <= seed_y0 + 2 * rh; y++)
+            for (int x = seed_x0; x <= seed_x0 + 2 * rw; x++)
+                foveal_fg += core_mask[(size_t)y * w + (size_t)x];
+        if (foveal_fg < (uint32_t)MS_FOVEAL_FG_MIN) {
+            for (int i = 0; i < 8; i++) features.hue_histogram[i] = 0.0f;
+            features.chromatic_dispersion = 1.0f;
+            features.volume_cm3 = 0.0f;
+            heap_caps_free(dy_map);
+            heap_caps_free(core_mask);
+            heap_caps_free(out_mask);
+            return features;
+        }
+
         // Select the foreground component: the largest blob, with a centre
         // proximity tiebreak among comparable-sized blobs (>=50% of the largest).
         // This replaces the single-pixel centre seed, which collapsed to a tiny
@@ -742,6 +769,16 @@ ColorFeatures HueExtractor::process_differential(const uint16_t* flash, const ui
     features.centroid_px[0] = ecx;
     features.centroid_px[1] = ecy;
     features.overflow_mask = overflow;
+    // Opposite-border glare rejection: wall/table glare spans the full sensor.
+    if (spans_opposite_borders(overflow)) {
+        for (int i = 0; i < 8; i++) features.hue_histogram[i] = 0.0f;
+        features.chromatic_dispersion = 1.0f;
+        features.volume_cm3 = 0.0f;
+        heap_caps_free(dy_map);
+        heap_caps_free(core_mask);
+        heap_caps_free(out_mask);
+        return features;
+    }
     if (overflow == 0 && emaj > 1.0f && emin > 1.0f) {
         // Whole fruit in view: refine volume from the natural oval (3-sigma
         // ellipse axes -> semi-axis lengths), a closer fit than the bbox.
@@ -766,11 +803,20 @@ ColorFeatures HueExtractor::process_differential(const uint16_t* flash, const ui
         unpack_rgb565((const uint8_t*)&flash[i], fr, fg, fb);
         unpack_rgb565((const uint8_t*)&ambient[i], ar, ag, ab);
 
-        // Flash white-balance (cyan cast fix): the 'white' LED reads blue-heavy
-        // on green fruit, pushing hue past the 120° window into cyan. Scaling
-        // flash-B by MS_WB_B_SCALE pulls it back into the green band. V =
-        // max(R,G,B) is unchanged for green-dominant fruit, so seed_v_min stays
-        // valid; the histogram and reflectance means both use the WB'd flash.
+        // Raw (pre-WB) saturation gate: washed-out neutral cast regions (~S 0.24)
+        // must not count as green in the hue report, while real fruit (~S 0.5)
+        // stays in. Evaluated on the raw flash before the B WB-scale below.
+        {
+            float rh, rs, rv;
+            rgb888_to_hsv(fr, fg, fb, rh, rs, rv);
+            if (rs < HUE_RAW_S_MIN) continue;
+        }
+
+        // Flash white-balance: MS_WB_B_SCALE (1.0 = none) — the sensor's on-chip
+        // AWB already balances the flash frame naturally (converged by the AWB
+        // warm-up before the lock). No B-reduction is applied, so yellow fruit is
+        // not pushed toward the green bins. V = max(R,G,B) is unchanged for
+        // green-dominant fruit, so seed_v_min stays valid.
         int wb_fb = (int)((float)fb * MS_WB_B_SCALE);
         if (wb_fb > 255) wb_fb = 255;
         fb = (uint8_t)wb_fb;
@@ -1050,6 +1096,25 @@ ColorFeatures HueExtractor::process_unified_burst(const uint16_t* flashed1, cons
             out_mask[i] = 0;   // visited / output, initially empty
         }
 
+        // Strict foveal fail-fast (item 2, mirrors final_pipeline._FOVEAL_FG_MIN):
+        // same as process_differential — the foveal seed box must yield a confident
+        // fruit-like foreground on its own; edge/border washes report empty.
+        uint32_t foveal_fg = 0;
+        for (int y = seed_y0; y <= seed_y0 + 2 * rh; y++)
+            for (int x = seed_x0; x <= seed_x0 + 2 * rw; x++)
+                foveal_fg += core_mask[(size_t)y * w + (size_t)x];
+        if (foveal_fg < (uint32_t)MS_FOVEAL_FG_MIN) {
+            for (int i = 0; i < 8; i++) features.hue_histogram[i] = 0.0f;
+            features.chromatic_dispersion = 1.0f;
+            features.volume_cm3 = 0.0f;
+            heap_caps_free(dy_map);
+            heap_caps_free(core_mask);
+            heap_caps_free(out_mask);
+            if (core_pixels_out) *core_pixels_out = 0;
+            if (snap_pixels_out) *snap_pixels_out = 0;
+            return features;
+        }
+
         // Select the foreground component: largest blob with a centre-proximity
         // tiebreak among comparable blobs (>=50% of the largest). Mirrors
         // process_differential and the validated host port; replaces the
@@ -1163,6 +1228,31 @@ ColorFeatures HueExtractor::process_unified_burst(const uint16_t* flashed1, cons
     features.centroid_px[0] = ecx;
     features.centroid_px[1] = ecy;
     features.overflow_mask = overflow;
+
+    // Opposite-border glare rejection: wall/table glare spans the full sensor.
+    if (spans_opposite_borders(overflow)) {
+        features.volume_cm3 = 0.0f;
+        features.ellipse_major_px = 0.0f;
+        features.ellipse_minor_px = 0.0f;
+        features.centroid_px[0] = 0.0f;
+        features.centroid_px[1] = 0.0f;
+        for (int i = 0; i < 8; i++) features.hue_histogram[i] = 0.0f;
+        features.chromatic_dispersion = 1.0f;
+        if (fg_pixels_out) *fg_pixels_out = 0;
+        if (core_pixels_out) *core_pixels_out = 0;
+        if (snap_pixels_out) *snap_pixels_out = 0;
+        if (bbox_x_out) *bbox_x_out = 0;
+        if (bbox_y_out) *bbox_y_out = 0;
+        if (bbox_w_out) *bbox_w_out = 0;
+        if (bbox_h_out) *bbox_h_out = 0;
+        heap_caps_free(dy_map);
+        heap_caps_free(core_mask);
+        heap_caps_free(out_mask);
+        if (proj_x) heap_caps_free(proj_x);
+        if (proj_y) heap_caps_free(proj_y);
+        return features;
+    }
+
     if (overflow == 0 && emaj > 1.0f && emin > 1.0f) {
         // Whole fruit in view -> refine volume with the natural oval.
         const float a = emin * cm_per_pixel;
@@ -1190,7 +1280,17 @@ ColorFeatures HueExtractor::process_unified_burst(const uint16_t* flashed1, cons
         uint8_t fg_ = g1 > g2 ? g1 : g2;
         uint8_t fb = b1 > b2 ? b1 : b2;
 
-        // Flash white-balance (cyan cast fix, see process_differential).
+        // Raw (pre-WB) saturation gate: washed-out neutral cast regions (~S 0.24)
+        // must not count as green in the hue report, while real fruit (~S 0.5)
+        // stays in. Evaluated on the raw fused flash before the B WB-scale below.
+        {
+            float rh, rs, rv;
+            rgb888_to_hsv(fr, fg_, fb, rh, rs, rv);
+            if (rs < HUE_RAW_S_MIN) continue;
+        }
+
+        // Flash white-balance: MS_WB_B_SCALE (1.0 = none, see process_differential).
+        // AWB converges before the lock so no B-reduction is needed.
         int wb_fb = (int)((float)fb * MS_WB_B_SCALE);
         if (wb_fb > 255) wb_fb = 255;
         fb = (uint8_t)wb_fb;

@@ -97,6 +97,19 @@ struct FlashGuard {
 // Single-shot decode buffer (PSRAM, 320×256 RGB565 = 160KB).
 static uint16_t* s_ss_buf = nullptr;
 
+// ─── AWB warm-up (item 1, 2026-09-05) ─────────────────────────────
+// Converge white-balance off its cold-start green cast BEFORE the capture locks
+// the sensor. AWB is still ACTIVE here (enabled at camera init); the ~10
+// discarded frames (15 ms apart) let it settle, then the lock freezes the
+// converged gains for the ambient/flash pair.
+static void ms_warmup_awb() {
+    for (int i = 0; i < MS_WARMUP_FRAMES; i++) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(MS_WARMUP_DELAY_MS));
+    }
+}
+
 // ─── Fast single-shot white-flash capture (default on all targets) ──
 bool multispectral_capture_single_shot(ColorFeatures& out) {
     if (!is_camera_ready()) {
@@ -116,6 +129,8 @@ bool multispectral_capture_single_shot(ColorFeatures& out) {
 
     // Suppress led_indicator so the WS2812 stays white during capture.
     led_indicator_set_scan_active(true);
+
+    ms_warmup_awb();  // converge AWB before the kept frame (item 1)
 
     FlashGuard guard;
     guard.on();
@@ -237,6 +252,7 @@ bool multispectral_capture_dual_shot(ColorFeatures& out) {
 
     led_indicator_set_scan_active(true);
     camera_wake();  // session start: restores XCLK from idle
+    ms_warmup_awb();  // converge AWB while it is still active (item 1)
     multispectral_lock_sensor();
 
     // Ambient baseline (flash off), then back-to-back flash frame under the
@@ -307,6 +323,7 @@ bool multispectral_capture_dual_shot_debug(ColorFeatures& out, DualShotDebugInfo
     led_indicator_set_scan_active(true);
     FlashGuard guard;
     camera_wake();  // session start: restores XCLK from idle
+    ms_warmup_awb();  // converge AWB while it is still active (item 1)
     uint32_t t0 = millis();
     multispectral_lock_sensor();
     info.lock_ms = millis() - t0;
@@ -474,6 +491,7 @@ bool multispectral_capture_burst(ColorFeatures& out) {
 
     led_indicator_set_scan_active(true);
     camera_wake();
+    ms_warmup_awb();  // converge AWB while it is still active (item 1)
     multispectral_lock_sensor();
 
     uint16_t aw = 0, ah = 0, f1w = 0, f1h = 0, f2w = 0, f2h = 0;
@@ -546,6 +564,7 @@ bool multispectral_capture_burst_debug(ColorFeatures& out, DualShotDebugInfo& in
     led_indicator_set_scan_active(true);
     FlashGuard guard;
     camera_wake();
+    ms_warmup_awb();  // converge AWB while it is still active (item 1)
     uint32_t t0 = millis();
     multispectral_lock_sensor();
     info.lock_ms = millis() - t0;
@@ -965,6 +984,7 @@ bool multispectral_capture(ColorFeatures& out) {
 
     uint16_t* bufs[3] = { s_buf_r, s_buf_g, s_buf_b };
 
+    ms_warmup_awb();  // converge AWB while it is still active (item 1)
     multispectral_lock_sensor();
     rgb_led_set_raw(0, 0, 0);
 

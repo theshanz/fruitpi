@@ -110,6 +110,15 @@ constexpr float VOLUME_CM3_MIN     = 10.0f;  // sanity clamp for estimated volum
 constexpr float VOLUME_CM3_MAX     = 500.0f;
 constexpr float VOLUME_DEFAULT_CM3 = 350.0f; // fallback when bbox criteria fail
 
+// Frame-overflow edge bits (the "fits frame?" signal from fit_fruit_ellipse):
+// a fruit hugging an edge sets that bit. A blob touching BOTH Top+Bottom (or
+// BOTH Left+Right) edges is wall/table glare sweeping the whole sensor, not a
+// fruit — matches final_pipeline._OVFL_* / ms_tool (single source of truth).
+constexpr uint8_t OVERFLOW_LEFT   = 0x01;
+constexpr uint8_t OVERFLOW_RIGHT  = 0x02;
+constexpr uint8_t OVERFLOW_TOP    = 0x04;
+constexpr uint8_t OVERFLOW_BOTTOM = 0x08;
+
 // ─── Multispectral scan ───────────────────────────────────────────
 constexpr int    MS_DECODE_SCALE        = 2;    // TJpgDec 1/4: SXGA → 320×256
 constexpr int    MS_FIXED_GAIN          = 5;    // locked sensor AGC gain
@@ -131,6 +140,14 @@ constexpr bool   MS_AMBIENT_DEFAULT     = true; // subtract no-flash baseline
 // wait for. Exposure convergence is handled by the discard frame(s) above.
 constexpr int FLASH_SETTLE_DELAY_MS = 0;
 
+// AWB warm-up (item 1, 2026-09-05): the OV sensor converges white-balance over
+// the first frames after wake; locking the sensor too early freezes the
+// cold-start green cast into the captured gains. Discard the first ~10 frames
+// with AWB still ACTIVE before multispectral_lock_sensor(), so the real
+// capture freezes the converged gains. User-specified spec.
+constexpr int    MS_WARMUP_FRAMES   = 10;
+constexpr uint32_t MS_WARMUP_DELAY_MS = 15;
+
 // White flash intensity (0-255). 255 saturates a glossy fruit at close range
 // -> specular glare pixels (S just above the 0.15 floor) leak noisy hue into
 // every histogram bin. Keep it modest; AEC/AGC adapt to the rest.
@@ -151,15 +168,20 @@ constexpr float FRUIT_MIN_V_CUT = 0.25f;  // low-light noise floor
 constexpr float FRUIT_MIN_S_CUT = 0.20f;  // desaturated background
 constexpr float GLARE_MIN_S_CUT = 0.15f;  // glare desaturation threshold
 constexpr float GLARE_MAX_V_CUT = 0.88f;  // cuts specular hot spots
+// Raw (pre-WB) saturation floor for hue-report pixels: washed-out neutral cast
+// regions (~S 0.24) otherwise read as green after the B WB-scale; real fruit
+// sits at ~S 0.5. Applied to the fused flash BEFORE MS_WB_B_SCALE.
+constexpr float HUE_RAW_S_MIN = 0.30f;
 
-// Flash white-balance (cyan cast fix, applied to the fused flash before HSV in
-// the hue pass): the RGB LED 'white' flash reads blue-heavy on green fruit,
-// washing green ~>120° into cyan. Scaling the flash B channel by
-// MS_WB_B_SCALE pulls cyan back into the green window. V=max(R,G,B) is
-// unchanged for green-dominant fruit, so the centre-prior seed V floor stays
-// valid. Empirically fit to two live green-mango bundles (2431/2000): 0.62
-// drops cyan 22->2% / 52->7% while keeping green dominant.
-constexpr float MS_WB_B_SCALE = 0.62f;
+// Flash white-balance: NO artificial correction (MS_WB_B_SCALE = 1.0). The
+// sensor's on-chip AWB now balances the flash naturally — the AWB warm-up
+// (MS_WARMUP_FRAMES) converges it before multispectral_lock_sensor() freezes
+// the gains, exactly like the working one-shot/process_frame path, which never
+// applies a B-scale and renders natural R≈G≈B on neutrals. The earlier 0.62
+// B-reduction was a band-aid for disabling AWB too early and froze a cold-green
+// cast; with proper AWB settle it is no longer needed and would otherwise push
+// yellow fruit (e.g. banana) toward the green bins.
+constexpr float MS_WB_B_SCALE = 1.0f;
 
 // Edge-refined trimap segmentation (replaces the single ΔY gate in
 // process_differential): a solid core (ΔY >= EDGE_CORE_DY), a definite
@@ -181,6 +203,13 @@ constexpr int EDGE_GRAD_MIN = 8;    // |∇ΔY| above which a rim pixel is admit
 constexpr float CENTRE_SEED_FRACTION = 0.10f;       // 10% of W/H each side → 20% foveal box
 constexpr float CENTRE_SEED_V_MIN    = 0.08f;       // lowest allowed flash-V floor
 constexpr int   CENTRE_SEED_DY_MIN   = 14;          // lowest allowed ΔY threshold
+
+// Strict foveal fail-fast (item 2, 2026-09-05): report EMPTY unless the central
+// foveal seed box alone yields a confident fruit-like foreground. A blob pinned
+// to a frame edge or washed to the sensor border reads 0-140 foveal px across
+// 28 validated bundles, while live centred captures sit at 1095-2407 px; 400
+// sits ≥2σ from both populations. Mirrors final_pipeline._FOVEAL_FG_MIN.
+constexpr uint32_t MS_FOVEAL_FG_MIN = 400;
 
 // Gradient Notch (2026-09-04 research pipeline, tests/final_pipeline.py): Sobel
 // gradient magnitude on ΔY, fovea-adaptive cut threshold t_grad = μ_fov + K·σ_fov
@@ -226,7 +255,11 @@ constexpr float PARALLAX_GLOBAL_HANDHELD = 0.40f; // mean px across blocks -> ha
 // Layer 5 semantic gates for the burst path.
 // Glossy table / white-wall reject: if the core's mean saturation is under
 // TABLE_MIN_MEAN_S the region is neutral flash glare -> fg=0, bbox=0x0, vol=0.
-constexpr float TABLE_MIN_MEAN_S = 0.20f;
+// 0.25 (up from 0.20): the empty-frame dark-room capture reads mean S=0.215,
+// just above the old bar -> whole-frame false positive; all 10 validation
+// bundles keep byte-identical fg up to 0.28, so 0.25 rejects that scene with
+// margin on both sides.
+constexpr float TABLE_MIN_MEAN_S = 0.25f;
 
 // 2D skin gate (Q3): keep the 20° hue window (preserves ripe orange/apricot
 // 20–35° pigments) and reject human skin by its hue+saturation band rather
