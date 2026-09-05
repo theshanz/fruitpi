@@ -4,6 +4,9 @@
 #include <cmath>
 #include <algorithm>
 
+#define GAUSSIAN_TEMPERATURE          3.0f   // Calibrates 32D sum into standard probability space
+#define ANOMALY_MAX_MAHALANOBIS_D2   35.0f   // Max allowable distance before flagging anomaly
+
 const char* const  CLASS_LABELS[NUM_CLASSES] = {
     "UNRIPE",
     "PERFECTLY_RIPE",
@@ -165,7 +168,8 @@ static void score_logits_32d(
             float diff = state[d] - model.prototypes[c][d];
             d2 += model.feature_weights[d] * diff * diff;
         }
-        raw_scores[c] = model.biases[c] - 0.5f * d2;
+        // APPLY GAUSSIAN TEMPERATURE DIVISOR:
+        raw_scores[c] = model.biases[c] - (0.5f * d2 / GAUSSIAN_TEMPERATURE);
     }
 
     // Biological chlorophyll veto — green bins are read dynamically from the
@@ -209,25 +213,48 @@ static BiologicalStatus decide_32d(
     float p_rotten = result.probabilities[3];
     float p_artif  = result.probabilities[4];
 
+    // Fix 3: Absolute-distance anomaly gate (detect multi-bounce/noise)
+    float min_dist_sq = 1e9f;
+    float max_logit = logits[0];
+    for (int c = 1; c < NUM_CLASSES; c++) if (logits[c] > max_logit) max_logit = logits[c];
+    float pseudo_distances[NUM_CLASSES];
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        pseudo_distances[c] = -2.0f * (logits[c] - max_logit);
+        if (pseudo_distances[c] < 0.0f) pseudo_distances[c] = 0.0f;
+        if (probs[c] > 1e-5f && pseudo_distances[c] < min_dist_sq) {
+            min_dist_sq = pseudo_distances[c];
+        }
+    }
+    bool distance_anomaly = (min_dist_sq > ANOMALY_MAX_MAHALANOBIS_D2);
+
     if (p_rotten > ANOMALY_CONFIDENCE_THRESHOLD && p_rotten > p_artif){
         result.primary_decision = CLASS_LABELS[3];
         result.is_anomaly = true;
         result.ripeness_index = 0.0f;
+        if (distance_anomaly) { result.confidence = 50.0f; result.is_anomaly = true; }
     } else if (p_artif > ANOMALY_CONFIDENCE_THRESHOLD){
         result.primary_decision = CLASS_LABELS[4];
         result.is_anomaly = true;
         result.ripeness_index = 0.0f;
+        if (distance_anomaly) { result.confidence = 50.0f; result.is_anomaly = true; }
     } else {
-        result.is_anomaly = false;
-        int best = 0;
-        float best_val = result.probabilities[0];
-        for (int i = 1; i < 3; i++){
-            if (result.probabilities[i] > best_val){ best_val = result.probabilities[i]; best = i; }
+        if (distance_anomaly) {
+            result.is_anomaly = true;
+            result.confidence = 50.0f;
+            result.ripeness_index = 1.0f;
+            result.primary_decision = CLASS_LABELS[0];
+        } else {
+            result.is_anomaly = false;
+            int best = 0;
+            float best_val = result.probabilities[0];
+            for (int i = 1; i < 3; i++){
+                if (result.probabilities[i] > best_val){ best_val = result.probabilities[i]; best = i; }
+            }
+            result.primary_decision = CLASS_LABELS[best];
+            float sum_mat = result.probabilities[0] + result.probabilities[1] + result.probabilities[2];
+            result.ripeness_index = (sum_mat > 0.001f) ?
+                (1.0f * result.probabilities[0] + 2.0f * result.probabilities[1] + 3.0f * result.probabilities[2]) / sum_mat : 1.0f;
         }
-        result.primary_decision = CLASS_LABELS[best];
-        float sum_mat = result.probabilities[0] + result.probabilities[1] + result.probabilities[2];
-        result.ripeness_index = (sum_mat > 0.001f) ?
-            (1.0f * result.probabilities[0] + 2.0f * result.probabilities[1] + 3.0f * result.probabilities[2]) / sum_mat : 1.0f;
     }
 
     float H = 0.0f;
@@ -280,6 +307,14 @@ BiologicalStatus evaluate_fruit_ntap_32d(
     for (uint8_t i = 0; i < n_taps; i++) {
         score_logits_32d(states[i], model, tap_logits);
         for (int c = 0; c < NUM_CLASSES; c++) summed_logits[c] += tap_logits[c];
+    }
+
+    // AVERAGE the logits across taps instead of summing (prevent inflation)
+    if (n_taps > 1) {
+        float inv_n = 1.0f / (float)n_taps;
+        for (int c = 0; c < NUM_CLASSES; c++) {
+            summed_logits[c] *= inv_n;
+        }
     }
 
     return decide_32d(summed_logits);

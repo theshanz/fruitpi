@@ -1,7 +1,55 @@
 #include "camera_handler.h"
+#include "config.h"
+
+#include "driver/ledc.h"
+
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+#include "rgb_led.h"
+#endif
 
 static bool camera_hardware_ok = false;
 static framesize_t s_working_size = FRAMESIZE_VGA;
+
+// Idle power control: the sensor streams continuously between captures unless
+// XCLK is gated. On classic ESP32 the driver owns LEDC CH0 (Timer 0) on
+// pin_xclk; ledc_stop freezes the channel -> sensor loses its pixel clock.
+// On ESP32-S3 XCLK comes from the LCD_CAM clock generator (CAM_CLK) via the
+// GPIO matrix, so ALL LEDC calls fail here with "LEDC is not initialized".
+// Empirically, flipping the XCLK pad direction (GPIO_MODE_DISABLE/OUTPUT) does
+// NOT resume the clock on this build either, so the S3 sensor is left
+// streaming (see camera_sleep_idle). The S3-EYE has no PWDN pin, so without a
+// working CAM_CLK gate there is no idle power lever on S3.
+static bool s_camera_awake = false;
+#ifndef CONFIG_IDF_TARGET_ESP32S3
+static bool s_xclk_duty_saved = false;
+static ledc_mode_t s_xclk_mode = LEDC_LOW_SPEED_MODE;
+static uint32_t s_xclk_duty = 0;
+#endif
+static constexpr uint32_t CAMERA_WAKE_SETTLE_MS = 60;
+
+// AI-Thinker on-board white flash LED (non-S3 targets). High = on.
+#ifndef CONFIG_IDF_TARGET_ESP32S3
+static constexpr uint8_t FLASH_LED_PIN = 4;
+#endif
+
+void camera_set_flash(bool on) {
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    if (on) {
+        rgb_led_set_flash_brightness(WHITE_FLASH_BRIGHTNESS);
+        rgb_led_flash_white();
+    } else {
+        rgb_led_set(0, 0, 0);
+    }
+#else
+    static bool flash_pin_init = false;
+    if (!flash_pin_init) {
+        pinMode(FLASH_LED_PIN, OUTPUT);
+        digitalWrite(FLASH_LED_PIN, LOW);
+        flash_pin_init = true;
+    }
+    digitalWrite(FLASH_LED_PIN, on ? HIGH : LOW);
+#endif
+}
 
 static framesize_t apply_sensor_tuning(sensor_t* s, framesize_t frame_size);
 static bool capture_boot_frame(framesize_t start);
@@ -99,6 +147,10 @@ bool init_camera_subsystem() {
         return false;
     }
 
+    // Clock is live right after esp_camera_init; track that state so the first
+    // camera_sleep_idle() (just after the boot test) actually stops it.
+    s_camera_awake = true;
+
     s_working_size = FRAMESIZE_SXGA;
 
     // Single init at the working resolution. No set_framesize() at runtime
@@ -116,7 +168,89 @@ bool init_camera_subsystem() {
     // 1 Boot Test Capture with automatic step-down until a frame succeeds.
     camera_hardware_ok = capture_boot_frame(s_working_size);
 
+    // Drop the sensor to idle (XCLK off) until the first real capture arrives.
+    // With the clock gated the OV3660 stops streaming, which removes the idle
+    // heat the user noticed. Stashed duty (restored by camera_wake) is the
+    // driver's original value, so the clock resumes bit-identical.
+    camera_sleep_idle();
+
     return camera_hardware_ok;
+}
+
+#ifndef CONFIG_IDF_TARGET_ESP32S3
+// ─── Idle power (classic ESP32 only): stop/restart XCLK on the LEDC channel
+// the driver owns. On S3 the CAM_CLK signal is not LEDC-driven, so the whole
+// duty-save dance is meaningless there; we gate the GPIO pin instead. ───────
+static bool find_xclk_duty(ledc_mode_t& mode_out, uint32_t& duty_out) {
+    // Classic ESP32 supports both modes; the driver picks one. Use whichever
+    // currently produces the clock.
+    const ledc_mode_t modes[] = { LEDC_LOW_SPEED_MODE, LEDC_HIGH_SPEED_MODE };
+    for (int i = 0; i < 2; i++) {
+        uint32_t d = ledc_get_duty(modes[i], LEDC_CHANNEL_0);
+        if (d > 0) {
+            mode_out = modes[i];
+            duty_out = d;
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
+void camera_sleep_idle() {
+    if (!s_camera_awake) return;
+
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    // Empirically rejected on this board: flipping the XCLK pad direction
+    // (GPIO_MODE_DISABLE -> GPIO_MODE_OUTPUT) does NOT restart CAM_CLK on this
+    // esp32-camera build — after wake the sensor stops ACKing SCCB and every
+    // fb_get returns NULL, even the ambient grab. The SDK prebuilds have no
+    // source to mirror the exact pad/matrix setup, so the only safe option is
+    // to leave the sensor streaming (same as Round 2, where ambient grabbed
+    // cleanly). Idle XCLK gating stays a separate, later nicety — it is not
+    // the flash-on wedge root cause.
+    Serial.println("[CameraHandler] Sensor idle (XCLK gating disabled on S3).");
+    return;
+#else
+    // Save the driver's live duty once so wake restores the exact clock.
+    if (!s_xclk_duty_saved) {
+        if (find_xclk_duty(s_xclk_mode, s_xclk_duty)) {
+            s_xclk_duty_saved = true;
+        } else {
+            // Without the original duty we cannot restore the clock, so skipping
+            // idle is safer than leaving the sensor unwakeable.
+            Serial.println("[CameraHandler] Warn: XCLK duty unknown, staying awake.");
+            return;
+        }
+    }
+    // Native IDF LEDC API (esp_camera configures the XCLK channel through the
+    // IDF driver, not the Arduino HAL, so the Arduino ledc_* wrappers error
+    // out with "LEDC is not initialized"). ledc_stop freezes channel output at
+    // idle level 0 -> the sensor loses its pixel clock and stops streaming.
+    ledc_stop(s_xclk_mode, LEDC_CHANNEL_0, 0);
+    s_camera_awake = false;
+    Serial.println("[CameraHandler] Sensor idle (XCLK off).");
+#endif
+}
+
+void camera_wake() {
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    // Round 2 semantics: the sensor never goes to sleep on S3 (see
+    // camera_sleep_idle), so wake leaves the settled clock untouched.
+    if (s_camera_awake) return;
+    s_camera_awake = true;
+    return;
+#else
+    if (s_camera_awake) return;
+    if (s_xclk_duty_saved) {
+        ledc_set_duty(s_xclk_mode, LEDC_CHANNEL_0, s_xclk_duty);
+        ledc_update_duty(s_xclk_mode, LEDC_CHANNEL_0);
+    }
+    s_camera_awake = true;
+    // Let a few VSYNCs come back so the first fb_get isn't a stale/wedged grab.
+    delay(CAMERA_WAKE_SETTLE_MS);
+    Serial.println("[CameraHandler] Sensor awake (XCLK on).");
+#endif
 }
 
 constexpr int CAPTURE_RETRY_ATTEMPTS = 6;
@@ -160,7 +294,11 @@ camera_fb_t* capture_camera_frame() {
         return nullptr;
     }
 
-    // Single-buffer camera: fb_get() waits for a freshly captured frame. Reset
+    // Idle XCLK is gated: wake the sensor the moment a grab is requested.
+    // Idempotent, so mid-session grabs (drains, dual-shot) are no-ops.
+    camera_wake();
+
+        // Single-buffer camera: fb_get() waits for a freshly captured frame. Reset
     // the buffer first by consuming whatever stale frame may be sitting in it
     // (one grab only — a tight drain loop wedges the S3 DMA), so the returned
     // frame is guaranteed to be a brand-new capture.
@@ -170,24 +308,27 @@ camera_fb_t* capture_camera_frame() {
     }
 
     camera_fb_t* fb = nullptr;
+    // Fail fast: a single NULL from fb_get() means the sensor has stopped
+    // delivering frames (wedged PCLK/VSYNC). Do NOT retry — each attempt can
+    // block for seconds, and with the flash lit it leaves the LED on for
+    // minutes. Return immediately; the caller's FlashGuard turns the LED off.
     for (int attempt = 1; attempt <= CAPTURE_RETRY_ATTEMPTS; ++attempt) {
         fb = esp_camera_fb_get();
-        if (fb) {
-            if (jpeg_has_valid_markers(fb)) {
-                if (attempt > 1) {
-                    Serial.printf("[CameraHandler] Captured on attempt %d.\n", attempt);
-                }
-                Serial.printf("[CameraHandler] JPEG markers OK (%d bytes).\n", fb->len);
-                return fb;
-            }
-            Serial.printf("[CameraHandler] Frame had invalid JPEG markers (%d bytes), discarding (attempt %d/%d).\n",
-                          fb->len, attempt, CAPTURE_RETRY_ATTEMPTS);
-            esp_camera_fb_return(fb);
-            fb = nullptr;
-        } else {
-            Serial.printf("[CameraHandler] esp_camera_fb_get() returned NULL (attempt %d/%d).\n",
-                          attempt, CAPTURE_RETRY_ATTEMPTS);
+        if (!fb) {
+            Serial.println("[CameraHandler] Frame grab failed (sensor wedged) — aborting capture.");
+            return nullptr;
         }
+        if (jpeg_has_valid_markers(fb)) {
+            if (attempt > 1) {
+                Serial.printf("[CameraHandler] Captured on attempt %d.\n", attempt);
+            }
+            Serial.printf("[CameraHandler] JPEG markers OK (%d bytes).\n", fb->len);
+            return fb;
+        }
+        Serial.printf("[CameraHandler] Frame had invalid JPEG markers (%d bytes), discarding (attempt %d/%d).\n",
+                      fb->len, attempt, CAPTURE_RETRY_ATTEMPTS);
+        esp_camera_fb_return(fb);
+        fb = nullptr;
         delay(CAPTURE_RETRY_DELAY_MS);
     }
 
@@ -195,7 +336,7 @@ camera_fb_t* capture_camera_frame() {
     // after esp_camera_deinit() (gdma_disconnect error, fb_get() NULL forever),
     // which would brick the camera for the whole session. Report the error
     // instead; the boot self-test already validated the hardware.
-    Serial.println("[CameraHandler] All capture retries failed.");
+    Serial.println("[CameraHandler] All capture retries failed (invalid markers).");
     return nullptr;
 }
 
@@ -203,6 +344,38 @@ void release_camera_frame(camera_fb_t* fb) {
     if (fb) {
         esp_camera_fb_return(fb);
     }
+}
+
+camera_fb_t* copy_camera_frame(const camera_fb_t* src, size_t& dst_len) {
+    dst_len = 0;
+    if (!src || !src->buf || src->len == 0) return nullptr;
+    camera_fb_t* copy = (camera_fb_t*)heap_caps_malloc(sizeof(camera_fb_t),
+                                                       MALLOC_CAP_SPIRAM);
+    if (!copy) return nullptr;
+    memset(copy, 0, sizeof(camera_fb_t));
+    uint8_t* dst_buf = (uint8_t*)heap_caps_malloc(src->len,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!dst_buf) {
+        dst_buf = (uint8_t*)heap_caps_malloc(src->len, MALLOC_CAP_8BIT);
+    }
+    if (!dst_buf) {
+        heap_caps_free(copy);
+        return nullptr;
+    }
+    memcpy(dst_buf, src->buf, src->len);
+    copy->buf    = dst_buf;
+    copy->len    = src->len;
+    copy->width  = src->width;
+    copy->height = src->height;
+    copy->format = src->format;
+    dst_len = src->len;
+    return copy;
+}
+
+void free_copied_frame(camera_fb_t* fb) {
+    if (!fb) return;
+    if (fb->buf) heap_caps_free(fb->buf);
+    heap_caps_free(fb);
 }
 
 bool is_camera_ready() {

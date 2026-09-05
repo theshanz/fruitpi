@@ -288,6 +288,24 @@ bool FruitStore::load_model_to_ram(const char* fruit_name) {
     strncpy(loaded_fruit_name, tmp.fruit_name, MAX_MODEL_NAME_LEN - 1);
     loaded_fruit_name[MAX_MODEL_NAME_LEN - 1] = '\0';
     is_model_loaded_in_ram = true;
+
+    // Persist the active model name so a reboot boots into this classifier
+    // instead of reverting to the factory default (Bug 2.1/2.2). A load into
+    // RAM is the authoritative activation, so every path that calls
+    // load_model_to_ram() (upload auto-activate, menu activate) now survives
+    // power-cycle. `active_index()`/boot-restore read this same key.
+    nvs_handle_t persist_nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &persist_nvs) == ESP_OK) {
+        nvs_set_str(persist_nvs, ACTIVE_NAME_KEY, loaded_fruit_name);
+        const esp_err_t perr = nvs_commit(persist_nvs);
+        nvs_close(persist_nvs);
+        Serial.printf("[FruitStore] Persisted active model '%s' to NVS (0x%X)\n",
+                      loaded_fruit_name, perr);
+    } else {
+        Serial.println("[FruitStore] WARN: cannot open NVS to persist active "
+                       "model (reboot will revert to factory default).");
+    }
+
     Serial.printf("[FruitStore] Loaded '%s' into RAM\n", loaded_fruit_name);
     if (store_mutex) xSemaphoreGive(store_mutex);
     return true;

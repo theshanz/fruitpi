@@ -216,6 +216,7 @@ class RulesModel32D {
   static List<double> rawScores(
       List<double> state, List<List<double>> means, List<double> biases,
       List<double> invVar, int mask) {
+    const double gaussianTemperature = 3.0;
     final scores = List<double>.generate(numClasses, (c) {
       if (((mask >> c) & 1) == 0) return -100000.0;
       var d2 = 0.0;
@@ -223,7 +224,7 @@ class RulesModel32D {
         final diff = state[d] - means[c][d];
         d2 += invVar[d] * diff * diff;
       }
-      return biases[c] - 0.5 * d2;
+      return biases[c] - (0.5 * d2 / gaussianTemperature);
     });
 
     // Green veto (bins 5..8).
@@ -893,14 +894,22 @@ class FruitProfileCompiler {
     final invVar = _precisionWeights(profile, measuredCentroids, measuredStates);
     final biases = _biases(profile);
     final mask = profile.activeMask;
+    // The green-chlorophyll veto reads RAW green-hue bins (state[5..8]) and is
+    // therefore a hard pre-softmax gate that ignores the Mahalanobis weights.
+    // If the user has deliberately zeroed the optics block (visual sensing is
+    // off), that green-pixel veto would silently override their intent and keep
+    // locking UNRIPE. Suppress it from the blob in that case so the veto only
+    // lives when skin-optics precision is actually in play.
+    final opticsActive = profile.wOptics > 0.05;
+    final anyEnabledVeto = profile.categories
+        .any((c) => c.isEnabled && c.enableGreenVeto);
     return RulesModel32D.packBinary(
       name: profile.name,
       protos: means,
       biases: biases,
       mask: mask,
       featureWeights: invVar,
-      greenVeto: profile.categories
-              .any((c) => c.isEnabled && c.enableGreenVeto)
+      greenVeto: (opticsActive && anyEnabledVeto)
           ? RulesModel32D.greenVetoDefault
           : 0.0,
     );

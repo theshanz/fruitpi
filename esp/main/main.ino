@@ -187,6 +187,7 @@ static void handle_laptop_capture_image_only() {
     bt.notify_status_change("camera_error");
     return;
   }
+  camera_wake();
   camera_fb_t *fb = capture_camera_frame();
   if (fb) {
     bt.send_raw_jpeg_stream(fb->buf, fb->len);
@@ -198,6 +199,7 @@ static void handle_laptop_capture_image_only() {
     led_pet_camera_error();
     lcd_camera_error();
   }
+  camera_sleep_idle();
 }
 
 // Raw waveform debug capture: N windows streamed back-to-back over BLE.
@@ -469,7 +471,7 @@ void loop() {
     scan_start_at = 0;
     scan_requested = false;              // trigger consumed by the scan
     ColorFeatures c_f;
-    if (multispectral_capture(c_f)) {
+    if (multispectral_capture_dual_shot(c_f)) {
       ms_features_pending = c_f;         // kept for the tap classifier below
       have_ms_features = true;
       if (bt.get_mode() == MODE_DEBUG) {
@@ -611,7 +613,7 @@ void loop() {
 
   if (bt.check_ms_scan_request()) {
     ColorFeatures ms_f;
-    if (multispectral_capture(ms_f)) {
+    if (multispectral_capture_dual_shot(ms_f)) {
       bt.notify_ms_features(ms_f);
     } else {
       bt.notify_status_change("camera_error");
@@ -623,6 +625,7 @@ void loop() {
     if (!is_camera_ready()) {
       bt.notify_status_change("camera_error");
     } else {
+      camera_wake();
       multispectral_lock_sensor();
       rgb_led_set_raw(0, 0, 0);
       // ch0 = no-flash ambient baseline, then R/G/B flashes.
@@ -648,11 +651,64 @@ void loop() {
       }
       rgb_led_set_raw(0, 0, 0);
       multispectral_restore_sensor();
+      camera_sleep_idle();
       bt.notify_status_change("ms_debug_done");
     }
 #else
     bt.notify_status_change("camera_error");
 #endif
+  }
+
+  // Dual-shot debug: same capture as ms_capture, but also streams the two
+  // original JPEGs (ambient then flash) plus a full timing/selection report.
+  // Works on every target (no WS2812 dependency).
+  if (bt.check_ms_debug_diff_request()) {
+    if (!is_camera_ready()) {
+      bt.notify_status_change("camera_error");
+    } else {
+      ColorFeatures d_f;
+      DualShotDebugInfo d_info;
+      camera_fb_t *d_amb = nullptr, *d_fsh = nullptr, *d_f2 = nullptr;
+      if (!multispectral_capture_burst_debug(d_f, d_info, d_amb, d_fsh, d_f2, true)) {
+        bt.notify_status_change("camera_error");
+        if (d_amb) free_copied_frame(d_amb);
+        if (d_fsh) free_copied_frame(d_fsh);
+        if (d_f2) free_copied_frame(d_f2);
+      } else {
+        // Local-report path: the feature report is built on the HOST from the
+        // three raw JPEGs, so only the tiny timing/meta notify is sent here.
+        bt.notify_ms_debug_diff_meta(d_info);
+        // Stream ambient, pump to completion, then F1, then F2.
+        if (d_amb) {
+          bt.send_ms_debug_jpeg(d_amb->buf, d_amb->len);
+          uint32_t pump_end = millis() + 3000;
+          while (bt.is_transfer_active() && millis() < pump_end) {
+            bt.service_transfer();
+            delay(5);
+          }
+          free_copied_frame(d_amb);
+        }
+        if (d_fsh) {
+          bt.send_ms_debug_jpeg(d_fsh->buf, d_fsh->len);
+          uint32_t pump_end = millis() + 3000;
+          while (bt.is_transfer_active() && millis() < pump_end) {
+            bt.service_transfer();
+            delay(5);
+          }
+          free_copied_frame(d_fsh);
+        }
+        if (d_f2) {
+          bt.send_ms_debug_jpeg(d_f2->buf, d_f2->len);
+          uint32_t pump_end = millis() + 3000;
+          while (bt.is_transfer_active() && millis() < pump_end) {
+            bt.service_transfer();
+            delay(5);
+          }
+          free_copied_frame(d_f2);
+        }
+        bt.notify_status_change("ms_debug_diff_done");
+      }
+    }
   }
 
   {

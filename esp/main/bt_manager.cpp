@@ -18,7 +18,7 @@ BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharSca
                          tx_resend_range_idx(0), tx_resend_seq(0), rx_buf(nullptr), rx_len(0), rx_id(0), rx_type(0),
                          rx_chunks(0), rx_received_count(0), rx_active(false), rx_last_activity_ms(0),
                          rx_next_progress_bytes(0), inference_requested(false), ms_scan_requested(false),
-                         ms_debug_requested(false), ms_config_requested(false),
+                         ms_debug_requested(false), ms_debug_diff_requested(false), ms_config_requested(false),
                          ms_cfg_gain_r(1.0f), ms_cfg_gain_g(1.0f), ms_cfg_gain_b(1.0f), ms_cfg_aec(0),
                          ms_cfg_ambient(true)
 {
@@ -321,6 +321,10 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 else if (strcmp(cmd, "ms_debug") == 0)
                 {
                     ms_debug_requested = true;
+                }
+                else if (strcmp(cmd, "ms_debug_diff") == 0)
+                {
+                    ms_debug_diff_requested = true;
                 }
                 else if (strcmp(cmd, "ms_config") == 0 &&
                          doc.containsKey("gain_r") && doc.containsKey("gain_g") && doc.containsKey("gain_b"))
@@ -747,8 +751,12 @@ uint32_t BTManager::inter_chunk_delay_ms()
         conn_itvl = server->getPeerInfo(0).getConnInterval(); // units of 1.25 ms
     }
     uint32_t d = (conn_itvl > 0) ? (uint32_t)(conn_itvl * 1.25f * 1.2f) : 30;
-    if (d < 10)
-        d = 10;
+    // Floor of 16 ms (>= the expert's 8 ms) keeps back-to-back JPEG chunks
+    // from flooding the host buffer: flash.jpg/flash2.jpg were dropped because
+    // consecutive notifications had no flow control. Bigger than the raw spec
+    // minimum to survive the 10 ms + connection-interval jitter reliably.
+    if (d < 16)
+        d = 16;
     return d;
 }
 
@@ -812,7 +820,7 @@ void BTManager::notify_ms_features(const ColorFeatures &f)
     float sum = f.raw_rgb_means[0] + f.raw_rgb_means[1] + f.raw_rgb_means[2];
     float inv = sum > 1e-6f ? 1.0f / sum : 0.0f;
 
-    StaticJsonDocument<448> doc;
+    StaticJsonDocument<768> doc;
     doc["status"] = "ms_captured";
 
     JsonArray hist = doc.createNestedArray("hue_histogram");
@@ -829,10 +837,122 @@ void BTManager::notify_ms_features(const ColorFeatures &f)
     JsonArray ambient = doc.createNestedArray("ambient_rgb_means");
     for (int i = 0; i < 3; i++) ambient.add(f.ambient_rgb_means[i]);
 
-    char output[448];
+    // Natural-oval fit + frame-overflow signal ("fruit exceeds frame?").
+    JsonObject ell = doc.createNestedObject("ellipse");
+    ell["major_px"] = f.ellipse_major_px;
+    ell["minor_px"] = f.ellipse_minor_px;
+    ell["cx"] = f.centroid_px[0];
+    ell["cy"] = f.centroid_px[1];
+    doc["overflow_mask"] = f.overflow_mask;   // bit0..3 = LT/RT/TP/BT edge overrun
+
+    char output[512];
     size_t len = serializeJson(doc, output);
 
     pCharScanResults->setValue((uint8_t *)output, len);
+    pCharScanResults->notify();
+}
+
+// Burst debug reports: two compact notifies, each kept under the ATT MTU so
+// a single notification survives the BLE stack (a notify bigger than
+// ATT_MTU-3 is truncated mid-JSON -> the host drops it and report.json is null).
+// The feature report carries the color/bbox/volume decision data; a second
+// small notify carries the Layer-2 motion classifier + flash2 grab timing.
+void BTManager::notify_ms_debug_diff(const ColorFeatures &f, const DualShotDebugInfo &info)
+{
+    if (!device_connected)
+        return;
+
+    // ── Part 1: feature report (status = ms_debug_diff) ──
+    // Kept deliberately small (< ATT MTU - 3 AND the doc pool) so one notify
+    // always arrives intact. The reflectance means + ratios + ambient means are
+    // NOT sent: the host recomputes them from the three saved JPEGs (it already
+    // does mean_rgb_jpeg()). This avoids the previous over-MTU truncation that
+    // silently dropped the trailing arrays and made report.json null.
+    StaticJsonDocument<384> doc;
+    doc["status"] = "ms_debug_diff";
+    doc["w"]       = info.w;
+    doc["h"]       = info.h;
+    doc["fg_pixels"]      = info.fg_pixels;
+    doc["core_pixels"]    = info.core_pixels;
+    doc["snap_pixels"]    = info.snap_pixels;
+
+    JsonObject bbox = doc.createNestedObject("bbox");
+    bbox["x"] = info.bbox_x;
+    bbox["y"] = info.bbox_y;
+    bbox["w"] = info.bbox_w;
+    bbox["h"] = info.bbox_h;
+
+    JsonObject timing = doc.createNestedObject("timing_ms");
+    timing["lock"]         = info.lock_ms;
+    timing["ambient_grab"] = info.ambient_grab_ms;
+    timing["flash_grab"]   = info.flash_grab_ms;
+    timing["decode"]       = info.decode_ms;
+    timing["process"]      = info.process_ms;
+    timing["total"]        = info.total_ms;
+
+    JsonArray hist = doc.createNestedArray("hue_histogram");
+    for (int i = 0; i < 8; i++) hist.add(f.hue_histogram[i]);
+    doc["chromatic_dispersion"] = f.chromatic_dispersion;
+    doc["volume_cm3"] = f.volume_cm3;
+
+    char out[384];
+    size_t len = serializeJson(doc, out, sizeof(out));
+    Serial.printf("[BTManager] ms_debug_diff report %u bytes (out %d).\n", (unsigned)len, (int)sizeof(out));
+    if (len >= (sizeof(out) - 1)) {
+        Serial.printf("[BTManager] Warn: ms_debug_diff report %u bytes (near overflow).\n",
+                      (unsigned)len);
+    }
+    pCharScanResults->setValue((uint8_t *)out, len);
+    pCharScanResults->notify();
+
+    // ── Part 2: motion / flash2 meta (status = ms_debug_diff_meta) ──
+    StaticJsonDocument<256> mdoc;
+    mdoc["status"] = "ms_debug_diff_meta";
+    JsonObject motion = mdoc.createNestedObject("motion");
+    motion["global_px"]  = info.global_motion;
+    motion["handheld"]   = info.handheld ? 1 : 0;
+    motion["moving_blocks"] = info.moving_blocks;
+    motion["total_blocks"]  = info.total_blocks;
+    mdoc["flash2_grab_ms"] = info.flash2_grab_ms;
+
+    char mout[256];
+    size_t mlen = serializeJson(mdoc, mout, sizeof(mout));
+    pCharScanResults->setValue((uint8_t *)mout, mlen);
+    pCharScanResults->notify();
+}
+
+// Minimal raw-capture meta for the local-report debug path. The firmware now
+// sends ONLY frame dimensions, device-side timing and JPEG lengths; the host
+// recomputes every segmentation/colour feature from the three raw JPEGs. This
+// removes all firmware JSON size/MTU fragility while keeping the host the
+// single source of truth for features.
+void BTManager::notify_ms_debug_diff_meta(const DualShotDebugInfo &info)
+{
+    if (!device_connected)
+        return;
+
+    StaticJsonDocument<160> doc;
+    doc["status"] = "ms_debug_diff";
+    doc["w"] = info.w;
+    doc["h"] = info.h;
+
+    JsonObject timing = doc.createNestedObject("timing_ms");
+    timing["lock"]         = info.lock_ms;
+    timing["ambient_grab"] = info.ambient_grab_ms;
+    timing["flash_grab"]   = info.flash_grab_ms;
+    timing["flash2_grab"]  = info.flash2_grab_ms;
+    timing["decode"]       = info.decode_ms;
+    timing["process"]      = info.process_ms;
+    timing["total"]        = info.total_ms;
+
+    doc["jpeg_len_ambient"] = info.ambient_jpeg_len;
+    doc["jpeg_len_flash"]   = info.flash_jpeg_len;
+    doc["jpeg_len_flash2"]  = info.flash2_jpeg_len;
+
+    char out[160];
+    size_t len = serializeJson(doc, out, sizeof(out));
+    Serial.printf("[BTManager] ms_debug meta %u bytes (out %d).\n", (unsigned)len, (int)sizeof(out));
+    pCharScanResults->setValue((uint8_t *)out, len);
     pCharScanResults->notify();
 }
 

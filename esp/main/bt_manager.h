@@ -7,6 +7,7 @@
 
 #include "sci_32d.h"
 #include "fruit_store.h"
+#include "multispectral.h"
 
 #define SERVICE_UUID             "4fa10001-2241-4cf5-9988-34824317f012"
 #define CHAR_MODEL_TRANSFER_UUID "4fa10002-2241-4cf5-9988-34824317f012"
@@ -69,6 +70,7 @@ private:
     bool inference_requested;
     bool ms_scan_requested;
     bool ms_debug_requested;
+    bool ms_debug_diff_requested;
     bool ms_config_requested;
     float ms_cfg_gain_r, ms_cfg_gain_g, ms_cfg_gain_b;
     int   ms_cfg_aec;
@@ -134,6 +136,8 @@ public:
 
     void notify_scan_result(const BiologicalStatus& result);
     void notify_ms_features(const ColorFeatures& f);
+    void notify_ms_debug_diff(const ColorFeatures& f, const DualShotDebugInfo& info);
+    void notify_ms_debug_diff_meta(const DualShotDebugInfo& info);
     void notify_status_change(const char* status_msg);
     void notify_debug_state(const float state[VECTOR_DIMENSIONS], float peak_adc);
     void notify_scan_config();
@@ -160,6 +164,11 @@ public:
 
     bool check_ms_debug_request() {
         if (ms_debug_requested) { ms_debug_requested = false; return true; }
+        return false;
+    }
+
+    bool check_ms_debug_diff_request() {
+        if (ms_debug_diff_requested) { ms_debug_diff_requested = false; return true; }
         return false;
     }
 

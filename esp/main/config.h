@@ -114,8 +114,10 @@ constexpr float VOLUME_DEFAULT_CM3 = 350.0f; // fallback when bbox criteria fail
 constexpr int    MS_DECODE_SCALE        = 2;    // TJpgDec 1/4: SXGA → 320×256
 constexpr int    MS_FIXED_GAIN          = 5;    // locked sensor AGC gain
 constexpr int    MS_FIXED_AEC           = 100;  // locked AEC (calibrated on white card)
-constexpr int    MS_SYNC_DISCARD_FRAMES = 2;    // frames dropped after LED change so the
+constexpr int    MS_SYNC_DISCARD_FRAMES = 1;    // frames dropped after LED change so the
                                              // kept frame's exposure happens under it
+                                             // (AEC is locked, so one rolling-shutter
+                                             // sync frame is enough)
 constexpr uint16_t MS_MAX_W            = 320;  // decoded buffer size
 constexpr uint16_t MS_MAX_H            = 256;
 constexpr float  MS_CM_PER_PIXEL_FULL  = 0.05f; // cm/px at native resolution
@@ -123,6 +125,115 @@ constexpr float  MS_CH_GAIN_R           = 1.16f;// white-card per-channel balanc
 constexpr float  MS_CH_GAIN_G           = 0.90f;
 constexpr float  MS_CH_GAIN_B           = 0.58f;
 constexpr bool   MS_AMBIENT_DEFAULT     = true; // subtract no-flash baseline
+
+// White flash settle: 0 — the LED is instantaneous and AEC/AGC are already
+// locked to the flash state before the ambient frame, so there is nothing to
+// wait for. Exposure convergence is handled by the discard frame(s) above.
+constexpr int FLASH_SETTLE_DELAY_MS = 0;
+
+// White flash intensity (0-255). 255 saturates a glossy fruit at close range
+// -> specular glare pixels (S just above the 0.15 floor) leak noisy hue into
+// every histogram bin. Keep it modest; AEC/AGC adapt to the rest.
+constexpr uint8_t WHITE_FLASH_BRIGHTNESS = 120;
+
+// Flash/no-flash differential segmentation: a pixel belongs to the foreground
+// object only if the white flash brightens its luminance clearly above the
+// no-flash baseline (flash falloff distance-gates the scene — far background
+// receives negligible flash light).
+constexpr int   FLASH_DELTA_Y_THRESHOLD = 18;    // min flash-vs-ambient Y delta (0-255)
+constexpr int   FLASH_MIN_OBJECT_PIXELS = 400;   // refined-mask foreground px to trust bbox
+
+// Hue-binning color filters (applied to the flash frame inside the mask).
+// FRUIT cuts floor V/S to kill low-light dark current (which biases R>G>B ->
+// false brown/orange) and washed-out background; the glare gate drops bright
+// near-achromatic specular hot spots that would flatten the histogram.
+constexpr float FRUIT_MIN_V_CUT = 0.25f;  // low-light noise floor
+constexpr float FRUIT_MIN_S_CUT = 0.20f;  // desaturated background
+constexpr float GLARE_MIN_S_CUT = 0.15f;  // glare desaturation threshold
+constexpr float GLARE_MAX_V_CUT = 0.88f;  // cuts specular hot spots
+
+// Flash white-balance (cyan cast fix, applied to the fused flash before HSV in
+// the hue pass): the RGB LED 'white' flash reads blue-heavy on green fruit,
+// washing green ~>120° into cyan. Scaling the flash B channel by
+// MS_WB_B_SCALE pulls cyan back into the green window. V=max(R,G,B) is
+// unchanged for green-dominant fruit, so the centre-prior seed V floor stays
+// valid. Empirically fit to two live green-mango bundles (2431/2000): 0.62
+// drops cyan 22->2% / 52->7% while keeping green dominant.
+constexpr float MS_WB_B_SCALE = 0.62f;
+
+// Edge-refined trimap segmentation (replaces the single ΔY gate in
+// process_differential): a solid core (ΔY >= EDGE_CORE_DY), a definite
+// background (ΔY < EDGE_BG_DY), and an ambiguous rim whose pixels are snapped
+// to the sharpest flash ΔY gradient so the silhouette locks to the true
+// physical edge instead of clipping rounded rims or bleeding into the table.
+constexpr int EDGE_CORE_DY  = 25;   // definite fruit interior (fixed path)
+constexpr int EDGE_BG_DY    = 12;   // definite background cutoff (fixed path)
+constexpr int EDGE_GRAD_MIN = 8;    // |∇ΔY| above which a rim pixel is admitted
+
+// Centre-prior seeded segmentation (process_differential, applied 2026-09-03).
+// Replaces the fixed EDGE_CORE_DY solid core with a centre-connected region
+// grown from a central foveal seed box: the fruit is the connected foreground
+// component that intersects the frame centre, so dark fruit is no longer
+// discarded by a global ΔY gate and peripheral table glare / hand motion are
+// pruned by construction. Thresholds adapt to the seed (matches the validated
+// host compute_local_report()): ΔY >= max(CENTRE_SEED_DY_MIN, P25(seed ΔY)),
+// flash-V >= max(CENTRE_SEED_V_MIN, P10(seed V)).
+constexpr float CENTRE_SEED_FRACTION = 0.10f;       // 10% of W/H each side → 20% foveal box
+constexpr float CENTRE_SEED_V_MIN    = 0.08f;       // lowest allowed flash-V floor
+constexpr int   CENTRE_SEED_DY_MIN   = 14;          // lowest allowed ΔY threshold
+
+// Gradient Notch (2026-09-04 research pipeline, tests/final_pipeline.py): Sobel
+// gradient magnitude on ΔY, fovea-adaptive cut threshold t_grad = μ_fov + K·σ_fov
+// computed from the same central seed box, and an UNCONDITIONAL 0px cut — zero
+// every foreground pixel with gmag > t_grad, applied BEFORE connected-component
+// selection. A raw 1px high-gradient line is mathematically sufficient to sever
+// 4/8-connectivity (a dilated trench would slice through small/distant fruit);
+// applying the cut after CCL is a no-op because the selected blob is already one
+// component. Unconditional: no statistical gate (removal %, gradient CV) can
+// separate when the notch helps vs hurts, and it is correct on all test bundles.
+// Safety: if the cut removes >80% of the foreground or leaves fewer than
+// FLASH_MIN_OBJECT_PIXELS, the raw foreground is restored.
+constexpr float FOVEAL_GRAD_K               = 2.8f;   // t_grad = μ_fov + K·σ_fov
+constexpr float GRAD_NOTCH_MAX_REMOVAL_FRAC = 0.80f;  // safety fallback bound
+
+// Centre-bias gaussian σ (px) for largest-blob selection. The chosen component
+// maximises  size * exp(-d² / (2σ²))  with d = bbox-midpoint distance to frame
+// centre, so a background blob pinned to the frame edge (e.g. a warm-coloured
+// chair) is pruned even when it is the largest component; a fruit within ~one σ
+// of centre always wins. Raised here to bias "grab the central fruit".
+constexpr float MS_CENTRE_BIAS_SIGMA = 40.0f;
+
+// ─── Unified 5-layer burst pipeline (process_unified_burst) ─────────
+// Replaces the fixed thresholds with a 98th-percentile dynamic gate so that a
+// close fruit reflects a peak ΔY of ~160 while room bounce stays at ΔY~28:
+//   τ_core = max(min, 0.35 × p98), τ_bg = max(min, 0.18 × p98)
+constexpr float BURST_CORE_FRAC   = 0.35f;
+constexpr float BURST_BG_FRAC     = 0.18f;
+constexpr int   BURST_CORE_MIN_DY = 28;   // floor on the dynamic core threshold
+constexpr int   BURST_BG_MIN_DY   = 14;   // floor on the dynamic background cutoff
+
+// Motion-parallax macroblock estimator (SAD, ±3 px). Divides the frame into a
+// 20×15 grid of 16×16 blocks; a block is foreground if its SAD displacement is
+// >= PARALLAX_MIN_MOTION. An adaptive global classifier (Q1) treats a
+// handheld scene (mean block motion >= PARALLAX_GLOBAL_HANDHELD) as motile and
+// enforces the gate; a stationary bench/tripod scene bypasses it so resting
+// fruit is never falsely rejected (Layer 2 default: distant/floodlit bg cut).
+constexpr int   PARALLAX_BLOCK_SIZE    = 16;
+constexpr int   PARALLAX_SEARCH_WIN    = 3;
+constexpr float PARALLAX_MIN_MOTION    = 1.0f;  // px, per-block foreground threshold
+constexpr float PARALLAX_GLOBAL_HANDHELD = 0.40f; // mean px across blocks -> handheld
+
+// Layer 5 semantic gates for the burst path.
+// Glossy table / white-wall reject: if the core's mean saturation is under
+// TABLE_MIN_MEAN_S the region is neutral flash glare -> fg=0, bbox=0x0, vol=0.
+constexpr float TABLE_MIN_MEAN_S = 0.20f;
+
+// 2D skin gate (Q3): keep the 20° hue window (preserves ripe orange/apricot
+// 20–35° pigments) and reject human skin by its hue+saturation band rather
+// than raising the hue floor.
+constexpr float SKIN_HUE_MIN_DEG = 15.0f;
+constexpr float SKIN_HUE_MAX_DEG = 32.0f;
+constexpr float SKIN_SAT_MAX     = 0.50f;  // fingers are low/moderate S (≤0.48)
 
 // ─── Guide flow timings ───────────────────────────────────────────
 constexpr uint32_t PLACE_FRUIT_HOLD_MS   = 800;   // "hold fruit up" beat before scan

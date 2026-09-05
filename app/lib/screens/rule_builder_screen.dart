@@ -35,6 +35,14 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
   late FruitProfile _profile;
   late final TextEditingController _nameController;
 
+  /// True once any balance slider or veto setting changes but the updated
+  /// model blob has not yet been compiled + uploaded to the scanner. Slider
+  /// edits are silent in local state until an explicit upload, so we surface
+  /// that with a banner instead of leaving the user scanning a stale model.
+  bool _isBlobDirty = false;
+
+  void _markDirty() => setState(() => _isBlobDirty = true);
+
   @override
   void initState() {
     super.initState();
@@ -145,7 +153,7 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
           profile: _profile,
           rule: _profile.categories[id],
           measuredCentroids: _measuredCentroids,
-          onDirty: _onRepoChanged,
+          onDirty: _markDirty,
         ),
       ),
     );
@@ -233,6 +241,7 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
     final nav = Navigator.of(context, rootNavigator: true);
     if (nav.canPop()) nav.pop(); // close progress dialog
     if (!mounted) return;
+    if (ok) _isBlobDirty = false;
     _toast(ok ? 'Saved to device flash!' : 'Upload failed');
   }
 
@@ -320,6 +329,10 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
             _nameField(),
             const SizedBox(height: 12),
             _healthBanner(ok),
+            if (_isBlobDirty) ...[
+              const SizedBox(height: 10),
+              _dirtyUploadBanner(),
+            ],
             const SizedBox(height: 16),
             _balanceCard(),
             const SizedBox(height: 18),
@@ -410,6 +423,49 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
     );
   }
 
+  Widget _dirtyUploadBanner() {
+    return FrostedBox(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      borderRadius: BorderRadius.circular(18),
+      backgroundColor: Cozy.chamomile.withValues(alpha: 0.10),
+      borderColor: Cozy.chamomile.withValues(alpha: 0.35),
+      child: Row(children: [
+        const Icon(Icons.cloud_upload_rounded, size: 17, color: Cozy.chamomile),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('UNSENT CHANGES',
+                style: TextStyle(
+                    fontSize: 12.5,
+                    letterSpacing: 0.8,
+                    fontWeight: FontWeight.bold,
+                    color: Cozy.chamomile)),
+            const SizedBox(height: 2),
+            Text(
+              widget.bleService.isConnected
+                  ? 'Balance/veto changed — re-upload to the scanner or it keeps using the old model.'
+                  : 'No device connected — upload will export a base64 .bin instead.',
+              style: const TextStyle(fontSize: 12.5, color: Cozy.warmGray),
+            ),
+          ]),
+        ),
+        const SizedBox(width: 8),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            backgroundColor: Cozy.chamomile,
+            foregroundColor: Cozy.deepBg,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12)),
+          ),
+          onPressed: _trainAndUpload,
+          child: const Text('UPLOAD',
+              style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 0.6)),
+        ),
+      ]),
+    );
+  }
+
   Widget _balanceCard() {
     return FrostedBox(
       padding: const EdgeInsets.all(16),
@@ -426,7 +482,10 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
           hint: 'hue & dispersion',
           color: Cozy.chamomile,
           value: _profile.wOptics,
-          onChanged: (v) => setState(() => _profile.wOptics = v),
+          onChanged: (v) {
+            setState(() => _profile.wOptics = v);
+            _markDirty();
+          },
         ),
         _BalanceSlider(
           icon: Icons.graphic_eq_rounded,
@@ -434,7 +493,10 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
           hint: '4x4 spectrogram',
           color: Cozy.duskBlue,
           value: _profile.wImage,
-          onChanged: (v) => setState(() => _profile.wImage = v),
+          onChanged: (v) {
+            setState(() => _profile.wImage = v);
+            _markDirty();
+          },
         ),
         _BalanceSlider(
           icon: Icons.monitor_heart_rounded,
@@ -442,7 +504,10 @@ class _RuleBuilderScreenState extends State<RuleBuilderScreen> {
           hint: 'damping, stiffness, tail',
           color: Cozy.heatherPink,
           value: _profile.wMoments,
-          onChanged: (v) => setState(() => _profile.wMoments = v),
+          onChanged: (v) {
+            setState(() => _profile.wMoments = v);
+            _markDirty();
+          },
         ),
       ]),
     );
@@ -731,9 +796,9 @@ class _BalanceSlider extends StatelessWidget {
             ),
             child: Slider(
               value: value,
-              min: 0.1,
+              min: 0.0,
               max: 2.0,
-              divisions: 38,
+              divisions: 40,
               onChanged: onChanged,
             ),
           ),
@@ -1244,8 +1309,10 @@ class _CategorySheetState extends State<_CategorySheet> {
                     value: _draft.enableGreenVeto,
                     onChanged: _isUnripe
                         ? null
-                        : (v) =>
-                            setState(() => _draft.enableGreenVeto = v),
+                        : (v) {
+                            setState(() => _draft.enableGreenVeto = v);
+                            widget.onDirty();
+                          },
                     secondary: Icon(
                         _isUnripe
                             ? Icons.block_rounded
@@ -1272,8 +1339,10 @@ class _CategorySheetState extends State<_CategorySheet> {
                       min: 0.1, max: 0.6,
                       format: (v) => '${(v * 100).round()}%',
                       color: Cozy.matcha,
-                      onChanged: (v) =>
-                          setState(() => _draft.greenVetoThreshold = v),
+                      onChanged: (v) {
+                        setState(() => _draft.greenVetoThreshold = v);
+                        widget.onDirty();
+                      },
                     ),
                 ],
               ),
