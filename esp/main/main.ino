@@ -268,8 +268,27 @@ static void run_raw_capture() {
   bt.notify_status_change("raw_capture_done");
 }
 
+// Camera boot test runs on a helper task in the BACKGROUND, AFTER bt.init():
+// BLE advertising is live the moment setup reaches it, so a wedged sensor (no
+// SCCB ACK) can no longer stall setup() and leave the device unreachable. The
+// acoustics-only DEBUG/waveform path stays usable even with no camera. The
+// loop's inference path checks camera_hardware_ok, so there is no race with
+// the loop's own captures: it stays false until this task completes.
+static bool boot_camera_ok = false;
+static void boot_camera_task(void*) {
+  boot_camera_ok = init_camera_subsystem();
+  vTaskDelete(nullptr);
+}
+
+// Tiny boot-stage tracer: flushes so a wedged boot shows exactly how far it got.
+static void boot_stage(const char* s) {
+  Serial.printf("[Boot] stage: %s\n", s);
+  Serial.flush();
+}
+
 void setup() {
   Serial.begin(115200);
+  boot_stage("serial");
   // START and SCAN are merged onto one GPIO14 button (active-high).
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLDOWN);   // == SCAN_BUTTON_PIN (same pin)
   pinMode(CANCEL_BUTTON_PIN, INPUT_PULLDOWN);
@@ -277,21 +296,30 @@ void setup() {
                   RISING);
   led_indicator_init();
   lcd_display_init();
+  boot_stage("led/lcd");
 
-  if (init_camera_subsystem()) {
-    Serial.println("[Main] Camera ready for captures.");
-  } else {
-    Serial.println("[Main] Camera init FAILED!");
-  }
   if (!acoustic_sensor.init()) {
     Serial.println("Failed to initialize Piezo system!");
     while (1) ;
   }
+  boot_stage("acoustic");
   store.init();
   refresh_default_screen();              // badge the idle screen if a model
                                          // survived in NVS
   multispectral_load_calibration();
+  boot_stage("cal");
   bt.init("Fruitipi", &store);
+  boot_stage("ble");
+  if (bt.get_mode() == MODE_DEBUG) {
+    // DEBUG boot: acoustics-only, camera not needed for the capture path.
+    // Skipping the probe entirely keeps the BLE + raw-waveform pipeline free
+    // of the camera's SCCB/current-spike wedge risk on marginal power.
+    Serial.println("[Main] DEBUG mode: camera probe skipped (acoustics-only).");
+  } else {
+    Serial.println("[Main] BLE advertising live; camera boot probe delayed 30s in background.");
+    xTaskCreatePinnedToCore(boot_camera_task, "camBoot", 8192, nullptr, 1,
+                            nullptr, 0);
+  }
 }
 
 void loop() {
@@ -594,43 +622,62 @@ void loop() {
                     features.impact_amplitude);
       start_acoustic_listening(dynamic_adc_threshold);
     } else {
-      Serial.printf("[Guide] TAP %u/%u DETECTED (since-arm %lu ms)\n",
-                    current_tap_idx + 1, total_taps,
-                    (unsigned long)(current_time - tap_arm_start_ms));
-      led_pet_tap_ok();
+      // Pull the raw 512-sample window ONCE, up front. It feeds BOTH the
+      // tap-quality gate (reject duds / grazes / truncated captures BEFORE
+      // they pollute the consensus) AND, in DEBUG mode, the raw-wave stream.
+      uint16_t raw_adc[512];
+      uint16_t peak_adc = 0;
+      acoustic_sensor.capture_sampler_raw_window(raw_adc, &peak_adc);
 
-      // Apply a run-wide volume override (BLE ScanConfig) if present.
-      if (bt.has_volume_override()) {
-        ms_features_pending.volume_cm3 = bt.get_override_volume_cm3();
-      }
-      tap_acoustics[current_tap_idx] = features;       // Dual-Latent per-tap input
-
-      // Dual-native per-tap debug payload (repurposed from the 32-dim block):
-      // the exact real-manifold coords + sigmoid latents this tap contributes,
-      // computed with the same math the engine aggregates. With a model loaded
-      // the blob's params drive the coords; otherwise the compiled defaults.
+      // Quality thresholds: timing + ringdown are fixed universal gates; the
+      // amplitude floor is per-fruit from the active model wire (Banana 160,
+      // Mango 200; 0 -> device default 160) so it rides with the model blob.
       DualLatentParams tap_params = dual_params_default();
       if (const DualModelWire* m = store.get_active_model_ptr()) {
         tap_params = dual_params_decode(*m);
       }
-      const float vol_norm =
-          dual_volume_norm(tap_params, ms_features_pending.volume_cm3);
-      DualTapCoords coords = dual_tap_coords(tap_params, features, vol_norm);
-      bt.notify_debug_state(coords, features.impact_amplitude);
-      current_tap_idx++;
-      tap_debounce_until_ms = current_time + TAP_MIN_INTERVAL_MS;
+      PiezoAcoustic::TapQualityResult tq =
+          PiezoAcoustic::evaluate_tap_quality(raw_adc, tap_params.min_peak_adc);
+      if (!tq.idx_ok || !tq.amp_ok || !tq.decay_ok) {
+        // Bad tap — do NOT count. Flush + re-arm clean and wait for a
+        // replacement tap, exactly like a first attempt. Visible retry cue.
+        Serial.printf("[Guide] TAP REJECTED (idx=%u adc=%u tail=%.2f%s%s%s) "
+                      "- TAP CLEANLY\n",
+                      tq.peak_idx, tq.peak_adc, tq.tail_ratio,
+                      tq.idx_ok ? "" : " [timing]", tq.amp_ok ? "" : " [amp]",
+                      tq.decay_ok ? "" : " [ringdown]");
+        lcd_tap_retry();
+        start_acoustic_listening(dynamic_adc_threshold);
+        tap_arm_start_ms = current_time;
+      } else {
+        Serial.printf("[Guide] TAP %u/%u DETECTED (since-arm %lu ms)\n",
+                      current_tap_idx + 1, total_taps,
+                      (unsigned long)(current_time - tap_arm_start_ms));
+        led_pet_tap_ok();
 
-      if (bt.get_mode() == MODE_DEBUG) {
-        // Repurposed DEBUG mode: the tap STREAMS its raw waveform for capture
-        // (data collection), then the SAME dual consensus runs below — DEBUG
-        // is the dual system's data-collection/inspection mode, not a 32D one.
-        uint16_t raw_adc[512];
-        uint16_t peak_adc;
-        acoustic_sensor.capture_sampler_raw_window(raw_adc, &peak_adc);
-        bt.send_raw_acoustic_waveform(raw_adc, peak_adc);
-      }
+        // Apply a run-wide volume override (BLE ScanConfig) if present.
+        if (bt.has_volume_override()) {
+          ms_features_pending.volume_cm3 = bt.get_override_volume_cm3();
+        }
+        tap_acoustics[current_tap_idx] = features;      // Dual-Latent per-tap input
 
-      if (current_tap_idx < total_taps) {
+        // Dual-native per-tap debug payload: the exact real-manifold coords +
+        // sigmoid latents this tap contributes, computed with the same math.
+        const float vol_norm =
+            dual_volume_norm(tap_params, ms_features_pending.volume_cm3);
+        DualTapCoords coords = dual_tap_coords(tap_params, features, vol_norm);
+        bt.notify_debug_state(coords, features.impact_amplitude);
+        current_tap_idx++;
+        tap_debounce_until_ms = current_time + TAP_MIN_INTERVAL_MS;
+
+        if (bt.get_mode() == MODE_DEBUG) {
+          // Repurposed DEBUG mode: the tap STREAMS its raw waveform for capture
+          // (data collection), then the SAME dual consensus runs below — DEBUG
+          // is the dual system's data-collection/inspection mode, not a 32D one.
+          bt.send_raw_acoustic_waveform(raw_adc, peak_adc);
+        }
+
+        if (current_tap_idx < total_taps) {
         // Consensus run — collect more taps. Re-arm the piezo; the vision
         // snapshot stays unchanged from the cam scan. Persistent progress:
         // the "TAP k/N OK" line is held as the base (survives the bus-quiet
@@ -672,6 +719,7 @@ void loop() {
         current_tap_idx = 0;
         have_ms_features = false;
       }
+    }
     }
   }
 

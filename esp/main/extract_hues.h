@@ -115,3 +115,25 @@ public:
                                                uint32_t* core_pixels_out = nullptr,
                                                uint32_t* snap_pixels_out = nullptr);
 };
+
+/**
+ * @brief Foveal center-box hue extraction (live multimodal capture).
+ *
+ * Restricts hue sampling to the central 100x100 box (x [110..210],
+ * y [78..178] on the 320x256 RGB565 decode, centred on cx=160/cy=128),
+ * gates on flash delta-luma (dY >= 14) + value/saturation floors, and
+ * rejects skin pixels (H 15°-35°, S <= 0.50) so a holding hand/arm can
+ * never pollute the histogram. Returns a ColorFeatures with the 8-bin hue
+ * histogram normalized to the green-vs-yellow skin question; fg_pixels_out
+ * reports the surviving box pixel count (>= MS_FOVEAL_FG_MIN gates fruit
+ * detection). hue_histogram[0] == 0 signals "no valid box pixels".
+ *
+ * @param flash   RGB565 frame captured under the white flash
+ * @param ambient RGB565 frame captured back-to-back with flash off
+ * @param w, h    Frame dimensions in pixels
+ * @param cm_per_pixel Calibration constant (volume stays at DEFAULT for box)
+ */
+ColorFeatures process_foveal_box(const uint16_t* flash, const uint16_t* ambient,
+                                 uint16_t w, uint16_t h,
+                                 float cm_per_pixel = 0.05f,
+                                 uint32_t* fg_pixels_out = nullptr);

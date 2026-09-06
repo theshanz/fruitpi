@@ -30,6 +30,8 @@ static_assert(offsetof(DualModelWire, r0_spec) == 48,
               "r0_spec offset must be 48");
 static_assert(offsetof(DualModelWire, anchors) == 92,
               "anchors offset must be 92");
+static_assert(offsetof(DualModelWire, min_peak_adc_lo) == 113,
+              "min_peak_adc must be at offset 113");
 
 // DISPLAY-ONLY confidence for the LCD. Smooths the posterior toward uniform
 // (Laplace, alpha=0.08) so a decisive result reads ~94% instead of a flat full

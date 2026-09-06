@@ -113,6 +113,50 @@ void PiezoAcoustic::capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_o
     }
 }
 
+// ─── Tap-quality validation ────────────────────────────────────────
+// Mirrors the offline analysis on the stored labelled windows: mean-centre,
+// locate max |centered|, then judge centroid, amplitude and ring-down energy.
+// The ringdown gate runs the FIXED direction (>= floor): a real impact has its
+// peak early in the window (7-18 ms) so most energy is in the post-peak
+// ring-down; a capture truncated at the window end or a scrape has almost no
+// tail energy. min_peak_adc comes from the model wire (0 = default 160) so the
+// amplitude floor is per-fruit (Banana 160, Mango 200) without firmware edits.
+PiezoAcoustic::TapQualityResult
+PiezoAcoustic::evaluate_tap_quality(const uint16_t raw[FFT_SIZE],
+                                    uint16_t min_peak_adc) {
+    // Mean-centre (DC block) and accumulate total energy.
+    uint32_t sum = 0;
+    for (int i = 0; i < FFT_SIZE; i++) sum += raw[i];
+    const float mean = (float)sum / (float)FFT_SIZE;
+
+    float peak_v = 0.0f;
+    int peak_idx = 0;
+    float e_total = 0.0f;
+    for (int i = 0; i < FFT_SIZE; i++) {
+        float c = (float)raw[i] - mean;
+        e_total += c * c;
+        if (fabsf(c) > peak_v) {
+            peak_v = fabsf(c);
+            peak_idx = i;
+        }
+    }
+
+    float e_tail = 0.0f;
+    for (int i = peak_idx; i < FFT_SIZE; i++) {
+        float c = (float)raw[i] - mean;
+        e_tail += c * c;
+    }
+
+    TapQualityResult r{};
+    r.peak_idx   = (uint16_t)peak_idx;
+    r.peak_adc   = (uint16_t)(peak_v + 0.5f);
+    r.tail_ratio = e_total > 1e-12f ? e_tail / e_total : 0.0f;
+    r.idx_ok     = (peak_idx >= TAP_Q_IDX_MIN) && (peak_idx <= TAP_Q_IDX_MAX);
+    r.amp_ok     = r.peak_adc >= min_peak_adc;
+    r.decay_ok   = r.tail_ratio >= TAP_Q_MIN_TAIL_RATIO;
+    return r;
+}
+
 // adc_buffer is written by Core-1 in process_captured_buffer() and read here.
 // Both paths are guarded by protocol: callers only reach this after is_data_ready()
 // returns true, meaning the sampler has finished processing and is back in DISARMED.

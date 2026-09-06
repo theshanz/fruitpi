@@ -87,6 +87,21 @@ constexpr float PIEZO_DEFAULT_THRESHOLD = 0.02f; // min |x−baseline| deviation
 constexpr float MIN_TAP_PEAK = 0.015f;           // windows below this impact amplitude
                                  // are electrical noise, silently re-armed.
 
+// ─── Tap-quality gate (rejects duds / grazes / truncated captures) ──
+// Validated locally on stored 512-sample windows: clean fruit taps peak at
+// index ~64..156 (7-18 ms, pre-trigger=64) with a strong ring-down that holds
+// >35% of window energy AFTER the peak. The truncated 20260906_171648 banana
+// capture peaked at index 510 (window end) with ~3% tail energy — exactly what
+// these two gates reject. min_peak_adc lives on the model wire (<DLAT>@113,
+// 0 = unspecified); the fallback below keeps old/absent fields working.
+constexpr uint16_t TAP_Q_IDX_MIN       = 25;    // impact must be centered (not in pre-trigger)
+constexpr uint16_t TAP_Q_IDX_MAX       = 180;   // not truncated at the window end
+constexpr float    TAP_Q_MIN_TAIL_RATIO = 0.35f; // E_after-peak / E_total floor (a real
+                                 // impact leaves its energy in the ring-down; a
+                                 // truncated/scrape capture has a tiny tail)
+constexpr uint16_t DUAL_DEFAULT_MIN_PEAK_ADC = 160; // ~0.05 V — used when the wire
+                                 // min_peak_adc is absent; Banana=160, Mango=200.
+
 // peak_abs is stored normalized to 0..1 after `raw_adc / 4095.0f`; the dual
 // β·ln(peak) force-de-coater was calibrated on RAW 12-bit counts (peaks ~2000
 // in the dataset), so rescale before the log or the ln(peak) sign flips.
@@ -223,6 +238,28 @@ constexpr int   CENTRE_SEED_DY_MIN   = 14;          // lowest allowed ΔY thresh
 // sits ≥2σ from both populations. Mirrors final_pipeline._FOVEAL_FG_MIN.
 constexpr uint32_t MS_FOVEAL_FG_MIN = 400;
 
+// Conservative Foveal Center Lock (item 1, 2026-09-06): the chosen foreground
+// blob MUST physically intersect the central fovea box (cx ± FOVEAL_LOCK_FRAC*W,
+// cy ± FOVEAL_LOCK_FRAC*H). If the centre crosshair is empty, the system fails
+// fast — never guess at peripheral warm-coloured chairs / hand blobs.
+constexpr float MS_FOVEAL_LOCK_FRAC = 0.15f;
+
+// Foveal core sampling (item 2b, 2026-09-06): the final hue histogram is built
+// only from the central 70% erosion of the segmented mask (one morphological
+// erosion pass), cutting off edge boundaries where background and fingers blend
+// with fruit skin. Mirrors final_pipeline._FOVEAL_CORE_FRAC.
+constexpr float MS_FOVEAL_CORE_FRAC = 0.70f;
+
+// Conservative Skin gate (item 2a, 2026-09-06): strip human-skin pixels from
+// the hue histogram. Skin band: H 15-35°, S ≤ 0.55 (fingers are moderate S),
+// V ≥ 0.20 (avoid dark-shadow false positives). Mirrors final_pipeline skin
+// gate (the "fingers" gate, applied strongest in the bottom 30% of bbox).
+constexpr float MS_SKIN_HUE_MIN_DEG = 15.0f;
+constexpr float MS_SKIN_HUE_MAX_DEG = 35.0f;
+constexpr float MS_SKIN_S_MAX       = 0.55f;
+constexpr float MS_SKIN_V_MIN       = 0.20f;
+constexpr float MS_SKIN_BBOX_BOTTOM = 0.30f;
+
 // Gradient Notch (2026-09-04 research pipeline, tests/final_pipeline.py): Sobel
 // gradient magnitude on ΔY, fovea-adaptive cut threshold t_grad = μ_fov + K·σ_fov
 // computed from the same central seed box, and an UNCONDITIONAL 0px cut — zero
@@ -305,7 +342,7 @@ constexpr float IMPACT_AMP_FLOOR         = 0.004f; // div-by-zero guard for weak
 // active_class_mask (auto-derived from the labels fed in); a nonzero
 // per-model mask always wins over this. 0x03 = two-class test default.
 constexpr uint8_t ACTIVE_CLASS_MASK      = 0x03;
-constexpr float GREEN_MASS_VETO_THRESHOLD   = 0.25f;
+constexpr float GREEN_MASS_VETO_THRESHOLD   = 0.40f;
 constexpr float ANOMALY_CONFIDENCE_THRESHOLD = 0.35f;
 constexpr float MIN_MASS23 = 10.0f;   // volume^(2/3) normalization range
 constexpr float MAX_MASS23 = 300.0f;

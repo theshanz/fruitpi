@@ -47,7 +47,10 @@ struct BiologicalStatus {
 //   84..87  vol23_lo                 (vol^(2/3) norm range)
 //   88..91  vol23_hi
 //   92..111 anchors[5]               (category centroids on the q latent)
-//   112..851 reserved2[740]          (must be zero)
+//   112     reserved2_pad            (must be zero)
+//   113..114 min_peak_adc            (u16 LE tap-quality amplitude floor; 0 =
+//                                    unspecified -> DUAL_DEFAULT_MIN_PEAK_ADC)
+//   115..851 reserved2[737]          (must be zero)
 struct __attribute__((packed)) DualModelWire {
     char    fruit_name[32];
     uint32_t magic;
@@ -69,7 +72,10 @@ struct __attribute__((packed)) DualModelWire {
     float    vol23_lo;
     float    vol23_hi;
     float    anchors[NUM_CLASSES];
-    uint8_t  reserved2[740];
+    uint8_t  reserved2_pad;           // 112
+    uint8_t  min_peak_adc_lo;         // 113 (u16 LE)
+    uint8_t  min_peak_adc_hi;         // 114
+    uint8_t  reserved2[737];          // 115..851
 };
 static_assert(sizeof(DualModelWire) == 852, "DualModelWire must be 852 bytes");
 

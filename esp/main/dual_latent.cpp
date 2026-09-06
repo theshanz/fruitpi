@@ -166,7 +166,12 @@ DualLatentParams dual_params_default() {
     p.vol23_lo            = DUAL_VOL23_LO;
     p.vol23_hi            = DUAL_VOL23_HI;
     for (int c = 0; c < NUM_CLASSES; c++) p.anchors[c] = DUAL_ANCHORS[c];
+    p.min_peak_adc = DUAL_DEFAULT_MIN_PEAK_ADC;
     return p;
+}
+
+static uint16_t wire_min_peak_adc(const DualModelWire& m) {
+    return (uint16_t)m.min_peak_adc_lo | ((uint16_t)m.min_peak_adc_hi << 8);
 }
 
 bool dual_wire_valid(const DualModelWire& m) {
@@ -195,8 +200,14 @@ bool dual_wire_valid(const DualModelWire& m) {
     // Reserved regions must be canonical (all zero).
     for (size_t i = 0; i < sizeof(m.reserved); i++)
         if (m.reserved[i] != 0) return false;
+    if (m.reserved2_pad != 0) return false;
     for (size_t i = 0; i < sizeof(m.reserved2); i++)
         if (m.reserved2[i] != 0) return false;
+
+    // min_peak_adc: 0 = unspecified (falls back to default), otherwise a valid
+    // 12-bit ADC amplitude floor.
+    const uint16_t mp = wire_min_peak_adc(m);
+    if (mp != 0 && mp > (uint16_t)PIEZO_ADC_FULL_SCALE) return false;
 
     // Floating parameters finite and within the ranges the builder emits.
     if (!std::isfinite(m.r0_spec) || !std::isfinite(m.r0_mom)) return false;
@@ -230,6 +241,8 @@ DualLatentParams dual_params_decode(const DualModelWire& m) {
     p.vol23_lo          = m.vol23_lo;
     p.vol23_hi          = m.vol23_hi;
     for (int c = 0; c < NUM_CLASSES; c++) p.anchors[c] = m.anchors[c];
+    const uint16_t mp = wire_min_peak_adc(m);
+    p.min_peak_adc = mp != 0 ? mp : (uint16_t)DUAL_DEFAULT_MIN_PEAK_ADC;
     return p;
 }
 

@@ -126,6 +126,24 @@ class PiezoAcoustic {
         // is_data_ready() returns true. Clears the data-ready flag.
         bool capture_sampler_raw_window(uint16_t raw_out[512], uint16_t* peak_out);
 
+        // ── Tap-quality validation (counted-tap gate) ───────────────
+        struct TapQualityResult {
+            uint16_t peak_idx;       // index of max |centered| within the 512 window
+            uint16_t peak_adc;       // max |centered| in 12-bit counts
+            float    tail_ratio;     // E(after peak) / E(total), 0..1
+            bool     idx_ok;         // TAP_Q_IDX_MIN..TAP_Q_IDX_MAX
+            bool     amp_ok;         // peak_adc >= min_peak_adc (wire, else default)
+            bool     decay_ok;       // tail_ratio >= TAP_Q_MIN_TAIL_RATIO
+        };
+
+        // Pure function over a captured 512-sample window: decides whether the
+        // impact is a clean, well-centered, strong tap (vs a dud, graze, or a
+        // capture truncated at the window end). Only the two decisive,
+        // universal gates (timing + ringdown) plus the model-tunable amplitude
+        // floor; validated offline against the stored labelled waveforms.
+        static TapQualityResult evaluate_tap_quality(
+            const uint16_t raw[FFT_SIZE], uint16_t min_peak_adc);
+
         // Continuous Background Recording API
         // trigger_threshold_adc is a DEVIATION threshold: |sample - baseline|
         // (normalized 0-1), not a raw ADC level. settle_us keeps the trigger

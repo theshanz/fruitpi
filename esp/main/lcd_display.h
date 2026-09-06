@@ -15,6 +15,7 @@ void lcd_countdown(uint8_t sec);   // "TAP in Ns" — placement grace
 void lcd_tap_ok();
 void lcd_tap_progress(uint8_t k, uint8_t n); // held "TAP k/n" line during consensus
 void lcd_tap_again(uint8_t k, uint8_t n);    // "TAP k/n OK -> TAP AGAIN" cue
+void lcd_tap_retry();                        // "[RETRY] TAP CLEANLY" cue
 void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100);
 void lcd_timeout();
 void lcd_placement_timeout();

@@ -42,6 +42,8 @@ struct DualLatentParams {
     float   vol23_lo;
     float   vol23_hi;
     float   anchors[NUM_CLASSES];
+    uint16_t min_peak_adc;           // tap-quality amplitude floor (counts)
+                                     // wire @113; 0 on wire -> default
 };
 
 // Compiled-in defaults (config.h) — used when no model blob is active.

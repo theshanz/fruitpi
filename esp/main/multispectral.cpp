@@ -273,10 +273,13 @@ bool multispectral_capture_dual_shot(ColorFeatures& out, uint32_t* fg_pixels_out
 
     uint32_t fg_px = 0;
     int bbox_w = 0, bbox_h = 0;
-    out = HueExtractor::process_differential(s_ss_buf, s_ss_amb_buf, fw, fh,
-                                             MS_CM_PER_PIXEL_FULL * (float)(1 << MS_DECODE_SCALE),
-                                             &fg_px, &bbox_w, &bbox_h);
+    out = process_foveal_box(s_ss_buf, s_ss_amb_buf, fw, fh,
+                             MS_CM_PER_PIXEL_FULL * (float)(1 << MS_DECODE_SCALE),
+                             &fg_px);
     if (fg_pixels_out) *fg_pixels_out = fg_px;
+    const int FOVEAL_BOX_SIDE = 210 - 110 + 1;  // 101 px
+    bbox_w = FOVEAL_BOX_SIDE;
+    bbox_h = FOVEAL_BOX_SIDE;
 
     Serial.printf("[MS] dual-shot OK: %ux%u, hue=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f] vol=%.0f rgb=(%.0f,%.0f,%.0f) amb=(%.0f,%.0f,%.0f) fg=%u bbox=%dx%d\n",
                   fw, fh,
@@ -414,14 +417,18 @@ bool multispectral_capture_dual_shot_debug(ColorFeatures& out, DualShotDebugInfo
     int bx = 0, by = 0, bw = 0, bh = 0;
     uint32_t core_px = 0, snap_px = 0;
     uint32_t tp = millis();
-    out = HueExtractor::process_differential(s_ss_buf, s_ss_amb_buf, fw, fh,
-                                             MS_CM_PER_PIXEL_FULL * (float)(1 << MS_DECODE_SCALE),
-                                             &fg_px, &bx, &by, &bw, &bh,
-                                             &core_px, &snap_px);
+    constexpr int FOVEAL_X0 = 110, FOVEAL_Y0 = 78, FOVEAL_SIDE = 101;
+    out = process_foveal_box(s_ss_buf, s_ss_amb_buf, fw, fh,
+                             MS_CM_PER_PIXEL_FULL * (float)(1 << MS_DECODE_SCALE),
+                             &fg_px);
     info.process_ms = millis() - tp;
     info.fg_pixels = fg_px;
-    info.core_pixels = core_px;
-    info.snap_pixels = snap_px;
+    info.core_pixels = 0;
+    info.snap_pixels = 0;
+    bx = FOVEAL_X0;
+    by = FOVEAL_Y0;
+    bw = FOVEAL_SIDE;
+    bh = FOVEAL_SIDE;
     info.bbox_x = bx;
     info.bbox_y = by;
     info.bbox_w = bw;

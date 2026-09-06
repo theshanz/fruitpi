@@ -336,6 +336,12 @@ void lcd_tap_again(uint8_t k, uint8_t n) {
   set_screen(l1, "TAP AGAIN", CUE_HOLD_MS);
   lcd_lock_give();
 }
+// Rejected tap — do not count. Prompt for a clean retry ("[RETRY] TAP CLEANLY").
+void lcd_tap_retry() {
+  lcd_lock_take();
+  set_screen("RETRY", "TAP CLEANLY", CUE_HOLD_MS);
+  lcd_lock_give();
+}
 void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100) {
   lcd_lock_take();
   char l1[17];

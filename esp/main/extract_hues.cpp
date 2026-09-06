@@ -77,7 +77,7 @@ float HueExtractor::calculate_chromatic_dispersion(const float hue[8]) {
 
 // ─── Pixel Unpack Helpers ─────────────────────────────────────────
 static inline void unpack_rgb565(const uint8_t* p, uint8_t& r, uint8_t& g, uint8_t& b) {
-    uint16_t pixel = (uint16_t)((p[0] << 8) | p[1]);
+    uint16_t pixel = (uint16_t)((p[1] << 8) | p[0]);
 
     r = (uint8_t)(((pixel >> 11) & 0x1F) << 3); r |= (uint8_t)(r >> 2);
     g = (uint8_t)(((pixel >> 5) & 0x3F) << 2); g |= (uint8_t)(g >> 4);
@@ -287,6 +287,74 @@ static float sobel_gmag(const uint8_t* dy, uint16_t w, uint16_t h, int x, int y)
 // FLASH_MIN_OBJECT_PIXELS, the raw foreground is restored (safety): the notch
 // is correct on all validated bundles, but a degenerate capture must never
 // collapse to an empty or shredded mask.
+// Foveal Center-Box hue extraction — simple, fool-proof.
+// ROI: x [110..210], y [78..178] (around cx=160, cy=128).
+// Only pixels with dY >= 14 and V >= 0.15 survive. Skin rejection: H [15..35], S <= 0.50.
+// 10-bin histogram [20°..155°]. If valid pixels < 250 return None (fg=0).
+// fg_pixels_out: surviving box pixel count (gates fruit detection >= 400).
+ColorFeatures process_foveal_box(const uint16_t* flash, const uint16_t* ambient,
+                                 uint16_t w, uint16_t h, float cm_per_pixel,
+                                 uint32_t* fg_pixels_out) {
+    ColorFeatures features;
+    memset(&features, 0, sizeof(ColorFeatures));
+
+    constexpr int X0 = 110, X1 = 210, Y0 = 78, Y1 = 178;
+    constexpr float MIN_DY = 14.0f;
+    constexpr float MIN_V = 0.15f;
+    constexpr int MIN_PIXELS = 250;
+
+    float hist[10] = {0};
+    int valid_pixels = 0;
+
+    for (int y = Y0; y <= Y1; y++) {
+        for (int x = X0; x <= X1; x++) {
+            size_t idx = (size_t)y * w + (size_t)x;
+            uint8_t r1, g1, b1, r2, g2, b2;
+            unpack_rgb565((const uint8_t*)(flash + idx), r1, g1, b1);
+            unpack_rgb565((const uint8_t*)(ambient + idx), r2, g2, b2);
+
+            float h=0, s=0, v=0;
+            HueExtractor::rgb888_to_hsv(r1, g1, b1, h, s, v);
+            float v_flash = v;
+            float dy = std::abs((float)r1 - (float)r2) + std::abs((float)g1 - (float)g2) + std::abs((float)b1 - (float)b2);
+            float dY = dy / 3.0f; // approximate luminance diff
+
+            // Saturation floor + value floor + dY gate
+            if (dY < MIN_DY || v_flash < MIN_V || s < 0.25f || v < 0.25f) continue;
+
+            // Skin rejection
+            if (h >= 15.0f && h <= 35.0f && s <= 0.50f) continue;
+
+            valid_pixels++;
+
+            // 10-bin histogram [20°..155°]
+            int bin = (int)((h - 20.0f) / 13.5f); // (155-20)/10 = 13.5° per bin
+            if (bin < 0) bin = 0;
+            if (bin > 9) bin = 9;
+            hist[bin] += 1.0f;
+        }
+    }
+
+    if (valid_pixels < MIN_PIXELS) {
+        if (fg_pixels_out) *fg_pixels_out = 0; // no fruit in the box
+        features.hue_histogram[0] = 0.0f; // fg = 0 signal
+        return features;
+    }
+
+    if (fg_pixels_out) *fg_pixels_out = (uint32_t)valid_pixels;
+
+    float total = 0.0f;
+    for (int i = 0; i < 10; i++) total += hist[i];
+    if (total > 0.0f) {
+        for (int i = 0; i < 8; i++) features.hue_histogram[i] = hist[i] / total; // normalize to 8 bins for compatibility
+    } else {
+        for (int i = 0; i < 8; i++) features.hue_histogram[i] = 0.125f;
+    }
+    features.chromatic_dispersion = 1.0f; // uniform assumption for box
+    features.volume_cm3 = VOLUME_DEFAULT_CM3;
+    return features;
+}
+
 static void apply_gradient_notch(uint8_t* core_mask, const uint8_t* dy_map,
                                  uint16_t w, uint16_t h,
                                  int seed_x0, int seed_y0, int rw, int rh) {
