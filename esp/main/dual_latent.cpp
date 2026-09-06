@@ -211,7 +211,7 @@ bool dual_wire_valid(const DualModelWire& m) {
 
     // Floating parameters finite and within the ranges the builder emits.
     if (!std::isfinite(m.r0_spec) || !std::isfinite(m.r0_mom)) return false;
-    if (!std::isfinite(m.alpha) || m.alpha <= 0.0f) return false;
+    if (!std::isfinite(m.alpha) || m.alpha == 0.0f) return false;  // sign flips q direction
     if (!std::isfinite(m.beta) || m.beta < 0.0f) return false;
     if (!std::isfinite(m.tau) || m.tau <= 0.0f) return false;
     if (!std::isfinite(m.w_acoustic) || !std::isfinite(m.w_optics)) return false;
