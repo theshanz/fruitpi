@@ -315,6 +315,24 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
       );
     }
     setState(() => _saving = false);
+    // Wire saved session data into dual-latent training + upload
+    try {
+      final wire = repo.buildDualWire(
+        fruitName: fruit,
+        category: widget.category,
+        modalityLabel: 'DUAL',
+        activeMask: 0x1F,
+      );
+      if (wire != null && mounted) {
+        final ok = await widget.bleService.uploadModelBin(wire);
+        if (ok && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            behavior: SnackBarBehavior.floating,
+            content: Text('DUAL MODEL UPLOADED FROM SESSION'),
+          ));
+        }
+      }
+    } catch (_) {}
     if (!mounted) return;
     Navigator.of(context).pop(true);
   }

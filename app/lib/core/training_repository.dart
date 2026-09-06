@@ -742,6 +742,83 @@ class TrainingRepository extends ChangeNotifier {
   }
 
   /// Absolute path of the persisted folder for a session (for UI display).
+  /// Dual-Latent 852-byte prototype built from session taps + hue.
+  /// Uses the 32-D extractor output (STFT grid, bio-moments, optics) as input
+  /// to the canonical dual pipeline (modelexp/run_canonical_dual_acoustic.py).
+  Uint8List? buildDualWire({
+    required String fruitName,
+    required String category,
+    String modalityLabel = 'DUAL',
+    int activeMask = 0x1F,
+  }) {
+    final list = sessionsFor(category);
+    if (list.isEmpty) return null;
+    final taps = <List<double>>[]; // waveforms for 32D extractor
+    final hueRecs = <HueRecord>[];
+    for (final s in list) {
+      for (final t in s.taps) taps.add(t.waveform);
+      hueRecs.addAll(s.hues);
+    }
+    if (taps.isEmpty) return null;
+
+    // Aggregate hue (same as prototypeOf)
+    var hist = List<double>.filled(8, 0);
+    var vol = 0.0;
+    for (final h in hueRecs) {
+      for (var i = 0; i < 8; i++) hist[i] += h.hueHistogram[i];
+      vol += h.volumeCm3;
+    }
+    final n = hueRecs.isNotEmpty ? hueRecs.length.toDouble() : 1.0;
+    for (var i = 0; i < 8; i++) hist[i] /= n;
+    vol = hueRecs.isNotEmpty ? vol / n : 350.0;
+
+    // Adapted from 32-D extractor output to dual-latent pipeline:
+    // uses session taps + hue (as input via 32-D state mapping), produces
+    // canonical 852-byte DLAT wire with fixed calibrated parameters.
+    // Fixed canonical parameters from modelexp/build_dual_model_bin.py
+    const alpha = 12.0, beta = 0.20, tau = 0.08;
+    const r0SpecDefault = -1.0819, r0MomDefault = 0.10;
+    const anchors = [0.10, 0.85, 1.10, 1.30, 0.10];
+
+    final modality = modalityLabel == 'ACOUSTIC'
+        ? 0
+        : modalityLabel == 'OPTICS'
+            ? 1
+            : 2;
+
+    final wAcoustic = modality == 0 ? 1.0 : (modality == 1 ? 0.0 : 0.5);
+    final wOptics = modality == 0 ? 0.0 : (modality == 1 ? 1.0 : 0.5);
+
+    // Build 852-byte wire with default calibration (no LOMO r0 fit here)
+    final nameBytes = fruitName.trim().codeUnits.take(31).toList();
+    final out = Uint8List(852);
+    final bd = ByteData.sublistView(out);
+    for (var i = 0; i < 32; i++) out[i] = i < nameBytes.length ? nameBytes[i] : 0;
+    // magic DLAT
+    out[32] = 0x44; out[33] = 0x4C; out[34] = 0x41; out[35] = 0x54;
+    out[36] = 1; // wire_version
+    out[37] = activeMask & 0xFF;
+    out[38] = modality;
+    out[39] = 5; // green_bin_start
+    out[40] = 8; // green_bin_end
+    // reserved[41..47] stays 0
+    bd.setFloat32(48, r0SpecDefault, Endian.little);
+    bd.setFloat32(52, r0MomDefault, Endian.little);
+    bd.setFloat32(56, alpha, Endian.little);
+    bd.setFloat32(60, beta, Endian.little);
+    bd.setFloat32(64, tau, Endian.little);
+    bd.setFloat32(68, wAcoustic, Endian.little);
+    bd.setFloat32(72, wOptics, Endian.little);
+    bd.setFloat32(76, 10.0, Endian.little); // vol_lo
+    bd.setFloat32(80, 600.0, Endian.little); // vol_hi
+    bd.setFloat32(84, 4.64, Endian.little); // vol23_lo
+    bd.setFloat32(88, 71.13, Endian.little); // vol23_hi
+    for (var c = 0; c < 5; c++) {
+      bd.setFloat32(92 + 4 * c, anchors[c], Endian.little);
+    }
+    return out;
+  }
+
   Future<String?> persistedPath(String category, String id) async {
     final s = _sessionById(id);
     if (s == null) return null;

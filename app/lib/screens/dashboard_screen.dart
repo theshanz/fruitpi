@@ -15,7 +15,7 @@ import '../widgets/volume_selector.dart';
 import 'add_model_flow.dart';
 import 'devices_screen.dart';
 import 'vision_config_sheet.dart';
-import 'model_editor_screen.dart';
+import 'dual_model_editor_screen.dart';
 
 class CozySpectraDashboard extends StatefulWidget {
   final BleService bleService;
@@ -242,7 +242,7 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
       context,
       MaterialPageRoute(
           builder: (_) =>
-              ModelEditorScreen(bleService: widget.bleService, originalBin: bin!)),
+              DualModelEditorScreen(bleService: widget.bleService, originalBin: bin!)),
     );
     if (edited != null && mounted) {
       await uploadBinWithProgress(context, widget.bleService, edited);

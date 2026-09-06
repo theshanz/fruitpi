@@ -4,15 +4,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/cozy_palette.dart';
+import '../core/dual_model_wire.dart';
 import '../core/model_vault.dart';
-import '../core/rules_model32d.dart';
 import '../services/ble_service.dart';
 import '../widgets/frosted.dart';
-import 'rule_builder_screen.dart';
+import 'dual_model_editor_screen.dart';
+import 'dual_rule_builder_screen.dart';
 
 /// Popup offering the different ways to add a fruit model:
-///   • Rule Builder  — collectorrr-style knobs, built in-app
-///   • Paste .bin    — base64/hex of a 616-byte Fruit28D blob
+///   • Dual Model Editor — edit 852-byte DLAT wire (toggle modality)
+///   • Paste .bin    — base64/hex of 852-byte Dual-Latent blob
 Future<void> showAddModelFlow(BuildContext context, BleService ble) {
   return showModalBottomSheet(
     context: context,
@@ -31,9 +32,32 @@ Future<void> showAddModelFlow(BuildContext context, BleService ble) {
             shape:
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
             leading: const Icon(Icons.tune_rounded, color: Cozy.matcha),
-            title: const Text('RULE BUILDER',
+            title: const Text('DUAL MODEL EDITOR',
                 style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
-            subtitle: Text('knobs per ripeness class · built on-device',
+            subtitle: Text('edit 852-byte DLAT wire · toggle modality',
+                style: TextStyle(fontSize: 15, color: Cozy.dimGray)),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () {
+              Navigator.pop(ctx);
+              final defaultBin = Uint8List.fromList(List.filled(852, 0));
+              Navigator.push(
+                ctx,
+                MaterialPageRoute(
+                  builder: (_) => DualModelEditorScreen(
+                    bleService: ble,
+                    originalBin: defaultBin,
+                  ),
+                ),
+              );
+            },
+          ),
+          ListTile(
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            leading: const Icon(Icons.category_rounded, color: Cozy.chamomile),
+            title: const Text('DUAL CATEGORY FLOW',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+            subtitle: Text('per-class data collection · modality toggle · train dual wire',
                 style: TextStyle(fontSize: 15, color: Cozy.dimGray)),
             trailing: const Icon(Icons.chevron_right_rounded),
             onTap: () {
@@ -41,7 +65,7 @@ Future<void> showAddModelFlow(BuildContext context, BleService ble) {
               Navigator.push(
                 ctx,
                 MaterialPageRoute(
-                    builder: (_) => RuleBuilderScreen(bleService: ble)),
+                  builder: (_) => DualRuleBuilderScreen(bleService: ble)),
               );
             },
           ),
@@ -79,7 +103,7 @@ Future<Uint8List?> showPasteBinDialog(BuildContext ctx) {
       content: Column(mainAxisSize: MainAxisSize.min, children: [
         Text(
             'Export from the fruit-profile engine as base64 or hex.\n'
-            'Accepted: ${RulesModel32D.wireBytes} B (legacy ${RulesModel32D.wireBytesLegacy} B).',
+            'Accepted: 852 B (dual-latent DLAT wire).',
             style: TextStyle(fontSize: 15, color: Cozy.warmGray)),
         const SizedBox(height: 12),
         TextField(
@@ -106,7 +130,7 @@ Future<Uint8List?> showPasteBinDialog(BuildContext ctx) {
             final text = ctrl.text.trim().isNotEmpty
                 ? ctrl.text.trim()
                 : (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
-            final bin = RulesModel32D.tryParseBinText(text);
+            final bin = DualModelWire.tryParseBinText(text);
             if (!dctx.mounted) return;
             if (bin == null) {
               ScaffoldMessenger.of(dctx).showSnackBar(const SnackBar(
@@ -135,7 +159,7 @@ Future<void> uploadBinWithProgress(
       canPop: false,
       child: AlertDialog(
         backgroundColor: Cozy.surfaceCard,
-        title: Text('UPLOADING "${RulesModel32D.binName(bin).toUpperCase()}"',
+        title: Text('UPLOADING "${DualModelWire.binName(bin).toUpperCase()}"',
             style: const TextStyle(
                 fontFamily: Cozy.monoFamily,
                 fontSize: 14,
@@ -170,7 +194,7 @@ Future<void> uploadBinWithProgress(
     behavior: SnackBarBehavior.floating,
     backgroundColor: ok ? Colors.green.shade800 : Colors.red.shade800,
     content: Text(ok
-        ? 'MODEL "${RulesModel32D.binName(bin)}" SAVED TO FLASH'
+        ? 'MODEL "${DualModelWire.binName(bin)}" SAVED TO FLASH'
         : 'UPLOAD FAILED'),
   ));
 }
