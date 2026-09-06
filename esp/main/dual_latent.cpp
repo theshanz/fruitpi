@@ -325,6 +325,34 @@ static BiologicalStatus evaluate_fruit_dual_impl(
         default: q = p.w_acoustic * q_int + p.w_optics * q_surf; break;
     }
 
+    // ── Stage 4d: 2D multimodal contradiction guard (mask-gated) ──
+    // A fruit that reads ripe on the SKIN (q_surf) yet unripe on the INTERIOR
+    // (q_int) contradicts genuine radial ripening (skin leads, flesh follows)
+    // and is the signature of ethylene/chemical artificial ripening. The guard
+    // is gated behind mask bit 4 so only models that OPT IN to recognizing
+    // ARTIFICIALLY_RIPENED see it — shipped blobs use mask 0x03 (bit 4 unset)
+    // and follow the exact validated decision path.
+    if (p.modality == MODALITY_DUAL &&
+        p.active_class_mask & (1u << 4) &&
+        q_surf >= 0.65f && q_int <= 0.40f && (q_surf - q_int) >= 0.35f) {
+        BiologicalStatus status;
+        memset(&status, 0, sizeof(status));
+        float contradiction = clamp_f((q_surf - q_int) * 100.0f, 80.0f, 99.0f);
+        status.probabilities[4] = contradiction / 100.0f;
+        status.primary_decision = CLASS_LABELS[4];
+        status.ripeness_index   = p.w_optics * q_surf + p.w_acoustic * q_int;
+        status.transition_entropy = 0.10f;
+        status.confidence       = contradiction;
+        status.is_anomaly       = true;
+        Serial.printf("[Dual] contradiction: q_surf=%.3f vs q_int=%.3f "
+                      "(delta=%.3f) -> %s (%.1f%%) src=%s mask=0x%02X "
+                      "modality=%s\n",
+                      q_surf, q_int, q_surf - q_int, CLASS_LABELS[4],
+                      (double)contradiction, src, p.active_class_mask,
+                      modality_name(p.modality));
+        return status;
+    }
+
     // ── Stage 5: canonical masked 1D metric decision ──
     BiologicalStatus result = decide_latent(p, q);
 
