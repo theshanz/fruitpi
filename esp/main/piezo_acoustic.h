@@ -18,12 +18,19 @@ struct AcousticFeatures {
     float impact_amplitude;   // Peak |sample - window mean| (0-1) — true tap strength
     float fft_bins[N_FFT_BINS]; //15 f^2 - conditioned log power bins
     float spectral_entropy; //Normalized s.e.
-    // ── 32D Fruit Profile additions ───────────────────────────────
+    // ── Dual-Latent acoustic input blocks ─────────────────────────
     float stft_grid[16];      // 4x4 time-frequency image (log1p band power),
                               // contrast-normalized to 0..1 in [10..25]
-    float bio_moments[6];     // dim 26..31: temporal centroid, tail energy,
+    float bio_moments[6];     // temporal centroid, tail energy,
                               // harmonic absorption, abbott stiffness,
                               // spectral entropy, dynamic damping
+    // ── Dual-Latent acoustic inputs (computed in process_captured_buffer) ──
+    float fbm2d_r_high_low;   // FBM-2D shear ratio E(>1kHz)/E(20..300Hz) on the
+                              // RAW window (unwindowed, zero-padded 2048-pt FFT)
+                              // — the q_spec de-coated input (r0_spec calibrated
+                              // on this exact estimator).
+    float peak_abs;           // max |raw ADC| over the window — force/amplitude
+                              // cue for the BETA*ln(peak) de-coating term.
 };
 
 enum SamplingState {
@@ -52,7 +59,7 @@ class PiezoAcoustic {
         void generate_hanning_window();
         float compute_spectral_entropy(const float raw_power[N_FFT_BINS]);
 
-        // 32D Fruit Profile DSP: STFT 4x4 grid + 6 bio-moments, computed
+        // Dual-Latent DSP: STFT 4x4 grid + 6 bio-moments, computed
         // from the full centered window during process_captured_buffer().
         alignas(16) float stft_fft[STFT_FFT_N * 2]; // per-frame FFT workspace
         alignas(16) float stft_win[STFT_FFT_N];     // Hanning for n_fft=128
@@ -61,6 +68,10 @@ class PiezoAcoustic {
         alignas(16) float dsp_centered[FFT_SIZE];
         alignas(16) float dsp_energy[FFT_SIZE];
         alignas(16) float dsp_rms_env[FFT_SIZE];
+        // 2048-pt zero-padded real-FFT scratch for the Dual FBM-2D shear ratio
+        // (process_captured_buffer). Member (NOT stack) so the 4KB sampler task
+        // never overflows; aligns to 16 for the SIMD fft kernels.
+        alignas(16) float dsp_rhi_fft[MS_DUAL_RFFT_N * 2];
         void build_stft_grid(const float centered[FFT_SIZE],
                              float out[16],
                              float raw_psd_mean[STFT_FFT_N / 2 + 1]);

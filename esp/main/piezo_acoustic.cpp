@@ -149,9 +149,13 @@ void PiezoAcoustic::arm(float trigger_threshold, uint32_t settle_us) {
         // Keep last_normalized_val at previous ambient reading so first-sample
         // delta is tiny (~0.002) instead of spiking to 0.032 from 0.0 init.
 
-        //prevent old data on new arm sequence
+        // Hard flush: prevent old data on a new arm sequence. Erase the ADC
+        // ring AND the feature store so nothing captured/decoded before this
+        // arming can ever be served as this run's tap — the next data-ready
+        // MUST come from a fresh threshold crossing after settle.
         memset(ring_buffer, 0, sizeof(ring_buffer));
         ring_head = 0;
+        memset(&latest_features, 0, sizeof(latest_features));
 
         armed_start_us = micros();
         state.store(STATE_ARMED);
@@ -314,7 +318,7 @@ void PiezoAcoustic::sampler_task_code(void* parameter) {
     }
 }
 
-// ─── 32D Fruit Profile DSP: STFT grid + bio-moments ───────────────
+// ─── Dual-Latent Acoustic DSP: STFT grid + bio-moments ────────────
 void PiezoAcoustic::build_stft_grid(
     const float centered[FFT_SIZE],
     float out[16],
@@ -573,6 +577,50 @@ void PiezoAcoustic::process_captured_buffer() {
     result.hertzian_adc = max_peak_adc;         // legacy raw peak (CSV parity)
     result.impact_amplitude = max_deviation;    // bias-independent tap strength
 
+    // ── Dual-Latent FBM-2D shear ratio (q_spec input) ─────────────────
+    // Mirrors tests/modelexp/mango_two_stage_afbm.r_high_low_tap():
+    //   sp = |rfft(w, n=2048)|^2 on the RAW window (NO mean removal, NO
+    //   windowing — the DC bias and all spectral leakage are part of the
+    //   estimator the r0_spec threshold was calibrated against), then
+    //   r_hl = E(>1kHz) / E(20..300Hz) with df = 8820/2048 and bin bounds
+    //   int(round(hz/df)). Zero-pad 512 -> 2048 (the validated estimator
+    //   pads the same way).
+    float peak_abs = 0.0f;
+    for (int i = 0; i < FFT_SIZE; i++) {
+        float a = fabsf(adc_buffer[i]);
+        if (a > peak_abs) peak_abs = a;
+        dsp_rhi_fft[i * 2]     = adc_buffer[i];
+        dsp_rhi_fft[i * 2 + 1] = 0.0f;
+    }
+    for (int i = FFT_SIZE; i < MS_DUAL_RFFT_N; i++) {
+        dsp_rhi_fft[i * 2]     = 0.0f;
+        dsp_rhi_fft[i * 2 + 1] = 0.0f;
+    }
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    dsps_fft2r_fc32_ae32(dsp_rhi_fft, MS_DUAL_RFFT_N);
+#else
+    dsps_fft2r_fc32(dsp_rhi_fft, MS_DUAL_RFFT_N);
+#endif
+    dsps_bit_rev_fc32(dsp_rhi_fft, MS_DUAL_RFFT_N);
+
+    {
+        const float df = (float)SAMPLING_FREQ_HZ / (float)MS_DUAL_RFFT_N;
+        const int k_low0 = (int)roundf(20.0f / df);
+        const int k_low1 = (int)roundf(300.0f / df);
+        const int k_hi   = (int)roundf(1000.0f / df);
+        float e_low = 0.0f, e_high = 0.0f;
+        for (int k = k_low0; k < k_low1; k++) {
+            float re = dsp_rhi_fft[k * 2], im = dsp_rhi_fft[k * 2 + 1];
+            e_low += (re * re) + (im * im);
+        }
+        for (int k = k_hi; k < MS_DUAL_RFFT_N / 2; k++) {
+            float re = dsp_rhi_fft[k * 2], im = dsp_rhi_fft[k * 2 + 1];
+            e_high += (re * re) + (im * im);
+        }
+        result.fbm2d_r_high_low = (e_high + 1e-12f) / (e_low + 1e-12f);
+    }
+    result.peak_abs = peak_abs;
+
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     dsps_fft2r_fc32_ae32(fft_input, FFT_SIZE);
 #else
@@ -612,7 +660,7 @@ void PiezoAcoustic::process_captured_buffer() {
 
     result.spectral_entropy = compute_spectral_entropy(raw_bin_power);
 
-    // ── 32D Fruit Profile: STFT 4x4 image + bio-moments ─────────────
+    // ── Dual-Latent per-tap features: STFT 4x4 grid + bio-moments ─────
     {
         float* centered_c = dsp_centered;
         for (int i = 0; i < FFT_SIZE; i++) centered_c[i] = adc_buffer[i] - mean;

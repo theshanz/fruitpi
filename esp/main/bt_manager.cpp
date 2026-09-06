@@ -68,8 +68,10 @@ static void vision_save_nvs()
 }
 
 // ─── Scan-config persistence (NVS namespace "scanconfig") ─────────────
-// tap_count + volume override survive a reboot (unlike vision gates these
-// are run-scope user settings the app sends once and expects to stick).
+// The volume override survives a reboot (a run-scope user setting the app
+// sends once and expects to stick). tap_count is deliberately VOLATILE: it
+// resets to the 3-tap default on every boot, so a fresh run always starts at
+// the easiest value and BLE overrides it per boot.
 static const char *SCANCONFIG_NS = "scanconfig";
 
 static void scanconfig_load_nvs(ScanConfig &cfg)
@@ -77,9 +79,6 @@ static void scanconfig_load_nvs(ScanConfig &cfg)
     nvs_handle_t nvs;
     if (nvs_open(SCANCONFIG_NS, NVS_READONLY, &nvs) != ESP_OK)
         return; // first boot: keep defaults
-    uint8_t taps = 0;
-    if (nvs_get_u8(nvs, "tap_count", &taps) == ESP_OK && taps > 0)
-        cfg.target_tap_count = taps;
     float vol = 0.0f;
     size_t sz = sizeof(float);
     if (nvs_get_blob(nvs, "volume_cm3", &vol, &sz) == ESP_OK && vol > 0.0f)
@@ -88,7 +87,7 @@ static void scanconfig_load_nvs(ScanConfig &cfg)
         cfg.use_volume_override = true;
     }
     nvs_close(nvs);
-    Serial.printf("[BTManager] scan config loaded: taps=%u vol=%.0f override=%d\n",
+    Serial.printf("[BTManager] scan config loaded: taps=%u (default 3) vol=%.0f override=%d\n",
                   cfg.target_tap_count, cfg.override_volume_cm3,
                   cfg.use_volume_override);
 }
@@ -98,7 +97,6 @@ static void scanconfig_save_nvs(ScanConfig &cfg)
     nvs_handle_t nvs;
     if (nvs_open(SCANCONFIG_NS, NVS_READWRITE, &nvs) != ESP_OK)
         return;
-    nvs_set_u8(nvs, "tap_count", cfg.target_tap_count);
     nvs_set_blob(nvs, "volume_cm3", &cfg.override_volume_cm3, sizeof(float));
     nvs_commit(nvs);
     nvs_close(nvs);
@@ -412,8 +410,8 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
             if (doc.containsKey("tap_count"))
             {
                 uint8_t taps = doc["tap_count"].as<uint8_t>();
-                if (taps < 1) taps = 1;
-                if (taps > MAX_CONSENSUS_TAPS) taps = MAX_CONSENSUS_TAPS;
+                if (taps < 2) taps = 2;      // N-tap consensus needs N >= 2
+                if (taps > MAX_DUAL_TAPS) taps = MAX_DUAL_TAPS;
                 current_config.target_tap_count = taps;
                 scanconfig_save_nvs(current_config);
                 Serial.printf("[BTManager] N-tap consensus set to %u.\n", taps);
@@ -760,11 +758,11 @@ uint32_t BTManager::inter_chunk_delay_ms()
     return d;
 }
 
-// ─── Save Received Model to NVS ──────────────────────────────────────
+// ─── Save Received Dual-Latent Model to NVS ──────────────────────────
 void BTManager::process_incoming_model()
 {
-    Fruit32D incoming_model;
-    memcpy(&incoming_model, model_rx_buffer, sizeof(Fruit32D));
+    DualModelWire incoming_model;
+    memcpy(&incoming_model, model_rx_buffer, sizeof(DualModelWire));
 
     Serial.printf("[BTManager] Completed Binary Model Upload: '%s'\n", incoming_model.fruit_name);
 
@@ -956,21 +954,24 @@ void BTManager::notify_ms_debug_diff_meta(const DualShotDebugInfo &info)
     pCharScanResults->notify();
 }
 
-// Full pipeline telemetry: the exact 32-D state the classifier saw,
-// plus the raw tap peak. One notify per inference — the app records it.
-void BTManager::notify_debug_state(const float state[VECTOR_DIMENSIONS], float peak_adc)
+// Full dual-latent telemetry per tap — the exact per-tap real-manifold
+// coords (r_spec/r_mom) and their sigmoid latents (q_spec/q_mom) the
+// consensus engine aggregates, plus the raw tap peak. One notify per tap;
+// the app records it. Replaces the legacy 32-dim state block.
+void BTManager::notify_debug_state(const DualTapCoords& coords, float peak_adc)
 {
     if (!device_connected)
         return;
 
-    DynamicJsonDocument doc(1600);
+    StaticJsonDocument<256> doc;
     doc["status"] = "debug_state";
     doc["peak"] = roundf(peak_adc * 1000.0f) / 1000.0f;
-    JsonArray st = doc.createNestedArray("state");
-    for (int i = 0; i < VECTOR_DIMENSIONS; i++)
-        st.add(roundf(state[i] * 1000.0f) / 1000.0f);
+    doc["r_spec"] = roundf(coords.r_spec * 1000.0f) / 1000.0f;
+    doc["r_mom"] = roundf(coords.r_mom * 1000.0f) / 1000.0f;
+    doc["q_spec"] = roundf(coords.q_spec * 1000.0f) / 1000.0f;
+    doc["q_mom"] = roundf(coords.q_mom * 1000.0f) / 1000.0f;
 
-    char output[1700];
+    char output[256];
     size_t n = serializeJson(doc, output, sizeof(output));
     pCharScanResults->setValue((uint8_t *)output, n);
     pCharScanResults->notify();

@@ -38,7 +38,7 @@ constexpr adc1_channel_t PIEZO_ADC_CHANNEL = ADC1_CHANNEL_1; // GPIO2 on ESP32-S
 #define RING_BUFFER_SIZE    1024     // circular buffer (2× FFT_SIZE)
 #define PIEZO_FLUSH_SAMPLES 256      // ~29 ms discarded after arm(): stale ring bleed-off
 
-// ─── 32D Fruit Profile audio image (STFT) ─────────────────────────
+// ─── Dual-Latent acoustic image (STFT) ────────────────────────────
 // Peak-aligned 384-sample window, n_fft=128, hop=32 -> 9 frames, pooled
 // into a 4x4 time-frequency grid. Bands match the validated engine.
 #define STFT_FFT_N        128
@@ -54,7 +54,7 @@ constexpr float STFT_BAND_HZ[STFT_FREQ_BANDS][2] = {
 };
 constexpr float STFT_CONTRAST_DB = 1.5f;  // dynamic-range floor (dB)
 
-// Bio-moment extraction (dim 26..31)
+// Bio-moment extraction (dual moment channel r_mom inputs)
 constexpr float TAIL_WINDOW_S   = 0.020f; // late-tail region after this much time
 constexpr int   RMS_ENVELOPE_N  = 16;     // RMS envelope window
 constexpr float DECAY_NOISE_GATE = 0.05f; // decay fit above this level
@@ -63,7 +63,9 @@ constexpr float HARMONIC_CLIP    = 3.0f;  // harmonic/fortitude clip then /3
 
 constexpr uint32_t ARM_SETTLE_MS  = 800;    // ignore triggers this long after arming
                                      // (button/placement/LCD bursts decay)
-constexpr uint32_t ARM_TIMEOUT_MS = 5000;   // auto-disarm when no tap arrives
+constexpr uint32_t ARM_TIMEOUT_MS = 15000;  // auto-disarm when no tap arrives;
+                                     // 15 s per tap window so a guided human
+                                     // taper can react (5 s was too tight)
 constexpr uint32_t ARM_TIMEOUT_US = ARM_TIMEOUT_MS * 1000UL;
 
 // BLE data-collection arming uses a two-stage ready confirmation that mirrors
@@ -83,7 +85,17 @@ constexpr float PIEZO_DEFAULT_THRESHOLD = 0.02f; // min |x−baseline| deviation
                                      // real fruit taps measure ~0.02–0.07.
                                      // BLE set_threshold overrides at runtime.
 constexpr float MIN_TAP_PEAK = 0.015f;           // windows below this impact amplitude
-                                     // are electrical noise, silently re-armed.
+                                 // are electrical noise, silently re-armed.
+
+// peak_abs is stored normalized to 0..1 after `raw_adc / 4095.0f`; the dual
+// β·ln(peak) force-de-coater was calibrated on RAW 12-bit counts (peaks ~2000
+// in the dataset), so rescale before the log or the ln(peak) sign flips.
+constexpr float PIEZO_ADC_FULL_SCALE = 4095.0f;
+
+// Minimum gap between accepted taps: re-arm suppresses the ringing residue of
+// the previous impact so one strike can't register as several taps. 500 ms
+// guarantees each physical impact is a distinct tap for the N-tap consensus.
+constexpr uint32_t TAP_MIN_INTERVAL_MS = 500;
 
 // Trigger gates: require sharp slew AND energy above baseline. Both adapt to
 // measured ambient noise (gate = mult × noise-EMA, floored, capped).
@@ -277,15 +289,15 @@ constexpr uint32_t LCD_FRAME_MS          = 4;     // min gap between LED frame w
 constexpr uint32_t LCD_ANIM_MS           = 180;   // LCD animation frame interval
 
 // ─── Classifier ───────────────────────────────────────────────────
-// 32D Fruit Profile v3: RAW states keep absolute physical scale (acoustic
-// amplitude survives — the cue that separates ripe/unripe). Blocks are NOT
-// L2-normalized (that was the ~51% coin-flip bug). Scoring is a
-// Diagonal-Gaussian (Mahalanobis):
-//   score[c] = bias[c] - 0.5 * sum_d inv_var[d]*(state[d]-mean[c][d])^2
-// where feature_weights[32] = pooled per-feature inverse-variance (floor 1e-3,
-// James-Stein shrink ~0.3) and prototypes[5][32] = per-class raw means.
-// (Mirrored by the app Rule Compiler rules_model32d.dart.)
-constexpr bool  ACOUSTIC_FORCE_INVARIANT = false;  // v3: amplitude is a real cue
+// The Dual-Latent modality engine (dual_latent.cpp) is the ONLY scorer in
+// this firmware — the 32D Diagonal-Gaussian scorer is removed. The acoustic
+// front-end still produces absolute-physical-scale features (amplitude survives
+// — the cue that separates ripe/unripe); the dual engine maps per-tap
+// (FBM-2D shear ratio, bio-moment contrast) onto a single ripeness latent q
+// and decides with a masked softmax on q (anchors, temperature DUAL_TAU).
+// (The app still mirrors the legacy layout in rules_model32d.dart — see the
+// Dual section below for the on-device truth.)
+constexpr bool  ACOUSTIC_FORCE_INVARIANT = false;  // amplitude is a real cue
 constexpr float IMPACT_AMP_FLOOR         = 0.004f; // div-by-zero guard for weak taps
 // Bit i enables class i: bit0=UNRIPE bit1=PERFECTLY_RIPE bit2=OVERRIPE
 // bit3=ROTTEN_OR_HOLLOW bit4=ARTIFICIALLY_RIPENED.
@@ -297,6 +309,56 @@ constexpr float GREEN_MASS_VETO_THRESHOLD   = 0.25f;
 constexpr float ANOMALY_CONFIDENCE_THRESHOLD = 0.35f;
 constexpr float MIN_MASS23 = 10.0f;   // volume^(2/3) normalization range
 constexpr float MAX_MASS23 = 300.0f;
+
+// ─── Dual-Latent modality engine (replaces 32D scorer in the inference path) ──
+// The device decision latent q is a single ripeness axis fed by one of three
+// MODALITIES (the sensor channel whose q contributes to the decision):
+//   MODALITY_ACOUSTIC : q = q_int = 0.5*q_spec + 0.5*q_mom  (optics disabled,
+//                       w_optics = 0.0) — the canonical Dual-Latent acoustic
+//                       pipeline validated on ggg (LOMO ~87.7% @ N=5) and the
+//                       fingerr zero-shot transfer (2/2 = 100%).
+//   MODALITY_OPTICS   : q = q_surf (skin-color ripeness: 1 - green-bin mass).
+//   MODALITY_DUAL     : q = w_ac*q_int + w_opt*q_surf  (both channels fused).
+//
+// Per-tap inputs (computed on-device, NOT from an uploaded blob):
+//   q_spec  <- sigmoid(ALPHA * (r_spec - R0_SPEC)), r_spec = median over taps of
+//              (FBM-2D E(>1kHz)/E(20..300Hz) shear ratio) - BETA*ln(peak_abs)
+//   q_mom   <- sigmoid(ALPHA * (r_mom - R0_MOM)),   r_mom  = median over taps of
+//              (spectral_entropy + tail_energy) - (abbott_stiffness + STFT t0 band0)
+//   q_int   = 0.5*q_spec + 0.5*q_mom                (50/50 Dual-Latent fusion)
+//   q_surf  = 1 - sum(hue bins MS_SURF_GREEN_BINS_START..END)   (green = unripe)
+// Decision (canonical 1D metric): masked softmax distance to DUAL_ANCHORS on the
+// q axis, temperature DUAL_TAU. Anchors sit on the same ripeness manifold as the
+// canonical engine (UNRIPE 0.10, PERFECTLY_RIPE 0.85, OVERRIPE 1.10,
+// ROTTEN 1.30, ARTIFICIAL 0.10), and for mask 0x03 the flip point is the
+// (0.10+0.85)/2 = 0.475 boundary reproduced by the fingerr experiment.
+constexpr int  MS_DUAL_RFFT_N      = 2048;   // zero-padded FFT for the shear ratio
+constexpr float DUAL_ALPHA         = 12.0f;  // sigmoid slope (validated sweep constant)
+constexpr float DUAL_BETA          = 0.20f;  // force de-coating factor (validated constant)
+constexpr float DUAL_TAU           = 0.08f;  // masked-softmax temperature
+constexpr float DUAL_R0_SPEC       = -1.0819f; // ggg-fit sigmoid midpoint, spectral
+constexpr float DUAL_R0_MOM        = -0.4104f; // ggg-fit sigmoid midpoint, moments
+constexpr float DUAL_ANCHORS[5]    = {0.10f, 0.85f, 1.10f, 1.30f, 0.10f};
+constexpr uint8_t MODAL_ACTIVE_CLASS_MASK = 0x03;  // UNRIPE vs PERFECTLY_RIPE (test default)
+constexpr int   MS_SURF_GREEN_BINS_START = 5; // hue bins 82.5-120 deg = green skin
+constexpr int   MS_SURF_GREEN_BINS_END   = 8;
+// Vol^(2/3) -> [0,1] normalizer (abbott stiffness term, mirrors Python).
+constexpr float DUAL_VOL_CLAMP_LO   = 10.0f;
+constexpr float DUAL_VOL_CLAMP_HI   = 600.0f;
+constexpr float DUAL_VOL23_LO       = 4.64f;   // 10^(2/3)
+constexpr float DUAL_VOL23_HI       = 71.13f;  // 600^(2/3)
+
+// Modality selection. Compile-time for this release: the acoustic test rig is
+// MODALITY_ACOUSTIC (optics channel zero-weighted). Weights only apply when
+// ACTIVE_MODALITY == MODALITY_DUAL.
+enum Modality : uint8_t {
+    MODALITY_ACOUSTIC = 0,   // optics disabled (w_optics = 0.0)
+    MODALITY_OPTICS   = 1,   // vision only (w_acoustic = 0.0)
+    MODALITY_DUAL     = 2    // 0.5*q_int + 0.5*q_surf
+};
+constexpr Modality ACTIVE_MODALITY        = MODALITY_ACOUSTIC;
+constexpr float    MODAL_W_ACOUSTIC       = 0.5f;
+constexpr float    MODAL_W_OPTICS         = 0.5f;
 
 // ─── Runtime-tunable vision gates (set over BLE via "vision_config") ───
 // Defaults come from the constexpr originals below.

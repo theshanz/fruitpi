@@ -116,9 +116,14 @@ bool multispectral_capture_single_shot(ColorFeatures& out);
  * and the volume bounding box.
  *
  * @param out Receives the extracted ColorFeatures on success.
+ * @param fg_pixels_out Optional: the centre-seeded foreground pixel count
+ *        (foveal fail-fast semantics, see MS_FOVEAL_FG_MIN). The caller can
+ *        treat fg_pixels_out < MS_FOVEAL_FG_MIN as fruit-detection false and
+ *        cancel the run.
  * @return true on success, false if capture or feature extraction failed.
  */
-bool multispectral_capture_dual_shot(ColorFeatures& out);
+bool multispectral_capture_dual_shot(ColorFeatures& out,
+                                     uint32_t* fg_pixels_out = nullptr);
 
 /**
  * @brief Unified 3-frame burst capture (Ambiant → Flash₁ → Flash₂).

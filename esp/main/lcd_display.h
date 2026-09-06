@@ -13,10 +13,13 @@ void lcd_disarmed();
 void lcd_armed();                  // "TAP fruit!" — listening starts
 void lcd_countdown(uint8_t sec);   // "TAP in Ns" — placement grace
 void lcd_tap_ok();
+void lcd_tap_progress(uint8_t k, uint8_t n); // held "TAP k/n" line during consensus
+void lcd_tap_again(uint8_t k, uint8_t n);    // "TAP k/n OK -> TAP AGAIN" cue
 void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100);
 void lcd_timeout();
 void lcd_placement_timeout();
 void lcd_camera_error();
+void lcd_no_fruit();
 void lcd_place_fruit();
 void lcd_place_on_piezo();
 
@@ -37,10 +40,13 @@ inline void lcd_disarmed() {}
 inline void lcd_armed() {}
 inline void lcd_countdown(uint8_t) {}
 inline void lcd_tap_ok() {}
+inline void lcd_tap_progress(uint8_t, uint8_t) {}
+inline void lcd_tap_again(uint8_t, uint8_t) {}
 inline void lcd_result(const char*, bool, float) {}
 inline void lcd_timeout() {}
 inline void lcd_placement_timeout() {}
 inline void lcd_camera_error() {}
+inline void lcd_no_fruit() {}
 inline void lcd_place_fruit() {}
 inline void lcd_place_on_piezo() {}
 inline void lcd_menu(const char*, uint8_t, uint8_t, uint8_t) {}

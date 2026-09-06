@@ -228,7 +228,7 @@ static bool grab_under_flash_state(bool flash_on, uint16_t* out_buf,
 }
 
 // ─── Flash/No-Flash differential capture (default on all targets) ──
-bool multispectral_capture_dual_shot(ColorFeatures& out) {
+bool multispectral_capture_dual_shot(ColorFeatures& out, uint32_t* fg_pixels_out) {
     if (!is_camera_ready()) {
         Serial.println("[MS] dual-shot: camera not ready.");
         return false;
@@ -276,6 +276,7 @@ bool multispectral_capture_dual_shot(ColorFeatures& out) {
     out = HueExtractor::process_differential(s_ss_buf, s_ss_amb_buf, fw, fh,
                                              MS_CM_PER_PIXEL_FULL * (float)(1 << MS_DECODE_SCALE),
                                              &fg_px, &bbox_w, &bbox_h);
+    if (fg_pixels_out) *fg_pixels_out = fg_px;
 
     Serial.printf("[MS] dual-shot OK: %ux%u, hue=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f] vol=%.0f rgb=(%.0f,%.0f,%.0f) amb=(%.0f,%.0f,%.0f) fg=%u bbox=%dx%d\n",
                   fw, fh,

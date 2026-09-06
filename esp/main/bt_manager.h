@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "sci_32d.h"
+#include "dual_latent.h"
 #include "fruit_store.h"
 #include "multispectral.h"
 
@@ -23,7 +24,7 @@ enum SystemMode {
 
 struct ScanConfig {
     char target_fruit[32];
-    uint8_t target_tap_count;        // taps per inference run (1..7, 0 = default 3)
+    uint8_t target_tap_count;        // taps per inference run (2..7, 0 = default 3)
     float override_volume_cm3;
     bool use_volume_override;
 };
@@ -139,7 +140,7 @@ public:
     void notify_ms_debug_diff(const ColorFeatures& f, const DualShotDebugInfo& info);
     void notify_ms_debug_diff_meta(const DualShotDebugInfo& info);
     void notify_status_change(const char* status_msg);
-    void notify_debug_state(const float state[VECTOR_DIMENSIONS], float peak_adc);
+    void notify_debug_state(const DualTapCoords& coords, float peak_adc);
     void notify_scan_config();
     void notify_models();
     void send_raw_jpeg_stream(const uint8_t* jpeg_buf, size_t jpeg_len);
@@ -216,13 +217,14 @@ public:
     void set_mode(SystemMode m) { current_mode = m; }
     const ScanConfig& get_config() const { return current_config; }
 
-    // Configurable N-tap consensus (default 3, clamped 1..MAX_CONSENSUS_TAPS).
+    // Configurable N-tap consensus (default 3, clamped 2..MAX_DUAL_TAPS —
+    // a single tap is not a consensus run).
     uint8_t get_target_tap_count() const {
         uint8_t n = current_config.target_tap_count
                         ? current_config.target_tap_count
                         : 3;
-        if (n < 1) n = 1;
-        if (n > MAX_CONSENSUS_TAPS) n = MAX_CONSENSUS_TAPS;
+        if (n < 2) n = 2;
+        if (n > MAX_DUAL_TAPS) n = MAX_DUAL_TAPS;
         return n;
     }
     bool has_volume_override() const { return current_config.use_volume_override; }

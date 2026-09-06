@@ -315,6 +315,27 @@ void lcd_place_on_piezo()   { lcd_lock_take(); set_base("Put fruit on", "piezo +
 void lcd_connected()        { lcd_lock_take(); flash("BLE", "Connected", CUE_HOLD_MS); lcd_lock_give(); }
 void lcd_disconnected()     { lcd_lock_take(); flash("BLE lost", nullptr, CUE_HOLD_MS); lcd_lock_give(); }
 void lcd_tap_ok()           { lcd_lock_take(); finish_cycle("Tap captured!", "Analyzing...", RESULT_HOLD_MS, Anim::SPINNER); lcd_lock_give(); }
+// Persistent consensus progress: shows "TAP k/n OK" and holds it until the
+// next tap lands (no auto-revert), so the user always sees how many taps are
+// done. Unlike a fading flash, this line survives the bus-quiet re-arm.
+void lcd_tap_progress(uint8_t k, uint8_t n) {
+  lcd_lock_take();
+  char l1[17];
+  snprintf(l1, sizeof(l1), "TAP %u/%u OK", (unsigned)k, (unsigned)n);
+  l1[16] = '\0';
+  set_base(l1, "Put fruit on");
+  lcd_lock_give();
+}
+// Transient cue for the FOLLOW-UP taps in a multi-tap run: flashes the
+// "tap again" hint on top of the held progress line.
+void lcd_tap_again(uint8_t k, uint8_t n) {
+  lcd_lock_take();
+  char l1[17];
+  snprintf(l1, sizeof(l1), "TAP %u/%u OK", (unsigned)k, (unsigned)n);
+  l1[16] = '\0';
+  set_screen(l1, "TAP AGAIN", CUE_HOLD_MS);
+  lcd_lock_give();
+}
 void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100) {
   lcd_lock_take();
   char l1[17];
@@ -328,4 +349,5 @@ void lcd_result(const char* decision, bool is_anomaly, float confidence_0_100) {
 void lcd_timeout()          { lcd_lock_take(); finish_cycle("No tap", "SCAN again", RESULT_HOLD_MS); lcd_lock_give(); }
 void lcd_placement_timeout(){ lcd_lock_take(); finish_cycle("Waiting...", "Timed out", RESULT_HOLD_MS); lcd_lock_give(); }
 void lcd_camera_error()     { lcd_lock_take(); finish_cycle("Camera error!", "SCAN to retry", RESULT_HOLD_MS); lcd_lock_give(); }
+void lcd_no_fruit()         { lcd_lock_take(); finish_cycle("No fruit found!", "Hold up + SCAN", RESULT_HOLD_MS); lcd_lock_give(); }
 #endif

@@ -1,5 +1,6 @@
 #include "bt_manager.h"
 #include "camera_handler.h"
+#include "dual_latent.h"
 #include "esp_camera.h"
 #include "extract_hues.h"
 #include "fruit_store.h"
@@ -37,11 +38,15 @@ uint32_t scan_start_at = 0;            // millis() when the cam scan should run
 ColorFeatures ms_features_pending;     // vision snapshot taken at cam scan
 bool     have_ms_features = false;
 
-// Multi-tap consensus: each tap contributes a block-normalized state vector;
-// collected taps are fused by median posterior in evaluate_fruit_ntap_32d.
-float    tap_states[MAX_CONSENSUS_TAPS][32];
+// Multi-tap consensus: each tap contributes the raw per-tap acoustic features
+// that feed the Dual-Latent modality engine. The Dual median-aggregates the
+// manifolds first then makes a single decision (evaluate_fruit_dual), and a
+// per-tap debug notify streams the exact dual-latent coords over BLE.
+// (Repurposed: the legacy 32-dim state block is gone.)
+AcousticFeatures tap_acoustics[MAX_DUAL_TAPS];
 uint8_t  current_tap_idx = 0;          // how many taps collected so far
 uint8_t  total_taps = 1;               // target from BLE ScanConfig (clamped)
+uint32_t tap_debounce_until_ms = 0;    // suppress ringing residue after a tap
 
 // ─── Buttons ──────────────────────────────────────────────────────
 struct PhysicalButton {
@@ -90,6 +95,10 @@ static void IRAM_ATTR cancel_button_isr() { s_isr_cancel = true; }
 static void start_acoustic_listening(float threshold) {
   lcd_set_quiet(true);
   acoustic_sensor.arm(threshold, ARM_SETTLE_MS * 1000UL);
+  Serial.printf("[Guide] LISTENING (taps %u/%u) — waiting for a fresh tap "
+                "(flush + settle %lu ms)\n",
+                (unsigned)current_tap_idx, (unsigned)total_taps,
+                (unsigned long)ARM_SETTLE_MS);
 }
 
 // Idempotent: only announces when something was actually running.
@@ -203,6 +212,11 @@ static void handle_laptop_capture_image_only() {
 }
 
 // Raw waveform debug capture: N windows streamed back-to-back over BLE.
+// Per-JPEG BLE pump deadline for the ms_debug / ms_debug_diff streams: the loop
+// exits early when the transfer completes, so this is only the safety ceiling
+// for a slow/large JPEG (a 60KB frame at typical BLE throughput needs >3s, and
+// cutting it short lets the next begin_transfer() wipe it mid-send).
+constexpr uint32_t MS_JPEG_PUMP_MS = 15000;
 static void run_raw_capture() {
   const uint8_t WINDOWS = bt.get_raw_capture_windows();
   constexpr uint32_t PUMP_BUDGET_MS = 120;   // BLE pump time per window
@@ -432,16 +446,46 @@ void loop() {
       (mode == MODE_INFERENCE || mode == MODE_DEBUG) &&
       !s_menu_open;                      // selector owns the buttons meanwhile
 
-  // Nothing to classify without an active model — point at the selector.
-  // MODE_DEBUG skips this gate: it records vectors, classification optional.
-  if (guide_trigger && !store.has_model() &&
-      bt.get_mode() != MODE_DEBUG) {
-    guide_trigger = false;
-    scan_requested = false;
-    Serial.println("[Guide] No active model — hold START to select one");
-    lcd_flash("No model!", "HOLD START");
-    bt.notify_status_change("no_model");
+  // NOTE: the old "no active 32D model -> abort" gate is GONE. The inference
+  // path always scores with the Dual-Latent modality engine
+  // (evaluate_fruit_dual). With no uploaded blob the compiled-in defaults run;
+  // a loaded DualModelWire blob (LCD/app "model") switches the params in.
+  // A model is optional — it never blocks a scan.
+
+  // Active-modality gate for the optical phase: MODALITY_OPTICS/DUAL enable
+  // the camera; the compiled-in MODALITY_ACOUSTIC (optics w=0) skips it.
+  DualLatentParams run_params = dual_params_default();
+  if (const DualModelWire* m = store.get_active_model_ptr()) {
+    run_params = dual_params_decode(*m);
   }
+  const bool optics_enabled = run_params.modality != MODALITY_ACOUSTIC;
+
+  // Shared arm step, reached by BOTH the optics path (after a successful cam
+  // scan) and the acoustics-only path (no camera beat at all): DEBUG auto-arms
+  // the piezo; inference waits for the second press with the fruit on it.
+  auto arm_run = [&]() {
+    if (bt.get_mode() == MODE_DEBUG) {
+      total_taps = bt.get_target_tap_count();
+      current_tap_idx = 0;
+      start_acoustic_listening(dynamic_adc_threshold);
+      tap_capture_running = true;
+      tap_arm_start_ms = current_time;
+      Serial.printf("[Guide] DEBUG: auto-armed piezo — TAP NOW (%u taps)\n",
+                    total_taps);
+      bt.notify_status_change("acoustic_armed");
+      led_pet_armed();
+    } else {
+      total_taps = bt.get_target_tap_count();
+      current_tap_idx = 0;
+      awaiting_placement = true;
+      placement_start_at = current_time;
+      led_pet_place_on_piezo();
+      lcd_place_on_piezo();
+      Serial.printf("[Guide] PLACE ON PIEZO — %u taps, press SCAN when ready\n",
+                    total_taps);
+      bt.notify_status_change("place_on_piezo");
+    }
+  };
 
   // Step A — placement confirmed: second press arms the piezo.
   if (guide_trigger && awaiting_placement) {
@@ -457,49 +501,61 @@ void loop() {
     bt.notify_status_change("acoustic_armed");
   }
 
-  // Phase 1 — hold the fruit in front of the camera, then scan.
-  if (guide_trigger && !tap_capture_running &&
-      !awaiting_placement && scan_start_at == 0 && is_camera_ready()) {
-    led_pet_place_fruit();
-    lcd_place_fruit();
-    Serial.println("[Guide] PLACE FRUIT — hold fruit in front of camera...");
-    scan_start_at = current_time + PLACE_FRUIT_HOLD_MS;
+  // Phase 1 — optics-enabled runs hold the fruit in front of the camera, then
+  // scan (Phase 2). Acoustics-only skips the camera beat and arms directly —
+  // the fruit goes straight on the piezo (or DEBUG auto-arms), so the optical
+  // phase is NEVER run for an acoustics-only model.
+  if (guide_trigger && !tap_capture_running && !awaiting_placement &&
+      scan_start_at == 0) {
+    if (optics_enabled && is_camera_ready()) {
+      led_pet_place_fruit();
+      lcd_place_fruit();
+      Serial.println("[Guide] PLACE FRUIT — hold fruit in front of camera...");
+      scan_start_at = current_time + PLACE_FRUIT_HOLD_MS;
+    } else if (!optics_enabled) {
+      guide_trigger = false;
+      scan_requested = false;
+      // Neutral vision stub keeps the engine's volume/abbott term at the
+      // bench-calibrated default for the acoustic manifold.
+      memset(&ms_features_pending, 0, sizeof(ms_features_pending));
+      ms_features_pending.volume_cm3 = VOLUME_DEFAULT_CM3;
+      have_ms_features = true;
+      arm_run();
+    }
+    // optics_enabled without a ready camera: leave the trigger pending; the
+    // camera becoming ready (or CANCEL) resolves it.
   }
 
-  // Phase 2 — multispectral scan (ambient + R/G/B flashes).
+  // Phase 2 — the optical phase runs ONLY when the active modality enables
+  // optics (MODALITY_OPTICS / MODALITY_DUAL); acoustics-only never reaches
+  // here (Phase 1 armed the run directly). When optics runs, a confident
+  // foveal foreground (fg_px >= MS_FOVEAL_FG_MIN) is required — fruit
+  // detection FALSE cancels the whole run: no piezo arm, no result.
   if (scan_start_at != 0 && current_time >= scan_start_at) {
     scan_start_at = 0;
     scan_requested = false;              // trigger consumed by the scan
-    ColorFeatures c_f;
-    if (multispectral_capture_dual_shot(c_f)) {
-      ms_features_pending = c_f;         // kept for the tap classifier below
-      have_ms_features = true;
-      if (bt.get_mode() == MODE_DEBUG) {
-        // Debug mode: skip second-press wait — auto-arm piezo immediately
-        // so the BLE connection doesn't drop before we can arm.
-        start_acoustic_listening(dynamic_adc_threshold);
-        tap_capture_running = true;
-        tap_arm_start_ms = current_time;
-        Serial.println("[Guide] DEBUG: auto-armed piezo — TAP NOW");
-        bt.notify_status_change("acoustic_armed");
-        led_pet_armed();
+
+    uint32_t fg_px = 0;
+    bool proceed = false;
+    if (multispectral_capture_dual_shot(ms_features_pending, &fg_px)) {
+      if (fg_px >= MS_FOVEAL_FG_MIN) {
+        have_ms_features = true;
+        proceed = true;
       } else {
-        // Multi-tap consensus: read the target tap count from BLE ScanConfig
-        // (clamped 1..7). A run-wide volume override replaces the
-        // camera-derived estimate for every tap of this run.
-        total_taps = bt.get_target_tap_count();
-        current_tap_idx = 0;
-        awaiting_placement = true;
-        placement_start_at = current_time;
-        led_pet_place_on_piezo();
-        lcd_place_on_piezo();
-        Serial.printf("[Guide] PLACE ON PIEZO — %u tap%s, press SCAN when ready\n",
-                      total_taps, total_taps == 1 ? "" : "s");
-        bt.notify_status_change("place_on_piezo");
+        // Fruit-detection false -> cancel: no piezo arm, no result.
+        Serial.printf("[Guide] FRUIT NOT DETECTED (fg=%u px < %u) — run cancelled\n",
+                      fg_px, MS_FOVEAL_FG_MIN);
+        bt.notify_status_change("fruit_not_detected");
+        led_pet_camera_error();
+        lcd_no_fruit();
       }
     } else {
       bt.notify_status_change("camera_error");
       lcd_camera_error();
+    }
+
+    if (proceed) {
+      arm_run();
     }
   }
 
@@ -517,6 +573,19 @@ void loop() {
     lcd_timeout();
   }
 
+  if (tap_capture_running && acoustic_sensor.is_data_ready() &&
+      current_time < tap_debounce_until_ms) {
+    // Ringing residue from the previous tap inside the cooldown window: it is
+    // NOT a new physical impact. Flush + re-arm clean so the NEXT data-ready
+    // can only come from a fresh threshold crossing after settle. Logged so
+    // the cooldown is observable, not silent.
+    Serial.printf("[Guide] residue within cooldown %u ms — discarded, "
+                  "re-armed clean for a fresh crossing\n",
+                  (unsigned)TAP_MIN_INTERVAL_MS);
+    start_acoustic_listening(dynamic_adc_threshold);
+    tap_arm_start_ms = current_time;
+  }
+
   if (tap_capture_running && acoustic_sensor.is_data_ready()) {
     AcousticFeatures features = acoustic_sensor.get_latest_features();
     if (features.impact_amplitude < MIN_TAP_PEAK) {
@@ -525,69 +594,80 @@ void loop() {
                     features.impact_amplitude);
       start_acoustic_listening(dynamic_adc_threshold);
     } else {
-      Serial.printf("[Guide] TAP %u/%u DETECTED\n", current_tap_idx + 1,
-                    total_taps);
+      Serial.printf("[Guide] TAP %u/%u DETECTED (since-arm %lu ms)\n",
+                    current_tap_idx + 1, total_taps,
+                    (unsigned long)(current_time - tap_arm_start_ms));
       led_pet_tap_ok();
 
       // Apply a run-wide volume override (BLE ScanConfig) if present.
       if (bt.has_volume_override()) {
         ms_features_pending.volume_cm3 = bt.get_override_volume_cm3();
       }
-      assemble_state_32d(tap_states[current_tap_idx], ms_features_pending,
-                         features);                    // block-norm 32-D
-      bt.notify_debug_state(tap_states[current_tap_idx],
-                            features.impact_amplitude);
-      current_tap_idx++;
+      tap_acoustics[current_tap_idx] = features;       // Dual-Latent per-tap input
 
-      const Fruit32D *model = store.get_active_model_ptr();
+      // Dual-native per-tap debug payload (repurposed from the 32-dim block):
+      // the exact real-manifold coords + sigmoid latents this tap contributes,
+      // computed with the same math the engine aggregates. With a model loaded
+      // the blob's params drive the coords; otherwise the compiled defaults.
+      DualLatentParams tap_params = dual_params_default();
+      if (const DualModelWire* m = store.get_active_model_ptr()) {
+        tap_params = dual_params_decode(*m);
+      }
+      const float vol_norm =
+          dual_volume_norm(tap_params, ms_features_pending.volume_cm3);
+      DualTapCoords coords = dual_tap_coords(tap_params, features, vol_norm);
+      bt.notify_debug_state(coords, features.impact_amplitude);
+      current_tap_idx++;
+      tap_debounce_until_ms = current_time + TAP_MIN_INTERVAL_MS;
 
       if (bt.get_mode() == MODE_DEBUG) {
-        // Debug mode: always record raw waveform; classify only
-        // if a model happens to be loaded.
+        // Repurposed DEBUG mode: the tap STREAMS its raw waveform for capture
+        // (data collection), then the SAME dual consensus runs below — DEBUG
+        // is the dual system's data-collection/inspection mode, not a 32D one.
         uint16_t raw_adc[512];
         uint16_t peak_adc;
         acoustic_sensor.capture_sampler_raw_window(raw_adc, &peak_adc);
         bt.send_raw_acoustic_waveform(raw_adc, peak_adc);
-        if (model) {
-          BiologicalStatus status =
-              evaluate_fruit_ntap_32d(tap_states, current_tap_idx, *model);
-          bt.notify_scan_result(status);
-        }
-        bt.notify_status_change("debug_captured");
-        lcd_flash("Recorded", nullptr);
-        tap_capture_running = false;
-        current_tap_idx = 0;
-        have_ms_features = false;
-      } else if (!model) {
-        Serial.println("[Guide] No active model — run aborted");
-        bt.notify_status_change("no_model");
-        led_pet_timeout();
-        tap_capture_running = false;
-        current_tap_idx = 0;
-        have_ms_features = false;
-      } else if (current_tap_idx < total_taps) {
-        // Consensus run — collect more taps. Re-arm the piezo and show
-        // progress; the vision snapshot stays unchanged from the cam scan.
+      }
+
+      if (current_tap_idx < total_taps) {
+        // Consensus run — collect more taps. Re-arm the piezo; the vision
+        // snapshot stays unchanged from the cam scan. Persistent progress:
+        // the "TAP k/N OK" line is held as the base (survives the bus-quiet
+        // re-arm), and a short "TAP AGAIN" cue flashes on top of it.
         Serial.printf("[Guide] %u/%u — TAP AGAIN\n", current_tap_idx,
                       total_taps);
-        char line1[16];
-        snprintf(line1, sizeof(line1), "TAP %u/%u OK", current_tap_idx,
-                 total_taps);
-        lcd_flash(line1, "TAP AGAIN");
+        lcd_tap_progress(current_tap_idx, total_taps);
+        lcd_tap_again(current_tap_idx, total_taps);
         start_acoustic_listening(dynamic_adc_threshold);
         tap_capture_running = true;
         tap_arm_start_ms = current_time;
       } else {
-        // Final tap: fuse all collected states by median posterior.
-        BiologicalStatus status =
-            evaluate_fruit_ntap_32d(tap_states, total_taps, *model);
+        // Final tap: acknowledge it, then classify with the Dual-Latent
+        // modality engine (median-aggregated per-tap manifolds -> single
+        // decision). A loaded DualModelWire blob controls the params (logs
+        // src=blob); with no model the compiled-in defaults run (logs
+        // src=default).
+        lcd_tap_progress(current_tap_idx, total_taps);
+        BiologicalStatus status;
+        if (const DualModelWire* m = store.get_active_model_ptr()) {
+          status = evaluate_fruit_dual(dual_params_decode(*m), tap_acoustics,
+                                       total_taps, ms_features_pending);
+        } else {
+          status = evaluate_fruit_dual(tap_acoustics, total_taps,
+                                       ms_features_pending);
+        }
         bt.notify_scan_result(status);
         led_pet_result(status.primary_decision, status.is_anomaly);
         // LCD meter uses the DISPLAY-ONLY degaussed confidence so a decisive
         // result doesn't render as a flat full bar (raw ~100%). The decision
         // and BLE-published posterior are untouched.
         lcd_result(status.primary_decision, status.is_anomaly,
-                   display_confidence_32d(status));
+                   display_confidence(status));
+        if (bt.get_mode() == MODE_DEBUG) {
+          bt.notify_status_change("debug_captured");
+          lcd_flash("Recorded", nullptr);
+        }
         tap_capture_running = false;
         current_tap_idx = 0;
         have_ms_features = false;
@@ -642,7 +722,7 @@ void loop() {
           release_camera_frame(fb);
           // Pump until this JPEG finishes streaming before starting the
           // next, otherwise begin_transfer() wipes the buffer mid-send.
-          uint32_t pump_end = millis() + 3000;
+          uint32_t pump_end = millis() + MS_JPEG_PUMP_MS;
           while (bt.is_transfer_active() && millis() < pump_end) {
             bt.service_transfer();
             delay(5);
@@ -681,7 +761,7 @@ void loop() {
         // Stream ambient, pump to completion, then F1, then F2.
         if (d_amb) {
           bt.send_ms_debug_jpeg(d_amb->buf, d_amb->len);
-          uint32_t pump_end = millis() + 3000;
+          uint32_t pump_end = millis() + MS_JPEG_PUMP_MS;
           while (bt.is_transfer_active() && millis() < pump_end) {
             bt.service_transfer();
             delay(5);
@@ -690,7 +770,7 @@ void loop() {
         }
         if (d_fsh) {
           bt.send_ms_debug_jpeg(d_fsh->buf, d_fsh->len);
-          uint32_t pump_end = millis() + 3000;
+          uint32_t pump_end = millis() + MS_JPEG_PUMP_MS;
           while (bt.is_transfer_active() && millis() < pump_end) {
             bt.service_transfer();
             delay(5);
@@ -699,7 +779,7 @@ void loop() {
         }
         if (d_f2) {
           bt.send_ms_debug_jpeg(d_f2->buf, d_f2->len);
-          uint32_t pump_end = millis() + 3000;
+          uint32_t pump_end = millis() + MS_JPEG_PUMP_MS;
           while (bt.is_transfer_active() && millis() < pump_end) {
             bt.service_transfer();
             delay(5);
