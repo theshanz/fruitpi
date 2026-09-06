@@ -31,6 +31,13 @@ struct AcousticFeatures {
                               // on this exact estimator).
     float peak_abs;           // max |raw ADC| over the window — force/amplitude
                               // cue for the BETA*ln(peak) de-coating term.
+    float stft_t1_decay;      // = stft_grid[1*4 + 2] — the prominent early-decay
+                              // STFT cell (T1 time slice, 500..850 Hz band),
+                              // contrast-normalized 0..1. Exposed explicitly so
+                              // the STFT-acoustic hook (acoustic_feature_mode==1)
+                              // and future models can consume it directly.
+                              // Faithful to stft_grid (identical value read-back)
+                              // so mode-0 legacy parity is never affected.
 };
 
 enum SamplingState {

@@ -970,6 +970,7 @@ void BTManager::notify_debug_state(const DualTapCoords& coords, float peak_adc)
     doc["r_mom"] = roundf(coords.r_mom * 1000.0f) / 1000.0f;
     doc["q_spec"] = roundf(coords.q_spec * 1000.0f) / 1000.0f;
     doc["q_mom"] = roundf(coords.q_mom * 1000.0f) / 1000.0f;
+    doc["stft_t1"] = roundf(coords.stft_t1 * 1000.0f) / 1000.0f;
 
     char output[256];
     size_t n = serializeJson(doc, output, sizeof(output));

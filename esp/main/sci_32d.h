@@ -50,7 +50,17 @@ struct BiologicalStatus {
 //   112     reserved2_pad            (must be zero)
 //   113..114 min_peak_adc            (u16 LE tap-quality amplitude floor; 0 =
 //                                    unspecified -> DUAL_DEFAULT_MIN_PEAK_ADC)
-//   115..851 reserved2[737]          (must be zero)
+//   115     reserved2_tail0          (must be zero; keeps offset 116 for the
+//                                    feature-mode byte below)
+//   116     acoustic_feature_mode    (0 = Standard r_spec [Default]; backward
+//                                    compatible exactly with pre-hook blobs.
+//                                    1 = STFT-enhanced AcousticFeatures branch,
+//                                    blends the early-decay STFT T1 cell)
+//   117..119 reserved2_tail[3]       (must be zero)
+//   120..123 stft_t1_prior           (f32 LE decision midpoint on the STFT T1
+//                                    early-decay coordinate; only read when
+//                                    acoustic_feature_mode == 1)
+//   124..851 reserved2[728]          (must be zero)
 struct __attribute__((packed)) DualModelWire {
     char    fruit_name[32];
     uint32_t magic;
@@ -75,9 +85,20 @@ struct __attribute__((packed)) DualModelWire {
     uint8_t  reserved2_pad;           // 112
     uint8_t  min_peak_adc_lo;         // 113 (u16 LE)
     uint8_t  min_peak_adc_hi;         // 114
-    uint8_t  reserved2[737];          // 115..851
+    uint8_t  reserved2_tail0;         // 115 (must be zero)
+    uint8_t  acoustic_feature_mode;   // 116 (0 Standard / 1 STFT-enhanced)
+    uint8_t  reserved2_tail[3];       // 117..119 (must be zero)
+    float    stft_t1_prior;           // 120..123 (f32 LE)
+    uint8_t  reserved2[728];          // 124..851
 };
 static_assert(sizeof(DualModelWire) == 852, "DualModelWire must be 852 bytes");
+
+// Acoustic feature hook modes (see acoustic_feature_mode @116). True backward
+// compatibility: mode 0 runs the exact validated r_spec Dual-Latent engine, so
+// pre-hook blobs (which zero this byte) produce bit-identical results.
+constexpr uint8_t ACOUSTIC_FEATURE_MODE_LEGACY = 0;      // Standard r_spec
+constexpr uint8_t ACOUSTIC_FEATURE_MODE_STFT   = 1;      // r_spec + STFT T1
+constexpr uint8_t ACOUSTIC_FEATURE_MODE_DEFAULT = ACOUSTIC_FEATURE_MODE_LEGACY;
 
 constexpr size_t MODEL_WIRE_BYTES = 852;
 

@@ -144,6 +144,10 @@ DualTapCoords dual_tap_coords(const DualLatentParams& p,
               (abbott + tap.stft_grid[0]);
     c.q_spec = sigmoid(p.alpha * (c.r_spec - p.r0_spec));
     c.q_mom  = sigmoid(p.alpha * (c.r_mom  - p.r0_mom));
+    // STFT T1 early-decay cell (contrast-normalized 0..1): the hook coordinate
+    // for acoustic_feature_mode == 1. Higher T1 band power at 500..850 Hz in the
+    // 14..29 ms slice -> lower ripeness latent (see evaluate_fruit_dual_impl).
+    c.stft_t1 = tap.stft_grid[1 * 4 + 2];
     return c;
 }
 
@@ -167,6 +171,8 @@ DualLatentParams dual_params_default() {
     p.vol23_hi            = DUAL_VOL23_HI;
     for (int c = 0; c < NUM_CLASSES; c++) p.anchors[c] = DUAL_ANCHORS[c];
     p.min_peak_adc = DUAL_DEFAULT_MIN_PEAK_ADC;
+    p.acoustic_feature_mode = ACOUSTIC_FEATURE_MODE_DEFAULT;  // 0 = legacy
+    p.stft_t1_prior = 0.5f;   // unused in mode 0; neutral midpoint if overridden
     return p;
 }
 
@@ -197,12 +203,24 @@ bool dual_wire_valid(const DualModelWire& m) {
     if (m.green_bin_start >= m.green_bin_end || m.green_bin_end > 8)
         return false;
 
-    // Reserved regions must be canonical (all zero).
+    // Reserved regions must be canonical (all zero). The STFT-acoustic hook
+    // bytes (acoustic_feature_mode @116 and stft_t1_prior @120..123) are now
+    // ACTIVE fields, so they are excluded from the zero-check below and
+    // validated explicitly; 115 / 117..119 / 124..851 stay reserved.
     for (size_t i = 0; i < sizeof(m.reserved); i++)
         if (m.reserved[i] != 0) return false;
     if (m.reserved2_pad != 0) return false;
+    if (m.reserved2_tail0 != 0) return false;
+    for (size_t i = 0; i < sizeof(m.reserved2_tail); i++)
+        if (m.reserved2_tail[i] != 0) return false;
     for (size_t i = 0; i < sizeof(m.reserved2); i++)
         if (m.reserved2[i] != 0) return false;
+
+    // Acoustic feature hook: mode must be known; prior finite.
+    if (m.acoustic_feature_mode != ACOUSTIC_FEATURE_MODE_LEGACY &&
+        m.acoustic_feature_mode != ACOUSTIC_FEATURE_MODE_STFT)
+        return false;
+    if (!std::isfinite(m.stft_t1_prior)) return false;
 
     // min_peak_adc: 0 = unspecified (falls back to default), otherwise a valid
     // 12-bit ADC amplitude floor.
@@ -243,6 +261,8 @@ DualLatentParams dual_params_decode(const DualModelWire& m) {
     for (int c = 0; c < NUM_CLASSES; c++) p.anchors[c] = m.anchors[c];
     const uint16_t mp = wire_min_peak_adc(m);
     p.min_peak_adc = mp != 0 ? mp : (uint16_t)DUAL_DEFAULT_MIN_PEAK_ADC;
+    p.acoustic_feature_mode = m.acoustic_feature_mode;
+    p.stft_t1_prior = m.stft_t1_prior;
     return p;
 }
 
@@ -263,10 +283,12 @@ static BiologicalStatus evaluate_fruit_dual_impl(
     // ── Stage 1/2: per-tap real-manifold coordinates ──
     float r_spec[MAX_DUAL_TAPS];
     float r_mom[MAX_DUAL_TAPS];
+    float stft_t1[MAX_DUAL_TAPS];
     for (uint8_t i = 0; i < n_taps; i++) {
         DualTapCoords c = dual_tap_coords(p, taps[i], vol_norm);
         r_spec[i] = c.r_spec;
         r_mom[i] = c.r_mom;
+        stft_t1[i] = c.stft_t1;
     }
 
     // ── Stage 3: order-invariant median aggregation ──
@@ -277,6 +299,20 @@ static BiologicalStatus evaluate_fruit_dual_impl(
     float q_spec = sigmoid(p.alpha * (r_spec_fruit - p.r0_spec));
     float q_mom  = sigmoid(p.alpha * (r_mom_fruit  - p.r0_mom));
     float q_int  = 0.5f * (q_spec + q_mom);
+
+    // ── Stage 4a: optional STFT-enhanced acoustic branch (opt-in only) ──
+    // acoustic_feature_mode == 1 blends the prominent early-decay STFT T1 cell
+    // (tap.stft_grid[1*4+2], contrast-normalized 0..1) into the acoustic latent.
+    // Higher T1 band power at 500..850 Hz in the 14..29 ms slice correlates with
+    // LESS ripeness (the "ripe t=1 band collapse" tell), so q_t1 rises as T1
+    // power falls below the prior. q_spec/q_mom are unchanged; mode 0 (default)
+    // leaves q_int byte-for-byte identical to the pre-hook engine.
+    float t1_fruit = 0.0f;
+    if (p.acoustic_feature_mode == ACOUSTIC_FEATURE_MODE_STFT) {
+        t1_fruit = median_n(stft_t1, n_taps);
+        float q_t1 = sigmoid(p.alpha * (p.stft_t1_prior - t1_fruit));
+        q_int = 0.5f * q_int + 0.5f * q_t1;
+    }
 
     // ── Stage 4b: optics channel (skin-color ripeness) ──
     float q_surf = surface_q(p, vision);
@@ -292,13 +328,24 @@ static BiologicalStatus evaluate_fruit_dual_impl(
     // ── Stage 5: canonical masked 1D metric decision ──
     BiologicalStatus result = decide_latent(p, q);
 
-    Serial.printf("[Dual] modality=%s N=%u r_spec=%.4f r_mom=%.4f "
-                  "q_spec=%.3f q_mom=%.3f q_int=%.3f q_surf=%.3f q=%.3f "
-                  "-> %s (%.1f%%) src=%s mask=0x%02X\n",
-                  modality_name(p.modality), n_taps,
-                  r_spec_fruit, r_mom_fruit, q_spec, q_mom, q_int, q_surf, q,
-                  result.primary_decision, (double)result.confidence,
-                  src, p.active_class_mask);
+    if (p.acoustic_feature_mode == ACOUSTIC_FEATURE_MODE_STFT)
+        Serial.printf("[Dual] modality=%s N=%u r_spec=%.4f r_mom=%.4f "
+                      "stft_t1=%.3f(prior=%.3f) q_spec=%.3f q_mom=%.3f "
+                      "q_int=%.3f q_surf=%.3f q=%.3f -> %s (%.1f%%) src=%s "
+                      "mask=0x%02X feat=STFT\n",
+                      modality_name(p.modality), n_taps,
+                      r_spec_fruit, r_mom_fruit, t1_fruit, p.stft_t1_prior,
+                      q_spec, q_mom, q_int, q_surf, q,
+                      result.primary_decision, (double)result.confidence,
+                      src, p.active_class_mask);
+    else
+        Serial.printf("[Dual] modality=%s N=%u r_spec=%.4f r_mom=%.4f "
+                      "q_spec=%.3f q_mom=%.3f q_int=%.3f q_surf=%.3f q=%.3f "
+                      "-> %s (%.1f%%) src=%s mask=0x%02X\n",
+                      modality_name(p.modality), n_taps,
+                      r_spec_fruit, r_mom_fruit, q_spec, q_mom, q_int, q_surf, q,
+                      result.primary_decision, (double)result.confidence,
+                      src, p.active_class_mask);
 
     return result;
 }

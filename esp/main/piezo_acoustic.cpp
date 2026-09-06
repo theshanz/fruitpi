@@ -722,6 +722,12 @@ void PiezoAcoustic::process_captured_buffer() {
         float psd_mean[STFT_FFT_N / 2 + 1];
         build_stft_grid(centered_c, result.stft_grid, psd_mean);
 
+        // Expose the prominent early-decay STFT cell (T1 time slice, 500..850 Hz
+        // band power) for the optional STFT-acoustic hook. Mirrors stft_grid so
+        // mode-0 (legacy r_spec) parity is unchanged: it is only read when a
+        // model opts in via acoustic_feature_mode == 1.
+        result.stft_t1_decay = result.stft_grid[1 * 4 + 2];
+
         // bio_moments[3] = mean fundamental grid energy (sum over 4 slices
         // normalized by 4) — the assembler scales it by volume^(2/3) to form
         // the abbott stiffness proxy. Normalizing keeps fundamental energy in

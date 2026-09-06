@@ -44,6 +44,13 @@ struct DualLatentParams {
     float   anchors[NUM_CLASSES];
     uint16_t min_peak_adc;           // tap-quality amplitude floor (counts)
                                      // wire @113; 0 on wire -> default
+    uint8_t acoustic_feature_mode;   // 0 = Standard r_spec (legacy, default),
+                                     // 1 = STFT-enhanced with stft_t1 term.
+                                     // wire @116; default = LEGACY so pre-hook
+                                     // blobs run the exact validated engine.
+    float   stft_t1_prior;           // decision midpoint on the STFT T1
+                                     // early-decay coordinate (wire @120), read
+                                     // only when acoustic_feature_mode == 1.
 };
 
 // Compiled-in defaults (config.h) — used when no model blob is active.
@@ -81,6 +88,8 @@ struct DualTapCoords {
     float r_mom;    // real-manifold moment coord
     float q_spec;   // sigmoid spectral latent
     float q_mom;    // sigmoid moment latent
+    float stft_t1;  // STFT T1 early-decay cell (contrast-normalized 0..1),
+                    // tap.stft_grid[1*4+2]; additive debug field (mode 1 hook)
 };
 
 // Volume^(2/3) -> [0,1] normalizer (shared with the engine + debug payload).

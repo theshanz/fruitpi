@@ -32,6 +32,10 @@ static_assert(offsetof(DualModelWire, anchors) == 92,
               "anchors offset must be 92");
 static_assert(offsetof(DualModelWire, min_peak_adc_lo) == 113,
               "min_peak_adc must be at offset 113");
+static_assert(offsetof(DualModelWire, acoustic_feature_mode) == 116,
+              "acoustic_feature_mode must be at offset 116");
+static_assert(offsetof(DualModelWire, stft_t1_prior) == 120,
+              "stft_t1_prior must be at offset 120");
 
 // DISPLAY-ONLY confidence for the LCD. Smooths the posterior toward uniform
 // (Laplace, alpha=0.08) so a decisive result reads ~94% instead of a flat full
