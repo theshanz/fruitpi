@@ -1,0 +1,24 @@
+{
+  "taps_captured": 3,
+  "target": 3,
+  "waves": 0,
+  "wave_file": null,
+  "pkt_stats": {
+    "header": 0,
+    "chunk": 0,
+    "pass_done": 0,
+    "other": 0,
+    "discarded": 0,
+    "finalized": 0
+  },
+  "decision": "UNRIPE",
+  "confidence": 96.15299988,
+  "probabilities": {
+    "unripe": 0.96153003,
+    "ripe": 0.038469948,
+    "overripe": 0,
+    "rotten": 0,
+    "artificially_ripened": 0
+  },
+  "label": "UNRIPE"
+}
