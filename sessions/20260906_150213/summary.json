@@ -1,0 +1,15 @@
+{
+  "taps_captured": 3,
+  "target": 3,
+  "waves": 1,
+  "wave_file": "sessions/20260906_150213/waves.npz",
+  "decision": "PERFECTLY_RIPE",
+  "confidence": 99.96533203,
+  "probabilities": {
+    "unripe": 0.000346711,
+    "ripe": 0.999653339,
+    "overripe": 0,
+    "rotten": 0,
+    "artificially_ripened": 0
+  }
+}

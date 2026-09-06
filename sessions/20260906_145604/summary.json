@@ -1,0 +1,15 @@
+{
+  "taps_captured": 3,
+  "target": 3,
+  "waves": 0,
+  "wave_file": null,
+  "decision": "UNRIPE",
+  "confidence": 90.04872131,
+  "probabilities": {
+    "unripe": 0.900487244,
+    "ripe": 0.099512719,
+    "overripe": 0,
+    "rotten": 0,
+    "artificially_ripened": 0
+  }
+}

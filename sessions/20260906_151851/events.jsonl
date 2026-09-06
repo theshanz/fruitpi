@@ -1,0 +1,4 @@
+{"peak": 0.159999996, "r_spec": -0.74000001, "r_mom": 0.50999999, "q_spec": 0.998000026, "q_mom": 0.88499999, "tap_idx": 1}
+{"peak": 0.123999998, "r_spec": -0.624000013, "r_mom": 0.592000008, "q_spec": 1, "q_mom": 0.953000009, "tap_idx": 2}
+{"peak": 0.086000003, "r_spec": -0.819000006, "r_mom": 0.689999998, "q_spec": 0.995000005, "q_mom": 0.985000014, "tap_idx": 3}
+{"decision": "PERFECTLY_RIPE", "ripeness_index": 0.975839734, "confidence": 99.99165344, "entropy": 0.000867448, "is_anomaly": false, "probabilities": {"unripe": 8.3486e-05, "ripe": 0.999916553, "overripe": 0, "rotten": 0, "artificially_ripened": 0}}
