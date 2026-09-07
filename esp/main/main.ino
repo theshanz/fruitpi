@@ -493,6 +493,14 @@ void loop() {
   // the piezo; inference waits for the second press with the fruit on it.
   auto arm_run = [&]() {
     if (bt.get_mode() == MODE_DEBUG) {
+      // Debug auto-arms with NO camera beat, so it must never reuse optics
+      // captured by a previous inference scan (stale hue from an earlier dual
+      // run would re-enable the contradiction guard / optics blend here).
+      for (int i = 0; i < 8; i++) ms_features_pending.hue_histogram[i] = 0.0f;
+      ms_features_pending.raw_rgb_means[0] = ms_features_pending.raw_rgb_means[1] =
+          ms_features_pending.raw_rgb_means[2] = 0.0f;
+      ms_features_pending.ambient_rgb_means[0] = ms_features_pending.ambient_rgb_means[1] =
+          ms_features_pending.ambient_rgb_means[2] = 0.0f;
       total_taps = bt.get_target_tap_count();
       current_tap_idx = 0;
       start_acoustic_listening(dynamic_adc_threshold);

@@ -1,0 +1,18 @@
+{
+  "taps_captured": 0,
+  "target": 4,
+  "waves": 0,
+  "wave_file": null,
+  "pkt_stats": {
+    "header": 0,
+    "chunk": 0,
+    "pass_done": 0,
+    "other": 0,
+    "discarded": 0,
+    "finalized": 0
+  },
+  "decision": null,
+  "confidence": null,
+  "probabilities": null,
+  "label": "UNRIPE"
+}

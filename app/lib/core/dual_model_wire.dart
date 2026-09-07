@@ -132,4 +132,81 @@ class DualModelWire {
     bd.setFloat32(0, v, Endian.little);
     return [bd.getUint8(0), bd.getUint8(1), bd.getUint8(2), bd.getUint8(3)];
   }
+
+  /// Canonical trained constants (mirrors tests/modelexp/build_dual_model_bin.py
+  /// DEFAULTS — the live banana multimodal v5 config).
+  static const double canonR0Spec = -1.150;
+  static const double canonR0Mom = 100.0;
+  static const double canonAlpha = 12.0;
+  static const double canonBeta = 0.20;
+  static const double canonTau = 0.08;
+  static const double canonWAcoustic = 0.5;
+  static const double canonWOptics = 0.5;
+  static const List<double> canonAnchors = [0.10, 0.85, 1.10, 1.30, 0.10];
+  static const int canonMinPeakAdc = 160;
+  static const int canonFeatMode = 0;
+  static const double canonStftT1Prior = 0.5;
+
+  /// Assemble a full 852-byte DLAT wire from editable parameters (the same
+  /// layout the Python builder emits). Non-DUAL modalities override the
+  /// weights (ACOUSTIC = 1/0, OPTICS = 0/1); DUAL keeps [wAcoustic]/[wOptics].
+  static Uint8List build({
+    required String name,
+    int activeMask = 0x1F,
+    int modality = modalityDual,
+    int greenStart = 5,
+    int greenEnd = 8,
+    double r0Spec = canonR0Spec,
+    double r0Mom = canonR0Mom,
+    double alpha = canonAlpha,
+    double beta = canonBeta,
+    double tau = canonTau,
+    double wAcoustic = canonWAcoustic,
+    double wOptics = canonWOptics,
+    double volLo = 10.0,
+    double volHi = 600.0,
+    double vol23Lo = 4.64,
+    double vol23Hi = 71.13,
+    List<double> anchors = canonAnchors,
+    int minPeakAdc = canonMinPeakAdc,
+    int featMode = canonFeatMode,
+    double stftT1Prior = canonStftT1Prior,
+  }) {
+    final out = Uint8List(wireBytes);
+    final bd = ByteData.sublistView(out);
+    final raw = name.codeUnits.take(31).toList();
+    for (var i = 0; i < 32; i++) out[i] = i < raw.length ? raw[i] : 0;
+    out[32] = 0x44; out[33] = 0x4C; out[34] = 0x41; out[35] = 0x54; // DLAT
+    out[offsetVersion] = 1;
+    out[offsetMask] = activeMask & 0xFF;
+    out[offsetModality] = modality.clamp(0, 2);
+    out[offsetGreenStart] = greenStart & 0xFF;
+    out[offsetGreenEnd] = greenEnd & 0xFF;
+    bd.setFloat32(offsetR0Spec, r0Spec, Endian.little);
+    bd.setFloat32(offsetR0Mom, r0Mom, Endian.little);
+    bd.setFloat32(offsetAlpha, alpha, Endian.little);
+    bd.setFloat32(offsetBeta, beta, Endian.little);
+    bd.setFloat32(offsetTau, tau, Endian.little);
+    final (wa, wo) = switch (modality) {
+      modalityAcoustic => (1.0, 0.0),
+      modalityOptics => (0.0, 1.0),
+      _ => (wAcoustic, wOptics),
+    };
+    bd.setFloat32(offsetWAcoustic, wa, Endian.little);
+    bd.setFloat32(offsetWOptics, wo, Endian.little);
+    bd.setFloat32(offsetVolLo, volLo, Endian.little);
+    bd.setFloat32(offsetVolHi, volHi, Endian.little);
+    bd.setFloat32(offsetVol23Lo, vol23Lo, Endian.little);
+    bd.setFloat32(offsetVol23Hi, vol23Hi, Endian.little);
+    for (var c = 0; c < 5; c++) {
+      final a = c < anchors.length ? anchors[c] : 0.5;
+      bd.setFloat32(offsetAnchors + 4 * c, a, Endian.little);
+    }
+    // 112 reserved2_pad stays 0
+    bd.setUint16(113, minPeakAdc, Endian.little);
+    // 115 reserved2_tail0 stays 0
+    out[116] = featMode & 0xFF;
+    bd.setFloat32(120, stftT1Prior, Endian.little);
+    return out;
+  }
 }

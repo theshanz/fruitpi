@@ -317,9 +317,12 @@ class _DataCollectionScreenState extends State<DataCollectionScreen> {
     setState(() => _saving = false);
     // Wire saved session data into dual-latent training + upload
     try {
+      final enabled = repo.connectedCategories
+          .where(BleProtocol.classLabels.contains)
+          .toList();
       final wire = repo.buildDualWire(
         fruitName: fruit,
-        category: widget.category,
+        enabledLabels: enabled,
         modalityLabel: 'DUAL',
         activeMask: 0x1F,
       );

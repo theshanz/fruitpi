@@ -1,0 +1,10 @@
+{}
+{"peak": 0.108000003, "r_spec": -1.174000025, "r_mom": -0.086000003, "q_spec": 0.547999978, "q_mom": 0, "stft_t1": 0.002, "tap_idx": 1}
+{"peak": 0.108000003, "r_spec": -1.174000025, "r_mom": -0.086000003, "q_spec": 0.547999978, "q_mom": 0, "stft_t1": 0.002, "tap_idx": 2}
+{"peak": 0.162, "r_spec": -1.320000052, "r_mom": -0.072999999, "q_spec": 0.173999995, "q_mom": 0, "stft_t1": 0.004, "tap_idx": 3}
+{"peak": 0.162, "r_spec": -1.320000052, "r_mom": -0.072999999, "q_spec": 0.173999995, "q_mom": 0, "stft_t1": 0.004, "tap_idx": 4}
+{"peak": 0.180000007, "r_spec": -1.330000043, "r_mom": -0.003, "q_spec": 0.157000005, "q_mom": 0, "stft_t1": 0, "tap_idx": 5}
+{"peak": 0.180000007, "r_spec": -1.330000043, "r_mom": -0.003, "q_spec": 0.157000005, "q_mom": 0, "stft_t1": 0, "tap_idx": 6}
+{"peak": 0.136999995, "r_spec": -1.246999979, "r_mom": 0.305000007, "q_spec": 0.333999991, "q_mom": 0, "stft_t1": 0.002, "tap_idx": 7}
+{"peak": 0.136999995, "r_spec": -1.246999979, "r_mom": 0.305000007, "q_spec": 0.333999991, "q_mom": 0, "stft_t1": 0.002, "tap_idx": 8}
+{"decision": "UNRIPE", "ripeness_index": 0.12271329, "confidence": 41.92965698, "entropy": 1.023263931, "is_anomaly": false, "probabilities": {"unripe": 0.419296563, "ripe": 0.16140683, "overripe": 0, "rotten": 0, "artificially_ripened": 0.419296563}}

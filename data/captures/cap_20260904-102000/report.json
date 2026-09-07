@@ -1,0 +1,57 @@
+{
+  "w": 320,
+  "h": 256,
+  "fg_pixels": 3200,
+  "core_pixels": 3200,
+  "snap_pixels": 0,
+  "bbox": {
+    "x": 128,
+    "y": 103,
+    "w": 64,
+    "h": 50
+  },
+  "motion": {
+    "global_px": 3.5502455830414017,
+    "handheld": true,
+    "moving_blocks": 250,
+    "total_blocks": 320
+  },
+  "volume_cm3": 500.0,
+  "chromatic_dispersion": 0.235,
+  "hue_histogram": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.6525,
+    0.3388,
+    0.0087,
+    0.0,
+    0.0
+  ],
+  "raw_rgb_means": [
+    113.6,
+    159.4,
+    90.7
+  ],
+  "ambient_rgb_means": [
+    114.7,
+    162.2,
+    81.3
+  ],
+  "rgb_ratios": [
+    0.312,
+    0.438,
+    0.249
+  ],
+  "cm_per_pixel": 0.2,
+  "timing_ms": {
+    "lock": 24,
+    "ambient_grab": 350,
+    "flash_grab": 542,
+    "flash2_grab": 517,
+    "decode": 2079,
+    "process": 0
+  }
+}

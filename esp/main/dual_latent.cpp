@@ -317,12 +317,23 @@ static BiologicalStatus evaluate_fruit_dual_impl(
     // ── Stage 4b: optics channel (skin-color ripeness) ──
     float q_surf = surface_q(p, vision);
 
+    // Optics are only meaningful when a real capture produced the hue
+    // histogram (normalized, sum ~1). With the camera skipped (acoustics-only
+    // debug), an all-zero histogram makes q_surf read 1.0, so the engine falls
+    // back to the acoustic latent and never lets phantom optics drive the
+    // decision or the contradiction guard.
+    float hue_sum = 0.0f;
+    for (int i = 0; i < 8; i++) hue_sum += vision.hue_histogram[i];
+    const bool optic_ok = hue_sum > 0.5f;
+
     // ── Stage 4c: modality switch combine ──
     float q;
     switch (p.modality) {
         case MODALITY_ACOUSTIC: q = q_int; break;
-        case MODALITY_OPTICS:   q = q_surf; break;
-        default: q = p.w_acoustic * q_int + p.w_optics * q_surf; break;
+        case MODALITY_OPTICS:   q = optic_ok ? q_surf : q_int; break;
+        default: q = optic_ok ? (p.w_acoustic * q_int + p.w_optics * q_surf)
+                              : q_int;
+                  break;
     }
 
     // ── Stage 4d: 2D multimodal contradiction guard (mask-gated) ──
@@ -333,6 +344,7 @@ static BiologicalStatus evaluate_fruit_dual_impl(
     // ARTIFICIALLY_RIPENED see it — shipped blobs use mask 0x03 (bit 4 unset)
     // and follow the exact validated decision path.
     if (p.modality == MODALITY_DUAL &&
+        optic_ok &&
         p.active_class_mask & (1u << 4) &&
         q_surf >= 0.65f && q_int <= 0.40f && (q_surf - q_int) >= 0.35f) {
         BiologicalStatus status;

@@ -1,0 +1,5 @@
+{"peak": 0.061999999, "r_spec": -1.093000054, "r_mom": 0.338, "q_spec": 0.976999998, "q_mom": 0, "stft_t1": 0, "tap_idx": 1}
+{"peak": 0.072999999, "r_spec": -1.103999972, "r_mom": 0.541000009, "q_spec": 0.971000016, "q_mom": 0, "stft_t1": 0, "tap_idx": 2}
+{"peak": 0.072999999, "r_spec": -1.125, "r_mom": 0.363999993, "q_spec": 0.957000017, "q_mom": 0, "stft_t1": 0, "tap_idx": 3}
+{"peak": 0.068999998, "r_spec": -1.062999964, "r_mom": 0.615999997, "q_spec": 0.986999989, "q_mom": 0, "stft_t1": 0.003, "tap_idx": 4}
+{"decision": "PERFECTLY_RIPE", "ripeness_index": 0.487103224, "confidence": 85.54836273, "entropy": 0.41307807, "is_anomaly": false, "probabilities": {"unripe": 0.144516364, "ripe": 0.855483592, "overripe": 0, "rotten": 0, "artificially_ripened": 0}}
