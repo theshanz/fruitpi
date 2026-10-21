@@ -27,6 +27,11 @@ constexpr uint8_t MAX_DUAL_TAPS = 7;
 
 // Runnable parameters decoded from either the wire or the compiled defaults.
 struct DualLatentParams {
+    // The strike site the operator tapped, as the model's per-site table
+    // indexes it.  0xFF = auto: the device picks the site whose anchor the
+    // feature lands nearest to.  An app that knows the site sets it and
+    // gets the exact anchor for it.
+    uint8_t site_id;
     uint8_t modality;              // Modality enum (0 = ACOUSTIC...)
     uint8_t active_class_mask;     // category switches
     uint8_t green_bin_start;

@@ -33,6 +33,21 @@ constexpr uint8_t  LCD_SDA_PIN = 41;  // NOT GPIO1: adjacent to piezo ADC (coupl
 constexpr uint8_t  LCD_SCL_PIN = 38;
 constexpr uint32_t LCD_I2C_HZ  = 50000;
 
+// ─── Active buzzer ─────────────────────────────────────────────────
+// Active = it has its own internal oscillator, so the firmware only GATES
+// POWER: no tone(), no hand-rolled square wave, just a level on the pin.
+// Volume is the LEDC duty cycle — the average voltage the buzzer sees — so a
+// smaller duty is a quieter cue (change the constant, not the waveform).
+//
+// The channel matters: Arduino's ledcSetup maps channel -> timer (chan/2)%4.
+// The camera owns LOW-speed channel 0 / timer 0 (IDF-driven XCLK), so this
+// uses channel 4 -> timer 2 and can never reconfigure the camera's clock.
+constexpr uint8_t  BUZZER_PIN          = 42;
+constexpr uint8_t  BUZZER_PWM_CHANNEL  = 4;
+constexpr uint32_t BUZZER_PWM_FREQ_HZ  = 1000;  // chops the level, not a tone
+constexpr uint8_t  BUZZER_VOLUME_CLICK = 40;    // 0..255 duty — button presses
+constexpr uint8_t  BUZZER_VOLUME_MAIN  = 96;    // 0..255 duty — general cues
+
 // ─── Piezo acoustic sampler ───────────────────────────────────────
 constexpr adc1_channel_t PIEZO_ADC_CHANNEL = ADC1_CHANNEL_1; // GPIO2 on ESP32-S3.
                                      // Keep away from GPIO1/LCD-SDA (ADC coupling).

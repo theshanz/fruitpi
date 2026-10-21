@@ -1,4 +1,5 @@
 #include "bt_manager.h"
+#include "buzzer.h"
 #include "camera_handler.h"
 #include "dual_latent.h"
 #include "esp_camera.h"
@@ -152,6 +153,7 @@ static void start_acoustic_listening(float threshold) {
   // discipline only runs between taps.
   led_indicator_set_held(true);
   camera_set_suspended(true);
+  buzzer_set_muted(true);           // the buzzer is an emitter too
   acoustic_sensor.arm(threshold, ARM_SETTLE_MS * 1000UL);
   Serial.printf("[Guide] LISTENING (taps %u/%u) — waiting for a fresh tap "
                 "(flush + settle %lu ms)\n",
@@ -349,7 +351,8 @@ void setup() {
                   RISING);
   led_indicator_init();
   lcd_display_init();
-  boot_stage("led/lcd");
+  buzzer_init();
+  boot_stage("led/lcd/buzzer");
 
   if (!acoustic_sensor.init()) {
     Serial.println("Failed to initialize Piezo system!");
@@ -374,6 +377,14 @@ void setup() {
     // and the board stays quiet for the piezo.
     Serial.println("[Main] BLE advertising live; camera is lazy (first use).");
   }
+}
+
+// The decoded model's parameters plus the strike site the operator tapped
+// (0xFF = auto: the device picks the site whose anchor the feature lands
+// nearest to).
+static DualLatentParams dual_params_with_site(DualLatentParams p) {
+  p.site_id = bt.get_site_id();
+  return p;
 }
 
 void loop() {
@@ -402,20 +413,29 @@ void loop() {
   lcd_set_quiet(sampler_busy);
   led_indicator_set_held(sampler_busy);
   camera_set_suspended(sampler_busy);
+  buzzer_set_muted(sampler_busy);
   static uint32_t last_state_log_ms = 0;
   if (sampler_busy && current_time - last_state_log_ms > 2000) {
     last_state_log_ms = current_time;
-    Serial.printf("[Quiet] armed: state=%d held=%d cam_susp=%d\n",
+    Serial.printf("[Quiet] armed: state=%d held=%d cam_susp=%d mute=%d\n",
                   (int)acoustic_sensor.get_state(),
-                  (int)led_indicator_is_held(), (int)camera_is_suspended());
+                  (int)led_indicator_is_held(), (int)camera_is_suspended(),
+                  (int)buzzer_is_muted());
   }
 
   /// ── 1. BLE connection cues ────────────────────────────────────────
   static bool last_ble_connected = false;
   bool now_connected = bt.is_connected();
   if (now_connected != last_ble_connected) {
-    if (now_connected) { led_pet_connected(); lcd_connected(); }
-    else               { led_pet_disconnected(); lcd_disconnected(); }
+    if (now_connected) {
+      led_pet_connected();
+      lcd_connected();
+      buzzer_double(30);
+    } else {
+      led_pet_disconnected();
+      lcd_disconnected();
+      buzzer_beep(60);
+    }
     last_ble_connected = now_connected;
   }
 
@@ -440,6 +460,7 @@ void loop() {
   if (btn_now && !btn_prev) {
     btn_press_ms = current_time;
     btn_hold_done = false;
+    buzzer_click();
   }
   if (btn_now && !btn_hold_done &&
       current_time - btn_press_ms >= MENU_HOLD_MS) {
@@ -525,6 +546,7 @@ void loop() {
       if (!cancel_press_confirmed) {
         cancel_press_confirmed = true;
         cancel_press_ms = current_time;   // the press starts NOW
+        buzzer_click();
       }
       if (!cancel_hold_done &&
           current_time - cancel_press_ms >= MENU_HOLD_MS) {
@@ -625,6 +647,9 @@ void loop() {
   if (const DualModelWire* m = store.get_active_model_ptr()) {
     run_params = dual_params_decode(*m);
   }
+  // The strike site the operator tapped (the app's choice; 0xFF = auto, so
+  // the device picks the site whose anchor the feature lands nearest to).
+  run_params.site_id = bt.get_site_id();
   const bool optics_enabled = run_params.modality != MODALITY_ACOUSTIC;
 
   // Shared arm step, reached by BOTH the optics path (after a successful cam
@@ -845,7 +870,7 @@ void loop() {
         lcd_tap_progress(current_tap_idx, total_taps);
         BiologicalStatus status;
         if (const DualModelWire* m = store.get_active_model_ptr()) {
-          status = evaluate_fruit_dual(dual_params_decode(*m), tap_acoustics,
+          status = evaluate_fruit_dual(dual_params_with_site(dual_params_decode(*m)), tap_acoustics,
                                        total_taps, ms_features_pending);
         } else {
           status = evaluate_fruit_dual(tap_acoustics, total_taps,
@@ -853,6 +878,12 @@ void loop() {
         }
         bt.notify_scan_result(status);
         led_pet_result(status.primary_decision, status.is_anomaly);
+        // The sampler auto-disarmed above, but the quiet flag is only
+        // refreshed at the top of the next loop(): the cue is offered while
+        // still muted and the buzzer flushes it there — same deferral the
+        // LED overlay uses. It can never land inside an armed window.
+        if (status.is_anomaly) buzzer_error(90);
+        else                   buzzer_double(45);
         // LCD meter uses the DISPLAY-ONLY degaussed confidence so a decisive
         // result doesn't render as a flat full bar (raw ~100%). The decision
         // and BLE-published posterior are untouched.
@@ -1133,6 +1164,7 @@ void loop() {
     }
   }
 
+  buzzer_update();
   led_indicator_update();
   lcd_display_update();
   delay(10);

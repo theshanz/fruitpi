@@ -215,6 +215,10 @@ class BleService {
 
   Future<void> cancel() async => sendCommand(BleProtocol.cmdCancel());
 
+  /// The strike site the operator tapped (255 = auto).
+  Future<void> setSite(int site) async =>
+      sendCommand(BleProtocol.cmdSetSite(site));
+
   // ── Data-collection commands ───────────────────────────────────────
   Future<bool> setDataCollectionMode() async =>
       sendCommand(BleProtocol.cmdMode('data_collection'));

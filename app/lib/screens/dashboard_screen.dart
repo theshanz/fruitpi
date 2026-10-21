@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/cozy_palette.dart';
+import '../core/dual_model_wire.dart';
 import '../core/model_vault.dart';
 import '../core/protocol.dart';
 import '../services/ble_service.dart';
@@ -141,6 +142,26 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
   // container volume override + N-tap consensus count.
   double _scanVolumeCm3 = 350.0;
   int _scanTapCount = 3;
+
+  // The strike site the operator tapped.  255 = auto: the device picks the
+  // site whose anchor the measured feature lands nearest to.  The sites come
+  // from the ACTIVE MODEL's per-site table, so a model that was never
+  // measured on a site simply does not offer it.
+  static const int kAutoSite = 255;
+  int _siteId = kAutoSite;
+
+  List<DualModelSite> get _availableSites {
+    final name = widget.bleService.activeModel.value;
+    if (name == null || name.isEmpty) return const [];
+    final bin = ModelVault.get(name);
+    if (bin == null) return const [];
+    return DualModelWire.siteTable(bin);
+  }
+
+  void _setSite(int id) {
+    setState(() => _siteId = id);
+    widget.bleService.setSite(id);
+  }
 
   void _setScanVolume(double v) {
     setState(() => _scanVolumeCm3 = v);
@@ -641,7 +662,90 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
               tapCount: _scanTapCount,
               onChanged: _setScanTapCount,
             ),
+            const SizedBox(height: 16),
+            _siteSelector(),
           ]),
+    );
+  }
+
+  /// The strike-site picker.  "auto" is the default: the device matches the
+  /// measured feature against the model's per-site anchors itself.  Choosing
+  /// a site uses that site's anchor exactly, which is worth about one
+  /// boundary session on the Mango corpus (9/11 -> 9/9).
+  Widget _siteSelector() {
+    final sites = _availableSites;
+    final auto = _siteId == kAutoSite || _siteId >= 255;
+    final known = sites.any((s) => s.id == _siteId);
+    if (!auto && !known) {
+      // The model changed under us: fall back to auto rather than sending a
+      // site the active model does not have.
+      _siteId = kAutoSite;
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SectionLabel(title: '// STRIKE SITE'),
+        const SizedBox(height: 4),
+        Text(
+          sites.isEmpty
+              ? 'the active model carries no per-site table - the device picks'
+              : 'which surface you tapped; auto lets the device match it',
+          style: TextStyle(fontSize: 14, color: Cozy.dimGray),
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _siteChip(
+              label: 'AUTO',
+              selected: auto,
+              onTap: () => _setSite(kAutoSite),
+            ),
+            for (final site in sites)
+              _siteChip(
+                label: site.label,
+                selected: !auto && site.id == _siteId,
+                onTap: () => _setSite(site.id),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _siteChip({
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.selectionClick();
+        onTap();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+        decoration: BoxDecoration(
+          color: selected
+              ? _accent.withValues(alpha: 0.85)
+              : Colors.white.withValues(alpha: 0.06),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: selected
+                ? _accent
+                : Colors.white.withValues(alpha: 0.18),
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+            color: selected ? Cozy.deepBg : Cozy.oatmeal,
+          ),
+        ),
+      ),
     );
   }
 

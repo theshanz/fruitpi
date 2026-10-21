@@ -27,6 +27,11 @@ struct ScanConfig {
     uint8_t target_tap_count;        // taps per inference run (2..7, 0 = default 3)
     float override_volume_cm3;
     bool use_volume_override;
+    // The strike site the operator tapped, as the model's per-site table
+    // indexes it.  0xFF = auto: the device picks the site whose anchor the
+    // feature lands nearest to.  The app reads the sites out of the model's
+    // table and offers them in a dropdown, defaulting to auto.
+    uint8_t site_id;
 };
 
 
@@ -229,6 +234,8 @@ public:
     }
     bool has_volume_override() const { return current_config.use_volume_override; }
     float get_override_volume_cm3() const { return current_config.override_volume_cm3; }
+    // The strike site the operator tapped (0xFF = auto).
+    uint8_t get_site_id() const { return current_config.site_id; }
 
     bool is_connected() const { return device_connected; }
 };

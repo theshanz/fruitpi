@@ -210,3 +210,386 @@ class DualModelWire {
     return out;
   }
 }
+
+/// The 19 discriminator features a v2 rule block can use.
+/// Mirrors `DiscFeature` in esp/main/fruit_rule.h.
+class DualDiscFeature {
+  DualDiscFeature._();
+
+  static const int count = 19;
+  static const int shear = 0;
+  static const int rSpec = 1;
+  static const int rMom = 2;
+  static const int entropy = 3;
+  static const int centroid = 4;
+  static const int tail = 5;
+  static const int harmonic = 6;
+  static const int abbott = 7;
+  static const int bioEntropy = 8;
+  static const int damping = 9;
+  static const int stftT1 = 10;
+  static const int peak = 11;
+  static const int green = 12;
+  static const int warm = 13;
+  static const int hueMean = 14;
+  static const int dispersion = 15;
+  static const int hueEntropy = 16;
+  static const int darkSpot = 17;
+  static const int darkMass = 18;
+
+  static const List<String> names = [
+    'shear', 'r_spec', 'r_mom', 'entropy', 'centroid', 'tail', 'harmonic',
+    'abbott', 'bio_entropy', 'damping', 'stft_t1', 'peak', 'green', 'warm',
+    'hue_mean', 'dispersion', 'hue_entropy', 'dark_spot', 'dark_mass',
+  ];
+
+  static const List<String> descriptions = [
+    'FBM-2D shear ratio (median of N taps)',
+    'de-coated shear (median of N taps)',
+    'moment contrast (median of N taps)',
+    'spectral entropy',
+    'temporal centroid',
+    'tail energy',
+    'harmonic absorption',
+    'abbott stiffness',
+    'bio spectral entropy',
+    'dynamic damping',
+    'STFT early-decay T1',
+    'tap amplitude (median of N taps)',
+    'green mass (optics)',
+    'warm mass (optics)',
+    'mean hue (deg)',
+    'chromatic dispersion',
+    'hue-histogram entropy',
+    'black/brown SPOT area fraction',
+    'total dark area fraction',
+  ];
+
+  static String name(int id) =>
+      (id >= 0 && id < names.length) ? names[id] : 'feat$id';
+}
+
+/// The v2 per-fruit RULE BLOCK (728 bytes at wire offset 124).
+///
+/// Layout (mirrors `FruitRuleBlock` in esp/main/fruit_rule.h and the packer
+/// in datacollection/fruit_rules.py):
+///
+///   0  block_version u32      28 slot_feature[8] u8     76 class_lo[5][8] f32
+///   4  slot_mask u32          36 class_slot_mask[5] u8  236 class_hi[5][8] f32
+///   8  temperature f32        41 pad0[3]                396 class_soft[5][8] f32
+///  12  margin f32             44 slot_weight[8] f32      556 override_class u32
+///  16  default_class u32                                  560 override slots/ops
+///  20  anomaly_threshold f32                              564 override values
+///  24  ripeness_gain f32                                 572 reserved[156]
+///
+/// A class score is the weighted MEAN of its band memberships over the slots
+/// it uses; a slot whose feature could not be measured contributes 0 but
+/// still counts in the denominator, so a class that needs a channel we do not
+/// have (e.g. the camera for black spots) cannot win.
+class DualFruitRules {
+  DualFruitRules({
+    this.blockVersion = 1,
+    this.slotMask = 0,
+    this.temperature = 0.12,
+    this.margin = 0.05,
+    this.defaultClass = noClass,
+    this.anomalyThreshold = 0.5,
+    this.ripenessGain = 1.0,
+    List<int>? slotFeature,
+    List<int>? classSlotMask,
+    List<double>? slotWeight,
+    List<double>? classLo,
+    List<double>? classHi,
+    List<double>? classSoft,
+    this.overrideClass = noClass,
+    this.overrideSlot1 = 0,
+    this.overrideOp1 = 0,
+    this.overrideSlot2 = 0,
+    this.overrideOp2 = 0,
+    this.overrideVal1 = 0.0,
+    this.overrideVal2 = 0.0,
+  })  : slotFeature = slotFeature ?? List<int>.filled(8, 0),
+        classSlotMask = classSlotMask ?? List<int>.filled(5, 0),
+        slotWeight = slotWeight ?? List<double>.filled(8, 0.0),
+        classLo = classLo ?? List<double>.filled(40, 0.0),
+        classHi = classHi ?? List<double>.filled(40, 0.0),
+        classSoft = classSoft ?? List<double>.filled(40, 0.0);
+
+  /// "no class" marker — matches FRM_NO_CLASS in the firmware.
+  static const int noClass = 0xFF;
+  static const int maxSlots = 8;
+  static const int numClasses = 5;
+
+  static const int opGreater = 0;
+  static const int opLess = 1;
+
+  final int blockVersion;
+  final int slotMask;
+  final double temperature;
+  final double margin;
+  final int defaultClass;
+  final double anomalyThreshold;
+  final double ripenessGain;
+  final List<int> slotFeature;
+  final List<int> classSlotMask;
+  final List<double> slotWeight;
+  final List<double> classLo;
+  final List<double> classHi;
+  final List<double> classSoft;
+  final int overrideClass;
+  final int overrideSlot1;
+  final int overrideOp1;
+  final int overrideSlot2;
+  final int overrideOp2;
+  final double overrideVal1;
+  final double overrideVal2;
+
+  // ── parsing ────────────────────────────────────────────────────────
+
+  /// Parse the rule block of a blob (null when the blob is not a v2 wire).
+  static DualFruitRules? parse(Uint8List bin) {
+    if (bin.length < DualModelWire.wireBytes) return null;
+    if (bin[DualModelWire.offsetVersion] < DualModelWire.wireVersionRules) {
+      return null;
+    }
+    final b = Uint8List.sublistView(
+        bin, DualModelWire.ruleOffset, DualModelWire.ruleOffset + 728);
+    final bd = ByteData.sublistView(b);
+    final slotFeature = <int>[for (var i = 0; i < 8; i++) b[28 + i]];
+    final classSlotMask = <int>[for (var i = 0; i < 5; i++) b[36 + i]];
+    final slotWeight = <double>[for (var i = 0; i < 8; i++) bd.getFloat32(44 + 4 * i, Endian.little)];
+    final classLo = <double>[for (var i = 0; i < 40; i++) bd.getFloat32(76 + 4 * i, Endian.little)];
+    final classHi = <double>[for (var i = 0; i < 40; i++) bd.getFloat32(236 + 4 * i, Endian.little)];
+    final classSoft = <double>[for (var i = 0; i < 40; i++) bd.getFloat32(396 + 4 * i, Endian.little)];
+    return DualFruitRules(
+      blockVersion: bd.getUint32(0, Endian.little),
+      slotMask: bd.getUint32(4, Endian.little),
+      temperature: bd.getFloat32(8, Endian.little),
+      margin: bd.getFloat32(12, Endian.little),
+      defaultClass: bd.getUint32(16, Endian.little),
+      anomalyThreshold: bd.getFloat32(20, Endian.little),
+      ripenessGain: bd.getFloat32(24, Endian.little),
+      slotFeature: slotFeature,
+      classSlotMask: classSlotMask,
+      slotWeight: slotWeight,
+      classLo: classLo,
+      classHi: classHi,
+      classSoft: classSoft,
+      overrideClass: bd.getUint32(556, Endian.little),
+      overrideSlot1: b[560],
+      overrideOp1: b[561],
+      overrideSlot2: b[562],
+      overrideOp2: b[563],
+      overrideVal1: bd.getFloat32(564, Endian.little),
+      overrideVal2: bd.getFloat32(568, Endian.little),
+    );
+  }
+
+  // ── packing ────────────────────────────────────────────────────────
+
+  /// The 728-byte canonical block. Padding and the reserved tail are always
+  /// zero — the device rejects a blob whose padding is not canonical.
+  Uint8List pack() {
+    final b = Uint8List(728);
+    final bd = ByteData.sublistView(b);
+    bd.setUint32(0, blockVersion, Endian.little);
+    bd.setUint32(4, slotMask, Endian.little);
+    bd.setFloat32(8, temperature, Endian.little);
+    bd.setFloat32(12, margin, Endian.little);
+    bd.setUint32(16, defaultClass, Endian.little);
+    bd.setFloat32(20, anomalyThreshold, Endian.little);
+    bd.setFloat32(24, ripenessGain, Endian.little);
+    for (var i = 0; i < 8; i++) {
+      b[28 + i] = slotFeature[i] & 0xFF;
+      bd.setFloat32(44 + 4 * i, slotWeight[i], Endian.little);
+    }
+    for (var c = 0; c < 5; c++) {
+      b[36 + c] = classSlotMask[c] & 0xFF;
+      for (var i = 0; i < 8; i++) {
+        final k = c * 8 + i;
+        bd.setFloat32(76 + 4 * k, classLo[k], Endian.little);
+        bd.setFloat32(236 + 4 * k, classHi[k], Endian.little);
+        bd.setFloat32(396 + 4 * k, classSoft[k], Endian.little);
+      }
+    }
+    bd.setUint32(556, overrideClass, Endian.little);
+    b[560] = overrideSlot1 & 0xFF;
+    b[561] = overrideOp1 & 0xFF;
+    b[562] = overrideSlot2 & 0xFF;
+    b[563] = overrideOp2 & 0xFF;
+    bd.setFloat32(564, overrideVal1, Endian.little);
+    bd.setFloat32(568, overrideVal2, Endian.little);
+    return b;
+  }
+
+  DualFruitRules copyWith({
+    double? temperature,
+    double? margin,
+    int? defaultClass,
+    double? anomalyThreshold,
+    double? ripenessGain,
+  }) =>
+      DualFruitRules(
+        blockVersion: blockVersion,
+        slotMask: slotMask,
+        temperature: temperature ?? this.temperature,
+        margin: margin ?? this.margin,
+        defaultClass: defaultClass ?? this.defaultClass,
+        anomalyThreshold: anomalyThreshold ?? this.anomalyThreshold,
+        ripenessGain: ripenessGain ?? this.ripenessGain,
+        slotFeature: List<int>.from(slotFeature),
+        classSlotMask: List<int>.from(classSlotMask),
+        slotWeight: List<double>.from(slotWeight),
+        classLo: List<double>.from(classLo),
+        classHi: List<double>.from(classHi),
+        classSoft: List<double>.from(classSoft),
+        overrideClass: overrideClass,
+        overrideSlot1: overrideSlot1,
+        overrideOp1: overrideOp1,
+        overrideSlot2: overrideSlot2,
+        overrideOp2: overrideOp2,
+        overrideVal1: overrideVal1,
+        overrideVal2: overrideVal2,
+      );
+
+  // ── queries ────────────────────────────────────────────────────────
+
+  bool get isEmpty {
+    final b = pack();
+    for (final v in b) {
+      if (v != 0) return false;
+    }
+    return true;
+  }
+
+  /// Slot indices this class uses.
+  List<int> slotsOf(int cls) => <int>[
+        for (var i = 0; i < maxSlots; i++)
+          if ((classSlotMask[cls] >> i) & 1 == 1) i
+      ];
+
+  /// Feature id of a slot.
+  int featureOf(int slot) => slotFeature[slot];
+
+  /// The band [lo, hi, softness] of a class/slot pair.
+  List<double> bandOf(int cls, int slot) {
+    final k = cls * maxSlots + slot;
+    return [classLo[k], classHi[k], classSoft[k]];
+  }
+
+  /// Does this model use the black-spot discriminator?
+  bool get usesDarkSpot =>
+      List<int>.generate(maxSlots, (i) => i)
+          .any((i) => (slotMask >> i) & 1 == 1 &&
+              slotFeature[i] == DualDiscFeature.darkSpot);
+
+  /// Does any class use the black-spot discriminator?
+  bool get hasSpotRule {
+    for (var c = 0; c < numClasses; c++) {
+      for (final s in slotsOf(c)) {
+        if (slotFeature[s] == DualDiscFeature.darkSpot) return true;
+      }
+    }
+    return false;
+  }
+
+  // ── validation (mirror of fruit_rule_block_valid) ─────────────────
+
+  static bool _finite(double v) => v.isFinite;
+
+  /// The device's own validator, mirrored so the app never pushes a blob
+  /// the firmware would refuse.
+  bool get isValid {
+    if (blockVersion != 1) return false;
+    if (slotMask == 0) return false;
+    if (slotMask & ~((1 << maxSlots) - 1) != 0) return false;
+    if (!_finite(temperature) || temperature <= 0) return false;
+    if (!_finite(margin) || margin < 0) return false;
+    if (!_finite(anomalyThreshold) ||
+        anomalyThreshold < 0 ||
+        anomalyThreshold > 1) {
+      return false;
+    }
+    if (!_finite(ripenessGain) || ripenessGain < 0) return false;
+    if (defaultClass != noClass && defaultClass >= numClasses) return false;
+
+    for (var i = 0; i < maxSlots; i++) {
+      final active = (slotMask >> i) & 1 == 1;
+      if (!active) {
+        if (slotFeature[i] != 0) return false;
+        if (slotWeight[i] != 0.0) return false;
+        continue;
+      }
+      if (slotFeature[i] >= DualDiscFeature.count) return false;
+      if (!_finite(slotWeight[i]) || slotWeight[i] < 0) return false;
+    }
+
+    for (var c = 0; c < numClasses; c++) {
+      if (classSlotMask[c] & ~slotMask != 0) return false;
+      for (var i = 0; i < maxSlots; i++) {
+        final k = c * maxSlots + i;
+        final used = (classSlotMask[c] >> i) & 1 == 1;
+        if (!used) {
+          if (classLo[k] != 0.0 ||
+              classHi[k] != 0.0 ||
+              classSoft[k] != 0.0) {
+            return false;
+          }
+          continue;
+        }
+        if (!_finite(classLo[k]) || !_finite(classHi[k])) return false;
+        if (!_finite(classSoft[k]) || classSoft[k] <= 0) return false;
+        if (classHi[k] < classLo[k]) return false;
+      }
+    }
+
+    if (overrideClass != noClass) {
+      if (overrideClass >= numClasses) return false;
+      if (overrideOp1 > opLess || overrideOp2 > opLess) return false;
+      if (overrideSlot1 >= DualDiscFeature.count ||
+          overrideSlot2 >= DualDiscFeature.count) {
+        return false;
+      }
+      if ((slotMask >> overrideSlot1) & 1 != 1) return false;
+      if ((slotMask >> overrideSlot2) & 1 != 1) return false;
+      if (!_finite(overrideVal1) || !_finite(overrideVal2)) return false;
+    } else {
+      if (overrideSlot1 != 0 ||
+          overrideSlot2 != 0 ||
+          overrideOp1 != 0 ||
+          overrideOp2 != 0 ||
+          overrideVal1 != 0.0 ||
+          overrideVal2 != 0.0) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
+/// One strike site a model was measured on: the model's index for it and
+/// the class-band edge that applies there.
+class DualModelSite {
+  final int id;
+  final double anchor;
+  final double softness;
+
+  const DualModelSite({
+    required this.id,
+    required this.anchor,
+    required this.softness,
+  });
+
+  /// The name shown in the picker.  The site ids are the app's own
+  /// convention (the order the corpus was captured in), so the names live
+  /// here rather than in the blob - the blob's table has no room for them.
+  String get label => kSiteNames[id] ?? 'site $id';
+}
+
+/// The site ids, in the order the corpus captured them.
+const Map<int, String> kSiteNames = {
+  0: 'cheekA',
+  1: 'cheekB',
+  2: 'edge',
+  3: 'top',
+};

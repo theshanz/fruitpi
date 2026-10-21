@@ -6,6 +6,7 @@
 
 #include "esp_heap_caps.h"
 #include "lcd_display.h"
+#include "fruit_rule.h"
 
 BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharScanConfig(nullptr),
                          pCharScanResults(nullptr), pCharRawStream(nullptr), store_ref(nullptr),
@@ -24,6 +25,10 @@ BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharSca
 {
     memset(&current_config, 0, sizeof(ScanConfig));
     strncpy(current_config.target_fruit, "Mango", sizeof(current_config.target_fruit) - 1);
+    // The strike site defaults to AUTO: the device picks the site whose
+    // anchor the feature lands nearest to.  The app can name a site once
+    // the operator says which surface they tapped.
+    current_config.site_id = FRM_NO_CLASS;
     memset(model_rx_buffer, 0, sizeof(model_rx_buffer));
 }
 
@@ -87,9 +92,12 @@ static void scanconfig_load_nvs(ScanConfig &cfg)
         cfg.use_volume_override = true;
     }
     nvs_close(nvs);
-    Serial.printf("[BTManager] scan config loaded: taps=%u (default 3) vol=%.0f override=%d\n",
+    uint8_t site = FRM_NO_CLASS;
+    if (nvs_get_u8(nvs, "site_id", &site) == ESP_OK) cfg.site_id = site;
+    nvs_close(nvs);
+    Serial.printf("[BTManager] scan config loaded: taps=%u (default 3) vol=%.0f override=%d site=%d\n",
                   cfg.target_tap_count, cfg.override_volume_cm3,
-                  cfg.use_volume_override);
+                  cfg.use_volume_override, cfg.site_id);
 }
 
 static void scanconfig_save_nvs(ScanConfig &cfg)
@@ -98,6 +106,7 @@ static void scanconfig_save_nvs(ScanConfig &cfg)
     if (nvs_open(SCANCONFIG_NS, NVS_READWRITE, &nvs) != ESP_OK)
         return;
     nvs_set_blob(nvs, "volume_cm3", &cfg.override_volume_cm3, sizeof(float));
+    nvs_set_u8(nvs, "site_id", cfg.site_id);
     nvs_commit(nvs);
     nvs_close(nvs);
 }
@@ -382,6 +391,22 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                 {
                     new_threshold_val = doc["threshold"];
                     threshold_updated = true;
+                }
+                else if (strcmp(cmd, "set_site") == 0 && doc.containsKey("site"))
+                {
+                    // The strike site the operator tapped, as the model's
+                    // per-site table indexes it.  255 (or "auto") leaves it
+                    // to the device to pick the nearest anchor.
+                    const int site = doc["site"].is<int>() ? doc["site"].as<int>()
+                                                          : (int)doc["site"].as<unsigned long>();
+                    if (site < 0 || site > 255) {
+                        Serial.printf("[BTManager] set_site: out of range (%d)\n", site);
+                    } else {
+                        current_config.site_id = (uint8_t)site;
+                        scanconfig_save_nvs(current_config);
+                        Serial.printf("[BTManager] strike site = %d\n", current_config.site_id);
+                        notify_scan_config();
+                    }
                 }
             }
             if (doc.containsKey("fruit"))
@@ -1002,6 +1027,7 @@ void BTManager::notify_scan_config()
 
     StaticJsonDocument<128> doc;
     doc["status"] = "scan_config";
+    doc["site_id"] = (int)current_config.site_id;
     doc["mode"] = (current_mode == MODE_DATA_COLLECTION) ? "data_collection" :
                   (current_mode == MODE_DEBUG) ? "debug" : "inference";
     doc["tap_count"] = get_target_tap_count();

@@ -336,6 +336,7 @@ DualTapCoords dual_tap_coords(const DualLatentParams& p,
 // ─── Params: compiled defaults & wire decode ───────────────────────
 DualLatentParams dual_params_default() {
     DualLatentParams p{};
+    p.site_id             = FRM_NO_CLASS;   // AUTO
     p.modality            = (uint8_t)ACTIVE_MODALITY;
     p.active_class_mask   = MODAL_ACTIVE_CLASS_MASK;
     p.green_bin_start     = (uint8_t)MS_SURF_GREEN_BINS_START;
@@ -435,6 +436,10 @@ bool dual_wire_valid(const DualModelWire& m) {
 
 DualLatentParams dual_params_decode(const DualModelWire& m) {
     DualLatentParams p{};
+    // AUTO by default: the device picks the site whose anchor the feature
+    // lands nearest to.  The app overrides it with the site the operator
+    // says they tapped.
+    p.site_id = FRM_NO_CLASS;
     p.modality          = m.modality;
     p.active_class_mask = m.active_class_mask;
     p.green_bin_start   = m.green_bin_start;
@@ -643,6 +648,18 @@ BiologicalStatus evaluate_fruit_rules(
         // better by uploading the blob for the site it knows.
         float best_dist = -1.0f;
         for (uint8_t side = 0; side < rp.side_count; side++) {
+            // A declared site wins outright: the app told us which surface
+            // was tapped, so its anchor is the one that applies.
+            if (p.site_id != FRM_NO_CLASS && rp.side_id[side] == p.site_id) {
+                chosen_side = (int)side;
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    score[c] = ((mask >> c) & 1U)
+                        ? rule_class_score_site(rp, fs, (uint8_t)c, rp.side_anchor[side],
+                                                rp.side_soft[side])
+                        : 0.0f;
+                }
+                break;
+            }
             float s[NUM_CLASSES];
             for (int c = 0; c < NUM_CLASSES; c++) {
                 s[c] = ((mask >> c) & 1U)

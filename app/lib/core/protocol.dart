@@ -76,6 +76,11 @@ class BleProtocol {
       {'command': 'arm_acoustic'};
   static Map<String, dynamic> cmdArmReady() =>
       {'command': 'arm_ready'};
+  /// The strike site the operator tapped, as the model's per-site table
+  /// indexes it.  [site] = 255 (or 'auto') leaves the device to pick the
+  /// site whose anchor the feature lands nearest to.
+  static Map<String, dynamic> cmdSetSite(int site) =>
+      {'command': 'set_site', 'site': site & 0xFF};
   static Map<String, dynamic> cmdRawCapture({bool trigger = false, int windows = 20}) =>
       {'command': 'raw_capture', if (trigger) 'trigger': true, 'windows': windows};
   static Map<String, dynamic> cmdMsCapture() => {'command': 'ms_capture'};
