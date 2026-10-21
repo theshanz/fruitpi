@@ -29,6 +29,18 @@ bool     is_acoustic_armed = false;
 uint32_t arm_start_time = 0;          // millis() when data-collection armed
 bool     scan_requested = false;      // physical SCAN button edge
 
+// ─── Never-empty tap guard (collection path) ───────────────────────────
+// The tap-quality gate can reject every strike of a session (a mis-placed
+// fruit, a soft tap, a model floor that is too high for this rig).  With no
+// fallback the host waits for a window the device will never accept and the
+// run hangs.  So the best rejected window is kept and streamed once the
+// rejection budget is spent: a session always ends with at least one window.
+constexpr uint8_t TAP_REJECT_BUDGET = 3;   // rejects before the best is used
+static uint16_t s_best_rejected[512];
+static uint16_t s_best_rejected_peak = 0;
+static bool     s_best_rejected_valid = false;
+static uint8_t  s_reject_count = 0;
+
 // Inference guide flow: cam scan → fruit on piezo → tap → result.
 bool     awaiting_placement = false;   // cam scan done, waiting for SCAN press
 bool     tap_capture_running = false;  // piezo armed for the inference tap
@@ -65,6 +77,47 @@ static bool button_pressed_edge(PhysicalButton &btn, uint32_t now) {
 
 static PhysicalButton scan_btn = {SCAN_BUTTON_PIN, false, 0};
 
+// ─── Level-stable debounce ────────────────────────────────────────────────
+// The button contacts chatter: a press is a burst of edges over a few
+// milliseconds, and a worn contact can keep bouncing for tens of
+// milliseconds.  The old edge-only debounce only required the RELEASE to be
+// stable, so a bounce whose low gap was longer than the debounce window
+// produced TWO taps: the first armed the piezo, the second was queued as a
+// fresh scan (the "it resets to a new scan" symptom).
+//
+// Here the level is accepted only after it has been steady for the whole
+// window, so a chatter burst is ONE event, and a press that is released
+// early is simply ignored.
+struct DebouncedLevel {
+  uint8_t  pin;
+  bool     accepted;      // the debounced level
+  bool     candidate;     // the raw level waiting to be confirmed
+  uint32_t candidate_ms;  // when the candidate first appeared
+  bool     primed;
+
+  explicit DebouncedLevel(uint8_t p)
+      : pin(p), accepted(false), candidate(false), candidate_ms(0), primed(false) {}
+
+  bool read(uint32_t now) {
+    const bool raw = (digitalRead(pin) == HIGH);
+    if (!primed) {
+      primed = true;
+      candidate = raw;
+      accepted = raw;
+      candidate_ms = now;
+      return accepted;
+    }
+    if (raw != candidate) {
+      candidate = raw;
+      candidate_ms = now;
+    }
+    if (raw != accepted && (now - candidate_ms) >= BUTTON_DEBOUNCE_MS) {
+      accepted = raw;
+    }
+    return accepted;
+  }
+};
+
 // Data-collection arming: visible placement countdown first (piezo fully
 // disarmed while the fruit is placed), then real listening.
 enum class ArmStage : uint8_t { IDLE, GRACE, LISTENING, AWAITING_READY };
@@ -94,6 +147,11 @@ static void IRAM_ATTR cancel_button_isr() { s_isr_cancel = true; }
 // couples into the piezo and false-triggers it.
 static void start_acoustic_listening(float threshold) {
   lcd_set_quiet(true);
+  // The armed window starves loop() (the sampler busy-waits on the other
+  // core), so the emitters have to be silenced HERE as well — the loop's
+  // discipline only runs between taps.
+  led_indicator_set_held(true);
+  camera_set_suspended(true);
   acoustic_sensor.arm(threshold, ARM_SETTLE_MS * 1000UL);
   Serial.printf("[Guide] LISTENING (taps %u/%u) — waiting for a fresh tap "
                 "(flush + settle %lu ms)\n",
@@ -268,17 +326,12 @@ static void run_raw_capture() {
   bt.notify_status_change("raw_capture_done");
 }
 
-// Camera boot test runs on a helper task in the BACKGROUND, AFTER bt.init():
-// BLE advertising is live the moment setup reaches it, so a wedged sensor (no
-// SCCB ACK) can no longer stall setup() and leave the device unreachable. The
-// acoustics-only DEBUG/waveform path stays usable even with no camera. The
-// loop's inference path checks camera_hardware_ok, so there is no race with
-// the loop's own captures: it stays false until this task completes.
-static bool boot_camera_ok = false;
-static void boot_camera_task(void*) {
-  boot_camera_ok = init_camera_subsystem();
-  vTaskDelete(nullptr);
-}
+// The camera is NOT brought up at boot.  The OV3660 streams continuously once
+// esp_camera_init runs, and the S3 has no working XCLK gate, so an eager boot
+// probe leaves the sensor radiating for the whole session — a permanent noise
+// source for the piezo.  Instead the camera is initialised lazily by
+// camera_ensure_initialized() on the first capture that actually needs a
+// picture, and suspended for every acoustic read.
 
 // Tiny boot-stage tracer: flushes so a wedged boot shows exactly how far it got.
 static void boot_stage(const char* s) {
@@ -316,9 +369,10 @@ void setup() {
     // of the camera's SCCB/current-spike wedge risk on marginal power.
     Serial.println("[Main] DEBUG mode: camera probe skipped (acoustics-only).");
   } else {
-    Serial.println("[Main] BLE advertising live; camera boot probe delayed 30s in background.");
-    xTaskCreatePinnedToCore(boot_camera_task, "camBoot", 8192, nullptr, 1,
-                            nullptr, 0);
+    // The camera comes up lazily, on the first capture that needs a picture.
+    // An acoustic-only session therefore never brings the sensor up at all,
+    // and the board stays quiet for the piezo.
+    Serial.println("[Main] BLE advertising live; camera is lazy (first use).");
   }
 }
 
@@ -333,10 +387,28 @@ void loop() {
     last_announced_mode = mode;
   }
 
-  /// ── LCD bus discipline ────────────────────────────────────────────
-  // While the piezo samples, the LCD stays silent (ADC coupling); any
-  // screen requested meanwhile replays automatically when sampling ends.
-  lcd_set_quiet(acoustic_sensor.get_state() != STATE_DISARMED);
+  /// ── LED + camera discipline ───────────────────────────────────────
+  // The WS2812 is driven by the RMT peripheral at ~800 kHz, so an animating
+  // pattern is a CONTINUOUS digital emitter on the board and couples into
+  // the piezo.  While the sampler is busy the animation is frozen: the LED
+  // keeps its last colour and the RMT waveform stops entirely.
+  //
+  // The camera is the same story and worse: the OV3660 streams continuously
+  // from esp_camera_init and the S3 has no working XCLK gate, so once the
+  // sensor is up it radiates for the rest of the session.  It is therefore
+  // brought up lazily (first capture that needs it) and suspended for every
+  // acoustic read.
+  const bool sampler_busy = acoustic_sensor.get_state() != STATE_DISARMED;
+  lcd_set_quiet(sampler_busy);
+  led_indicator_set_held(sampler_busy);
+  camera_set_suspended(sampler_busy);
+  static uint32_t last_state_log_ms = 0;
+  if (sampler_busy && current_time - last_state_log_ms > 2000) {
+    last_state_log_ms = current_time;
+    Serial.printf("[Quiet] armed: state=%d held=%d cam_susp=%d\n",
+                  (int)acoustic_sensor.get_state(),
+                  (int)led_indicator_is_held(), (int)camera_is_suspended());
+  }
 
   /// ── 1. BLE connection cues ────────────────────────────────────────
   static bool last_ble_connected = false;
@@ -361,7 +433,10 @@ void loop() {
   static bool     btn_hold_done = false;
   bool boot_trigger = false;
 
-  bool btn_now = (digitalRead(BOOT_BUTTON_PIN) == HIGH);  // == SCAN_BUTTON_PIN
+  // Level-stable debounce: the contacts chatter, and a bounce must never
+  // read as two taps.
+  static DebouncedLevel start_btn(BOOT_BUTTON_PIN);   // == SCAN_BUTTON_PIN
+  const bool btn_now = start_btn.read(current_time);
   if (btn_now && !btn_prev) {
     btn_press_ms = current_time;
     btn_hold_done = false;
@@ -369,8 +444,27 @@ void loop() {
   if (btn_now && !btn_hold_done &&
       current_time - btn_press_ms >= MENU_HOLD_MS) {
     btn_hold_done = true;              // long press consumed, never a tap
-    if (s_menu_open) commit_menu_selection();   // hold again = use browsed
-    else             open_model_menu();          // hold = open the selector
+    if (s_menu_open) {
+      // The selector is already open, so the buttons belong to it: a hold
+      // commits the browsed model.  This cannot steal a scan, because a scan
+      // only starts when the selector is CLOSED.
+      commit_menu_selection();
+    } else if (awaiting_placement) {
+      // A press while the fruit is being placed means CONFIRM, however long
+      // it is held.  Without this a slightly long press opened the model
+      // selector instead, and the selector owns the buttons — so the flow
+      // could never reach the acoustic stage.
+      boot_trigger = true;
+      Serial.println("[Button] hold used as placement confirm");
+    } else {
+      // The START button is TAP-ONLY.  The hold used to open the model
+      // selector, and that STOLE presses: a slightly long press opened the
+      // selector, the selector then owns the buttons (a tap cycled a model
+      // instead of scanning, and an app scan request was ignored), so the
+      // button looked blocked.  The selector now lives on the CANCEL
+      // button's hold, on a button that can never steal a scan.
+      Serial.println("[Button] long press ignored (tap = scan)");
+    }
   }
   if (!btn_now && btn_prev && !btn_hold_done &&
       current_time - btn_press_ms >= BUTTON_DEBOUNCE_MS) {
@@ -394,7 +488,13 @@ void loop() {
   // DEBUG mode runs the same guide flow — it just records instead of
   // classifying (and skips the no-model gate below).
   if (bt.check_inference_request() &&
-      (mode == MODE_INFERENCE || mode == MODE_DEBUG) && !s_menu_open) {
+      (mode == MODE_INFERENCE || mode == MODE_DEBUG)) {
+    // An explicit scan request must never be swallowed by an open selector:
+    // close it and run the scan.
+    if (s_menu_open) {
+      close_model_menu(false);
+      Serial.println("[Menu] closed by a scan request");
+    }
     boot_trigger = true;
   }
 
@@ -405,28 +505,50 @@ void loop() {
   static uint32_t cancel_press_ms = 0;
   static bool     cancel_hold_done = false;
   static uint32_t last_cancel_ms = 0;
+  static bool     cancel_press_confirmed = false;
   if (s_isr_cancel) {
     s_isr_cancel = false;
-    if (!cancel_pending && current_time - last_cancel_ms >= BUTTON_DEBOUNCE_MS) {
+    if (!cancel_pending && current_time - last_cancel_ms >= CANCEL_RATE_LIMIT_MS) {
       cancel_pending = true;
       cancel_press_ms = current_time;
       cancel_hold_done = false;
+      cancel_press_confirmed = false;    // confirmed once the level holds
       last_cancel_ms = current_time;
     }
   }
   if (cancel_pending) {
-    const bool cancel_down = digitalRead(CANCEL_BUTTON_PIN) == HIGH;
-    if (cancel_down && !cancel_hold_done &&
-        current_time - cancel_press_ms >= MENU_HOLD_MS) {
-      cancel_hold_done = true;
-      reset_model_selection();           // held long enough: wipe selection
-    }
-    if (!cancel_down && !cancel_hold_done) {
+    // Debounced level: a chattering release must not fire the verdict early.
+    static DebouncedLevel cancel_btn(CANCEL_BUTTON_PIN);
+    const bool cancel_down = cancel_btn.read(current_time);
+    if (cancel_down) {
+      // The level has been HIGH for the whole debounce window: a real press.
+      if (!cancel_press_confirmed) {
+        cancel_press_confirmed = true;
+        cancel_press_ms = current_time;   // the press starts NOW
+      }
+      if (!cancel_hold_done &&
+          current_time - cancel_press_ms >= MENU_HOLD_MS) {
+        cancel_hold_done = true;
+        // The model selector moved here from the START button's hold, so a
+        // scan press can never be stolen by the menu gesture.  In the
+        // selector the same hold wipes the selection.
+        if (s_menu_open) reset_model_selection();
+        else             open_model_menu();
+      }
+    } else if (!cancel_press_confirmed) {
+      // The pin never held HIGH long enough to be a press: a spike (this
+      // pin is wired to 5 V and is prone to noise).  Drop it — a spike must
+      // never abort a run.
+      cancel_pending = false;
+    } else if (!cancel_hold_done) {
+      // Released after a CONFIRMED press: that is the verdict.
       Serial.println("[Button] CANCEL pressed");
       cancel_scan();                     // stop any run first...
       if (s_menu_open) close_model_menu(true);  // ...then leave the selector
+      cancel_pending = false;            // released — verdict served
+    } else {
+      cancel_pending = false;            // released after a hold
     }
-    if (!cancel_down) cancel_pending = false;   // released — verdict served
   }
 
   bt.service_transfer();
@@ -445,6 +567,23 @@ void loop() {
       Serial.printf("[Button] ARM — place fruit, TAP in %us\n",
                     (unsigned)(PLACE_GRACE_MS / 1000));
     }
+  }
+
+  // A trigger that arrives while a run is already under way must be
+  // DROPPED, not queued.  The guide flow is edge-driven: a leftover trigger
+  // starts a FRESH scan the moment the current run finishes, which is what
+  // made a double tap look like "it went back to a new scan" — the first tap
+  // confirmed the placement and armed the piezo, the second was queued and
+  // fired a new scan afterwards.
+  //
+  // `awaiting_placement` is deliberately NOT in this list: the second press
+  // IS the placement confirmation and must still get through.
+  if (tap_capture_running || scan_start_at != 0 || is_acoustic_armed) {
+    if (boot_trigger || scan_requested) {
+      Serial.println("[Button] tap ignored — a run is already in progress");
+    }
+    boot_trigger = false;
+    scan_requested = false;
   }
 
   // Grace expiry: placement window over — arm for real and say so.
@@ -926,11 +1065,64 @@ void loop() {
         arm_start_time = current_time;
         start_acoustic_listening(dynamic_adc_threshold);
       } else {
-        bt.send_raw_acoustic_waveform(raw_adc, peak_adc);
-        is_acoustic_armed = false;
-        bt.notify_status_change("acoustic_captured");
-        led_pet_tap_ok();
-        lcd_tap_ok();
+        // The same quality gate the inference path applies, so a collection
+        // run stores the same windows the device would accept: a window whose
+        // impact is not centred in the pre-trigger region, or that carries no
+        // ring-down, is not a strike — it is the piee's static output
+        // shifting (a DC step) or a scrape.  min_peak_adc = 0 because the
+        // amplitude floor here is MIN_TAP_PEAK (the device's own noise
+        // floor); the model's per-fruit floor belongs to the model, not to
+        // the corpus being collected for it.
+        PiezoAcoustic::TapQualityResult tq =
+            PiezoAcoustic::evaluate_tap_quality(raw_adc, 0);
+        if (!tq.idx_ok || !tq.decay_ok) {
+          // Keep the BEST rejected window.  Without this a session whose
+          // strikes all fail the gate can never complete: the host waits for
+          // a tap that the device will never accept, and the run hangs until
+          // the operator gives up.  The guard streams the best-so-far once
+          // the rejection budget is spent, so a session always ends with at
+          // least one window and the corpus records the *worst* case rather
+          // than nothing.
+          const bool better = !s_best_rejected_valid ||
+                              tq.peak_adc > s_best_rejected_peak;
+          if (better) {
+            memcpy(s_best_rejected, raw_adc, sizeof(s_best_rejected));
+            s_best_rejected_peak = tq.peak_adc;
+            s_best_rejected_valid = true;
+          }
+          s_reject_count++;
+          Serial.printf("[Acoustic] TAP REJECTED (idx=%u adc=%u tail=%.2f%s%s) "
+                        "- TAP CLEANLY (reject %u/%u)\n",
+                        tq.peak_idx, tq.peak_adc, tq.tail_ratio,
+                        tq.idx_ok ? "" : " [timing]",
+                        tq.decay_ok ? "" : " [ringdown]",
+                        (unsigned)s_reject_count, (unsigned)TAP_REJECT_BUDGET);
+          if (s_reject_count >= TAP_REJECT_BUDGET && s_best_rejected_valid) {
+            // Budget spent: stream the best window we saw so the session
+            // completes rather than hanging.
+            Serial.printf("[Acoustic] reject budget spent - streaming the best "
+                          "of %u rejected taps (adc=%u)\n",
+                          (unsigned)s_reject_count, (unsigned)s_best_rejected_peak);
+            bt.send_raw_acoustic_waveform(s_best_rejected, s_best_rejected_peak);
+            s_reject_count = 0;
+            s_best_rejected_valid = false;
+            is_acoustic_armed = false;
+            bt.notify_status_change("acoustic_captured");
+            led_pet_tap_ok();
+            lcd_tap_ok();
+          } else {
+            arm_start_time = current_time;
+            start_acoustic_listening(dynamic_adc_threshold);
+          }
+        } else {
+          s_reject_count = 0;
+          s_best_rejected_valid = false;
+          bt.send_raw_acoustic_waveform(raw_adc, peak_adc);
+          is_acoustic_armed = false;
+          bt.notify_status_change("acoustic_captured");
+          led_pet_tap_ok();
+          lcd_tap_ok();
+        }
       }
     } else if (current_time - arm_start_time >= ARM_TIMEOUT_MS) {
       is_acoustic_armed = false;

@@ -63,6 +63,25 @@ static ShowId pending[2];                    // chained overlays (max 2)
 static uint8_t pending_count = 0;
 static bool scan_active = false;
 
+static bool    s_held = false;                // frozen for an acoustic capture
+static bool    s_held_logged = false;
+
+bool led_indicator_is_held() { return s_held; }
+
+void led_indicator_set_held(bool held) {
+  if (held != s_held) {
+    Serial.printf("[LED] hold %s\n", held ? "ON (LED dark, animation frozen)" : "off");
+    if (held) {
+      // Dark and quiet: write ONE black frame and then never touch the LED
+      // again for the rest of the acoustic read.  A dark frame still needs
+      // one transmission, but after that the WS2812 latches and the RMT
+      // peripheral is idle, so the board stops radiating.
+      rgb_led_set_raw(0, 0, 0);
+    }
+  }
+  s_held = held;
+}
+
 void led_indicator_set_scan_active(bool active) { scan_active = active; }
 
 static void play_now(ShowId id) {
@@ -152,6 +171,11 @@ void led_indicator_init() {
 void led_indicator_update() {
   static uint32_t last_frame = 0;
   uint32_t now = millis();
+  if (s_held) {
+    // Held for an acoustic capture: the WS2812 keeps its last colour and
+    // the RMT waveform stops, so the board stops radiating.
+    return;
+  }
   if (now - last_frame < LCD_FRAME_MS) {
     return;
   }

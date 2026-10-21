@@ -10,6 +10,35 @@
 static bool camera_hardware_ok = false;
 static framesize_t s_working_size = FRAMESIZE_VGA;
 
+// ── The camera is a noise source for the piezo ─────────────────────────────
+// The OV3660 streams continuously from esp_camera_init (the S3 has no working
+// XCLK gate and no PWDN pin), so once the sensor is up it is a permanent
+// emitter: VSYNC/PCLK traffic, the sensor's supply current, and PSRAM DMA.
+// The acoustic path needs a quiet board, so the camera is brought up LAZILY
+// (on the first capture that actually needs it) and is SUSPENDED while the
+// piezo is reading.
+static bool s_initialized = false;
+static bool s_suspended = false;
+
+bool camera_ensure_initialized() {
+  if (s_initialized) return camera_hardware_ok;
+  // Never bring the sensor up in the middle of an acoustic read: the init
+  // burst (SCCB traffic, the boot frame, the warmup delay) is exactly the
+  // kind of current spike the piezo hears.
+  if (s_suspended) return false;
+  s_initialized = true;
+  camera_hardware_ok = init_camera_subsystem();
+  return camera_hardware_ok;
+}
+
+void camera_set_suspended(bool suspended) {
+  if (suspended != s_suspended) {
+    Serial.printf("[Camera] suspend %s\n", suspended ? "ON (piezo reading)" : "off");
+  }
+  s_suspended = suspended;
+}
+bool camera_is_suspended() { return s_suspended; }
+
 // Idle power control: the sensor streams continuously between captures unless
 // XCLK is gated. On classic ESP32 the driver owns LEDC CH0 (Timer 0) on
 // pin_xclk; ledc_stop freezes the channel -> sensor loses its pixel clock.
@@ -289,7 +318,13 @@ static bool capture_boot_frame(framesize_t start) {
 }
 
 camera_fb_t* capture_camera_frame() {
-    if (!camera_hardware_ok) {
+    if (s_suspended) {
+        // The piezo is reading: a frame grab (SCCB + DMA + the sensor's
+        // current spike) would land straight in the acoustic window.
+        Serial.println("[CameraHandler] Grab refused: the piezo is reading.");
+        return nullptr;
+    }
+    if (!camera_ensure_initialized()) {
         Serial.println("[CameraHandler] Cannot capture: Camera hardware not ready!");
         return nullptr;
     }
@@ -379,5 +414,7 @@ void free_copied_frame(camera_fb_t* fb) {
 }
 
 bool is_camera_ready() {
-    return camera_hardware_ok;
+    // Initialise on first use: a session that never asks for a picture (the
+    // acoustic collection path) must never bring the sensor up at all.
+    return camera_ensure_initialized();
 }

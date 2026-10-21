@@ -124,16 +124,32 @@ void PiezoAcoustic::capture_raw_waveform(uint16_t raw_out[512], uint16_t* peak_o
 PiezoAcoustic::TapQualityResult
 PiezoAcoustic::evaluate_tap_quality(const uint16_t raw[FFT_SIZE],
                                     uint16_t min_peak_adc) {
-    // Mean-centre (DC block) and accumulate total energy.
-    uint32_t sum = 0;
-    for (int i = 0; i < FFT_SIZE; i++) sum += raw[i];
-    const float mean = (float)sum / (float)FFT_SIZE;
+    // ── DC-TREND REMOVAL ───────────────────────────────────────────────
+    // A piezo generates a STATIC charge from the fruit's weight, and on a
+    // high-impedance node that charge drifts while the window is captured.
+    // Centring on the mean is not enough: the drift can be larger than the
+    // strike, and then the "impact" lands on the steepest part of the drift
+    // instead of on the strike (measured: the impact index scattered over
+    // 28..173 for one strike site).  So the peak and the energies are judged
+    // on a DETRENDED signal: a 32-sample moving average (3.6 ms at 8820 Hz)
+    // removes the slow drift and the static offset while leaving an impact
+    // (1-2 ms rise) intact.
+    float hp[FFT_SIZE];
+    float ma = (float)raw[0];
+    const float alpha = 1.0f / 32.0f;
+    float mean = 0.0f;
+    for (int i = 0; i < FFT_SIZE; i++) {
+        ma += alpha * ((float)raw[i] - ma);
+        hp[i] = (float)raw[i] - ma;
+        mean += hp[i];
+    }
+    mean /= (float)FFT_SIZE;
 
     float peak_v = 0.0f;
     int peak_idx = 0;
     float e_total = 0.0f;
     for (int i = 0; i < FFT_SIZE; i++) {
-        float c = (float)raw[i] - mean;
+        float c = hp[i] - mean;
         e_total += c * c;
         if (fabsf(c) > peak_v) {
             peak_v = fabsf(c);
@@ -143,7 +159,7 @@ PiezoAcoustic::evaluate_tap_quality(const uint16_t raw[FFT_SIZE],
 
     float e_tail = 0.0f;
     for (int i = peak_idx; i < FFT_SIZE; i++) {
-        float c = (float)raw[i] - mean;
+        float c = hp[i] - mean;
         e_tail += c * c;
     }
 

@@ -79,6 +79,30 @@ camera_fb_t* copy_camera_frame(const camera_fb_t* src, size_t& dst_len);
 void free_copied_frame(camera_fb_t* fb);
 
 /**
+ * @brief Brings the camera up on first use and reports whether it works.
+ *
+ * The sensor is never initialised speculatively: the OV3660 streams
+ * continuously once esp_camera_init runs, which is a permanent noise source
+ * for the piezo, so an acoustic-only session must not bring it up.
+ * @return true if the camera is initialised and healthy.
+ */
+bool camera_ensure_initialized();
+
+/**
+ * @brief Suspends the camera while the piezo is reading.
+ *
+ * While suspended, frame grabs are refused and the sensor is not brought up.
+ * The piezo path calls this for EVERY acoustic read, so the board is quiet
+ * whenever the sampler is armed.
+ */
+void camera_set_suspended(bool suspended);
+
+/**
+ * @brief True while the camera is suspended for an acoustic read.
+ */
+bool camera_is_suspended();
+
+/**
  * @brief Checks if camera hardware is ready.
  */
 bool is_camera_ready();

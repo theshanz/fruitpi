@@ -17,7 +17,16 @@ constexpr uint8_t CANCEL_BUTTON_PIN = 21;  // active-high, wired to 5V (prefer 3
                                      // WARNING: GPIO12 = CAM_PIN_Y6 — reads permanently
                                      // pressed if wired. Never use it for a button.
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
-constexpr uint32_t MENU_HOLD_MS       = 800;   // hold-to-commit / hold-to-reset
+constexpr uint32_t CANCEL_RATE_LIMIT_MS = 200;  // min gap between two CANCEL
+                                     // verdicts: a floating/noisy CANCEL pin
+                                     // must not be able to cancel a run over
+                                     // and over.  (Add a 10k pull-down to GND
+                                     // on that pin if it still misbehaves.)
+constexpr uint32_t MENU_HOLD_MS       = 2000;  // hold-to-commit / hold-to-reset.
+                                     // A TAP is a scan/confirm; the model
+                                     // selector needs a deliberate 2 s hold so
+                                     // an ordinary press can never be stolen
+                                     // by the menu gesture.
 
 // ─── LCD (PCF8574 I2C backpack) ───────────────────────────────────
 constexpr uint8_t  LCD_SDA_PIN = 41;  // NOT GPIO1: adjacent to piezo ADC (coupling)
@@ -123,7 +132,15 @@ constexpr float DEV_GATE_MULT        = 4.0f;
 constexpr float DEV_NOISE_EMA_INIT   = 0.005f;
 constexpr float DEV_NOISE_ALPHA      = 0.002f;
 constexpr float DEV_GATE_MAX         = 0.08f;
-constexpr float BASELINE_ALPHA_LISTEN = 0.005f; // τ≈23 ms while listening
+// The baseline tracks the ambient so the trigger judges the DEVIATION from
+// it.  On a piezo node the static charge from the fruit's weight drifts while
+// the window is captured; with a slow tracker that drift accumulates into the
+// deviation and the trigger fires on the drift instead of on the strike
+// (measured on the edge strike site: the impact index scattered 28..173).
+// τ≈7.4 ms tracks the drift away while an impact (1-2 ms rise) still stands
+// out.  The set-up phase keeps the fast tracker so the baseline is locked on
+// before the settle hold-off ends.
+constexpr float BASELINE_ALPHA_LISTEN = 0.015f; // τ≈7.4 ms while listening
 constexpr float BASELINE_ALPHA_SETTLE = 0.05f;  // fast re-track while settling
 
 // ─── Vision (HueExtractor) ────────────────────────────────────────
