@@ -720,8 +720,24 @@ BiologicalStatus evaluate_fruit_rules(
     for (int c = 0; c < NUM_CLASSES; c++) result.probabilities[c] *= inv;
 
     // ── Hard override: two handcrafted conditions that win outright ──
+    // The ANOMALY-ONLY target (FRM_ANOMALY_ONLY) does not name a class: the
+    // decision stands (UNRIPE / RIPE) and the result is flagged anomalous.
+    // That is the honest way to use a defect with no training samples of its
+    // own - a black spot on a banana is worth flagging, but calling it
+    // ROTTEN would be a claim the corpus cannot support.
     bool overridden = false;
-    if (rp.override_class < NUM_CLASSES) {
+    bool anomaly_override = false;
+    if (rp.override_class == FRM_ANOMALY_ONLY) {
+        const uint8_t f1 = rp.override_slot1, f2 = rp.override_slot2;
+        bool c1 = false, c2 = false;
+        if (f1 < DISC_COUNT && fs.ok[f1])
+            c1 = (rp.override_op1 == DISC_OP_GT) ? (fs.v[f1] > rp.override_val1)
+                                                 : (fs.v[f1] < rp.override_val1);
+        if (f2 < DISC_COUNT && fs.ok[f2])
+            c2 = (rp.override_op2 == DISC_OP_GT) ? (fs.v[f2] > rp.override_val2)
+                                                 : (fs.v[f2] < rp.override_val2);
+        anomaly_override = (c1 && c2);
+    } else if (rp.override_class < NUM_CLASSES) {
         const uint8_t f1 = rp.override_slot1, f2 = rp.override_slot2;
         bool c1 = false, c2 = false;
         if (f1 < DISC_COUNT && fs.ok[f1])
@@ -770,8 +786,9 @@ BiologicalStatus evaluate_fruit_rules(
     // black-spot discriminator lands here: a model that gives the ROTTEN
     // class a band on DISC_DARK_SPOT flips the decision into the anomaly
     // class as soon as spots are seen.
-    result.is_anomaly = ((best == 3 || best == 4) &&
-                          (overridden || score[best] >= rp.anomaly_threshold));
+    result.is_anomaly = anomaly_override ||
+                        ((best == 3 || best == 4) &&
+                         (overridden || score[best] >= rp.anomaly_threshold));
 
     Serial.printf("[Rule] N=%u score=[%.3f %.3f %.3f %.3f %.3f] "
                   "spot=%.3f dark=%.3f -> %s (%.1f%%) ri=%.3f%s%s mask=0x%02X\n",

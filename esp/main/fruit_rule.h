@@ -81,6 +81,12 @@ enum DiscOp : uint8_t {
 constexpr uint8_t FRM_MAX_SLOTS     = 8;
 constexpr uint8_t FRM_NUM_CLASSES   = 5;
 constexpr uint8_t FRM_NO_CLASS      = 0xFF;
+// The override target that flags an ANOMALY without naming a class: the
+// class decision stays as it was, but the result is marked anomalous.  This
+// is what a model uses for a defect that is worth flagging but has no
+// training samples of its own - a black spot on a banana, say, where the
+// ROTTEN class would be an unevidenced claim.
+constexpr uint8_t FRM_ANOMALY_ONLY  = 0xFE;
 constexpr uint8_t FRM_BLOCK_VERSION = 1;
 
 // ─── The 728-byte rule block (wire offset 124) ──────────────────────

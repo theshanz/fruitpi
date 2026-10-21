@@ -1,5 +1,6 @@
 #include "fruit_rule.h"
 
+#include <Arduino.h>
 #include <cmath>
 #include <cstring>
 
@@ -97,7 +98,10 @@ bool fruit_rule_block_valid(const FruitRuleBlock& b) {
     // Hard override: optional, but when present both conditions must be
     // well-formed and reference ACTIVE slots.
     if (b.override_class != FRM_NO_CLASS) {
-        if (b.override_class >= FRM_NUM_CLASSES) return false;
+        // FRM_ANOMALY_ONLY flags an anomaly without naming a class.
+        if (b.override_class != FRM_ANOMALY_ONLY &&
+            b.override_class >= FRM_NUM_CLASSES)
+            return false;
         if (b.override_op1 > DISC_OP_LT || b.override_op2 > DISC_OP_LT)
             return false;
         if (b.override_slot1 >= DISC_COUNT || b.override_slot2 >= DISC_COUNT)
@@ -135,6 +139,13 @@ FruitRuleParams fruit_rule_decode(const FruitRuleBlock& b) {    FruitRuleParams 
     }
     // The per-side anchor table, when the blob carries one.
     {
+        if (p.side_count > 0) {
+            Serial.printf("[Rules] per-site anchors: %u site(s):", p.side_count);
+            for (uint8_t i = 0; i < p.side_count; i++) {
+                Serial.printf(" %u=%.6f", p.side_id[i], p.side_anchor[i]);
+            }
+            Serial.println();
+        }
         const FruitSideTable t = *reinterpret_cast<const FruitSideTable*>(b.reserved);
         p.side_count = t.side_count;
         for (uint8_t i = 0; i < FRM_MAX_SIDES; i++) {
