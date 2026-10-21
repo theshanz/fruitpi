@@ -134,7 +134,13 @@ PiezoAcoustic::evaluate_tap_quality(const uint16_t raw[FFT_SIZE],
     // on a DETRENDED signal: a 32-sample moving average (3.6 ms at 8820 Hz)
     // removes the slow drift and the static offset while leaving an impact
     // (1-2 ms rise) intact.
-    float hp[FFT_SIZE];
+    //
+    // STATIC, not automatic: this is 2 KB and loopTask only has 8 KB total —
+    // as a local it pushed the task under its stack canary on the first tap
+    // (Guru Meditation, watchpoint in loopTask).  Both callers are in loop()
+    // and the function returns before loop() touches the buffer again, so
+    // there is no second writer and no reentrancy to lose.
+    static float hp[FFT_SIZE];
     float ma = (float)raw[0];
     const float alpha = 1.0f / 32.0f;
     float mean = 0.0f;

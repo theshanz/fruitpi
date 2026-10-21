@@ -283,7 +283,7 @@ static void run_raw_capture() {
 #ifdef CONFIG_IDF_TARGET_ESP32S3
   rgb_led_set_raw(255, 60, 0);               // orange = capture in progress
 #endif
-  uint16_t raw_adc[512];
+  static uint16_t raw_adc[512];   // 1 KB — keeps it off loopTask's stack
   uint16_t peak_adc;
 
   if (bt.is_raw_capture_trigger_mode()) {
@@ -347,6 +347,8 @@ void setup() {
   // START and SCAN are merged onto one GPIO14 button (active-high).
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLDOWN);   // == SCAN_BUTTON_PIN (same pin)
   pinMode(CANCEL_BUTTON_PIN, INPUT_PULLDOWN);
+  Serial.printf("[Button] idle levels: START=%d CANCEL=%d\n",
+                digitalRead(BOOT_BUTTON_PIN), digitalRead(CANCEL_BUTTON_PIN));
   attachInterrupt(digitalPinToInterrupt(CANCEL_BUTTON_PIN), cancel_button_isr,
                   RISING);
   led_indicator_init();
@@ -503,6 +505,14 @@ void loop() {
       scan_requested = true;            // merged SCAN role (data-collection arm / guide)
       Serial.println("[Button] START/SCAN pressed");
     }
+  }
+  if (btn_now != btn_prev) {
+    // Every real level transition on GPIO14, with the hold latch — this is
+    // what tells a stuck-high idle (never edges, hold latches, taps die
+    // silently) from a normal press/release pair.
+    Serial.printf("[Button] START raw %d -> %d (hold_done=%d elapsed=%lu ms)\n",
+                  (int)btn_prev, (int)btn_now, (int)btn_hold_done,
+                  (unsigned long)(current_time - btn_press_ms));
   }
   btn_prev = btn_now;
 
@@ -797,7 +807,7 @@ void loop() {
       // Pull the raw 512-sample window ONCE, up front. It feeds BOTH the
       // tap-quality gate (reject duds / grazes / truncated captures BEFORE
       // they pollute the consensus) AND, in DEBUG mode, the raw-wave stream.
-      uint16_t raw_adc[512];
+      static uint16_t raw_adc[512];   // 1 KB — stays off loopTask's 8 KB stack
       uint16_t peak_adc = 0;
       acoustic_sensor.capture_sampler_raw_window(raw_adc, &peak_adc);
 
@@ -1085,7 +1095,7 @@ void loop() {
   if (is_acoustic_armed) {
     if (acoustic_sensor.is_data_ready()) {
       AcousticFeatures feats = acoustic_sensor.get_latest_features();
-      uint16_t raw_adc[512];
+      static uint16_t raw_adc[512];   // 1 KB — keeps it off loopTask's stack
       uint16_t peak_adc;
       acoustic_sensor.capture_sampler_raw_window(raw_adc, &peak_adc);
 
