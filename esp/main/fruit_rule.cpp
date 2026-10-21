@@ -106,8 +106,20 @@ bool fruit_rule_block_valid(const FruitRuleBlock& b) {
             return false;
         if (b.override_slot1 >= DISC_COUNT || b.override_slot2 >= DISC_COUNT)
             return false;
-        if (!((b.slot_mask >> b.override_slot1) & 1U)) return false;
-        if (!((b.slot_mask >> b.override_slot2) & 1U)) return false;
+        // The override names a FEATURE id (the host packs the feature, not
+        // the slot index - see fruit_rules.py), so it must name a feature
+        // that one of the ACTIVE slots carries.  Checking it against the
+        // slot mask as if it were a slot index rejected every override that
+        // used a feature id above 7 - the black-spot discriminator is 17.
+        auto names_active_slot = [&b](uint8_t feature_id) {
+            for (uint8_t i = 0; i < FRM_MAX_SLOTS; i++) {
+                if (((b.slot_mask >> i) & 1U) && b.slot_feature[i] == feature_id)
+                    return true;
+            }
+            return false;
+        };
+        if (!names_active_slot(b.override_slot1)) return false;
+        if (!names_active_slot(b.override_slot2)) return false;
         if (!finite_f(b.override_val1) || !finite_f(b.override_val2)) return false;
     } else {
         if (b.override_slot1 != 0 || b.override_slot2 != 0) return false;
