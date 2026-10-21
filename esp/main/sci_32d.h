@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include "config.h"
 #include "extract_hues.h"
+#include "fruit_rule.h"
 #include "piezo_acoustic.h"
 
 // Shared biological ontology + the 852-byte LOADABLE DUAL-LATENT MODEL wire.
@@ -60,7 +62,9 @@ struct BiologicalStatus {
 //   120..123 stft_t1_prior           (f32 LE decision midpoint on the STFT T1
 //                                    early-decay coordinate; only read when
 //                                    acoustic_feature_mode == 1)
-//   124..851 reserved2[728]          (must be zero)
+//   124..851 rules                   (FruitRuleBlock, 728 bytes — wire v2
+//                                    fruit-specific discriminator rules;
+//                                    MUST be all zero for wire_version == 1)
 struct __attribute__((packed)) DualModelWire {
     char    fruit_name[32];
     uint32_t magic;
@@ -89,9 +93,31 @@ struct __attribute__((packed)) DualModelWire {
     uint8_t  acoustic_feature_mode;   // 116 (0 Standard / 1 STFT-enhanced)
     uint8_t  reserved2_tail[3];       // 117..119 (must be zero)
     float    stft_t1_prior;           // 120..123 (f32 LE)
-    uint8_t  reserved2[728];          // 124..851
+    FruitRuleBlock rules;             // 124..851 (wire v2 rule block)
 };
 static_assert(sizeof(DualModelWire) == 852, "DualModelWire must be 852 bytes");
+static_assert(offsetof(DualModelWire, magic) == 32, "magic @32");
+static_assert(offsetof(DualModelWire, wire_version) == 36, "wire_version @36");
+static_assert(offsetof(DualModelWire, active_class_mask) == 37, "mask @37");
+static_assert(offsetof(DualModelWire, modality) == 38, "modality @38");
+static_assert(offsetof(DualModelWire, green_bin_start) == 39, "green start @39");
+static_assert(offsetof(DualModelWire, green_bin_end) == 40, "green end @40");
+static_assert(offsetof(DualModelWire, r0_spec) == 48, "r0_spec @48");
+static_assert(offsetof(DualModelWire, r0_mom) == 52, "r0_mom @52");
+static_assert(offsetof(DualModelWire, alpha) == 56, "alpha @56");
+static_assert(offsetof(DualModelWire, beta) == 60, "beta @60");
+static_assert(offsetof(DualModelWire, tau) == 64, "tau @64");
+static_assert(offsetof(DualModelWire, w_acoustic) == 68, "w_acoustic @68");
+static_assert(offsetof(DualModelWire, w_optics) == 72, "w_optics @72");
+static_assert(offsetof(DualModelWire, vol_clamp_lo) == 76, "vol_clamp_lo @76");
+static_assert(offsetof(DualModelWire, vol_clamp_hi) == 80, "vol_clamp_hi @80");
+static_assert(offsetof(DualModelWire, vol23_lo) == 84, "vol23_lo @84");
+static_assert(offsetof(DualModelWire, vol23_hi) == 88, "vol23_hi @88");
+static_assert(offsetof(DualModelWire, anchors) == 92, "anchors @92");
+static_assert(offsetof(DualModelWire, min_peak_adc_lo) == 113, "min_peak @113");
+static_assert(offsetof(DualModelWire, acoustic_feature_mode) == 116, "feat mode @116");
+static_assert(offsetof(DualModelWire, stft_t1_prior) == 120, "t1 prior @120");
+static_assert(offsetof(DualModelWire, rules) == 124, "rule block @124");
 
 // Acoustic feature hook modes (see acoustic_feature_mode @116). True backward
 // compatibility: mode 0 runs the exact validated r_spec Dual-Latent engine, so
@@ -107,7 +133,12 @@ constexpr size_t MODEL_WIRE_BYTES = 852;
 // lets the device/host reject a legacy 32D blob (which has '2FRT' semantics and
 // no magic at 32) that survived an older flash image.
 constexpr uint32_t DUAL_MODEL_MAGIC = 0x444C4154;   // "DLAT"
-constexpr uint8_t  DUAL_MODEL_WIRE_VERSION = 1;
+constexpr uint8_t  DUAL_MODEL_WIRE_VERSION = 1;     // classic single-latent blob
+// v2 = the same 852 bytes, with the 728-byte rule block at offset 124
+// carrying fruit-specific discriminators (see fruit_rule.h). v1 blobs stay
+// valid: the store format version is NOT bumped, so models already saved on
+// the device keep loading and keep running the legacy decision path.
+constexpr uint8_t  DUAL_MODEL_WIRE_VERSION_RULES = 2;
 constexpr uint8_t  MODEL_STORE_VERSION = 4;         // v4 = Dual wire (v3 was 32D)
 
 // DISPLAY-ONLY confidence for the LCD: a decisive posterior saturates

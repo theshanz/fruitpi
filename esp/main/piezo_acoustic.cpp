@@ -720,6 +720,35 @@ void PiezoAcoustic::process_captured_buffer() {
 
     result.spectral_entropy = compute_spectral_entropy(raw_bin_power);
 
+    // ── The 16 log bands (the host's grid) and the mode band ───────────
+    // The host's timbre features are 16 log-spaced cells from 50 Hz to
+    // 2200 Hz over the SAME 512-point Hann FFT of the SAME mean-centred
+    // window (see fruit_engine.acoustic.dsp.pool_16_bands), so computing
+    // the cells here keeps the device and the trainer on one spectrum: the
+    // band a model is calibrated on is the band the device measures.
+    // The mode-band cell is the discriminator that separated green from
+    // yellow on the Mango corpus (the ripe mango's ~258 Hz mode).
+    {
+        const float edges[N_LOG_BANDS + 1] = {LOG_BAND_EDGES_HZ};
+        float cell_power[N_LOG_BANDS] = {0};
+        float total = 0.0f;
+        for (int k = 1; k < (FFT_SIZE / 2); k++) {
+            const float freq = (float)k * bin_resolution;
+            if (freq < edges[0] || freq >= edges[N_LOG_BANDS]) continue;
+            const float re = fft_input[k * 2];
+            const float im = fft_input[k * 2 + 1];
+            // The magnitude, NOT the power: the host's pool_16_bands sums
+            // exp(log|FFT|) = |FFT| over each cell, so summing |FFT|^2 here
+            // would measure a different band than the model was calibrated on.
+            const float mag = sqrtf((re * re) + (im * im));
+            int cell = 0;
+            while (cell < N_LOG_BANDS - 1 && freq >= edges[cell + 1]) cell++;
+            cell_power[cell] += mag;
+        }
+        for (int c = 0; c < N_LOG_BANDS; c++) total += cell_power[c];
+        result.mode_band_energy = (cell_power[LOG_MODE_BAND_INDEX] + 1e-12f) / (total + 1e-12f);
+    }
+
     // ── Dual-Latent per-tap features: STFT 4x4 grid + bio-moments ─────
     {
         float* centered_c = dsp_centered;
@@ -760,7 +789,7 @@ void PiezoAcoustic::process_captured_buffer() {
         latest_features = result;
         new_data_available.store(true);
         xSemaphoreGive(data_mutex);
-        Serial.printf("[Acoustic] Capture done, peak=%.3f amp=%.3f\n",
-                      max_peak_adc, max_deviation);
+        Serial.printf("[Acoustic] Capture done, peak=%.3f amp=%.3f mode_band=%.6f\n",
+                      max_peak_adc, max_deviation, result.mode_band_energy);
     }
 }

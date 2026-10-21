@@ -43,6 +43,7 @@ inline void lcd_countdown(uint8_t) {}
 inline void lcd_tap_ok() {}
 inline void lcd_tap_progress(uint8_t, uint8_t) {}
 inline void lcd_tap_again(uint8_t, uint8_t) {}
+inline void lcd_tap_retry() {}
 inline void lcd_result(const char*, bool, float) {}
 inline void lcd_timeout() {}
 inline void lcd_placement_timeout() {}

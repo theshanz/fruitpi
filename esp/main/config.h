@@ -96,6 +96,22 @@ constexpr float PIEZO_DEFAULT_THRESHOLD = 0.02f; // min |x−baseline| deviation
 constexpr float MIN_TAP_PEAK = 0.015f;           // windows below this impact amplitude
                                  // are electrical noise, silently re-armed.
 
+// ─── The 16 log bands the timbre features are built on ───────────────────
+// These MUST match fruit_engine.acoustic.dsp.pool_16_bands exactly (16
+// log-spaced cells from 50 Hz to 2200 Hz over the 512-point Hann FFT of the
+// mean-centred window), otherwise the device measures a different band from
+// the one a model was calibrated on.  The mode-band cell is the
+// discriminator that separated a green from a yellow mango on the
+// Mango-capped corpus (the ripe mango's ~258 Hz mode).
+constexpr int N_LOG_BANDS = 16;
+constexpr float LOG_BAND_LOW_HZ = 50.0f;
+constexpr float LOG_BAND_HIGH_HZ = 2200.0f;
+constexpr int LOG_MODE_BAND_INDEX = 7;   // 262.2 - 332.2 Hz
+// The cell edges, 50 * (2200/50)^(i/16).
+#define LOG_BAND_EDGES_HZ                                                       \
+    50.0f, 63.4f, 80.3f, 101.7f, 128.9f, 163.3f, 206.9f, 262.2f, 332.2f,      \
+    420.9f, 533.4f, 675.8f, 856.4f, 1085.3f, 1375.1f, 1742.3f, 2200.0f
+
 // ─── Tap-quality gate (rejects duds / grazes / truncated captures) ──
 // Validated locally on stored 512-sample windows: clean fruit taps peak at
 // index ~64..156 (7-18 ms, pre-trigger=64) with a strong ring-down that holds

@@ -287,6 +287,76 @@ static float sobel_gmag(const uint8_t* dy, uint16_t w, uint16_t h, int x, int y)
 // FLASH_MIN_OBJECT_PIXELS, the raw foreground is restored (safety): the notch
 // is correct on all validated bundles, but a degenerate capture must never
 // collapse to an empty or shredded mask.
+// ═══ Black / brown spot detection ═════════════════════════════════════
+// The foveal box only keeps bright, saturated pixels — they are the ones
+// that build the hue histogram — so a black spot on the skin never
+// reaches the histogram. That is the classic "a spotted banana still
+// reads perfectly yellow" failure. We recover the missing information
+// with a local contrast test:
+//
+//   • a SPOT is a region much darker than the skin around it;
+//   • the spot itself barely responds to the flash (black absorbs it), so
+//     the "is there fruit here" test uses the NEIGHBOURHOOD flash
+//     response, not the pixel's own;
+//   • a shadow or a dark-skinned fruit makes the whole neighbourhood
+//     dark, so the neighbourhood must also be lit.
+//
+// The work happens on a 2x-downsampled 50x50 grid of the 101x101 foveal
+// box with a separable box blur for the neighbourhood means.
+constexpr int   BS_GRID    = 50;    // 50x50 cells (2x2 px each)
+constexpr int   BS_RADIUS  = 5;     // blur radius in cells (10 px)
+constexpr float BS_MIN_DY  = 8.0f;  // neighbourhood flash response floor
+constexpr float BS_MIN_LIT = 0.18f; // neighbourhood brightness floor
+constexpr float BS_SPOT_REL = 0.55f;// spot if centre V < 55% of neighbourhood V
+constexpr float BS_DARK_ABS = 0.30f;// absolute darkness (V < 0.30)
+
+static uint16_t s_bs_vsum[BS_GRID * BS_GRID];
+static uint16_t s_bs_dysum[BS_GRID * BS_GRID];
+static uint8_t  s_bs_v[BS_GRID * BS_GRID];
+static uint8_t  s_bs_dy[BS_GRID * BS_GRID];
+static uint8_t  s_bs_vb[BS_GRID * BS_GRID];
+static uint8_t  s_bs_dyb[BS_GRID * BS_GRID];
+static uint8_t  s_bs_tmp[BS_GRID * BS_GRID];
+
+// Separable box blur (radius r, edge-clamped) over an n x n uint8 grid.
+static void bs_blur_h(const uint8_t* src, uint8_t* dst, int n, int r) {
+    const int cnt = 2 * r + 1;
+    for (int y = 0; y < n; y++) {
+        int sum = 0;
+        for (int k = -r; k <= r; k++) {
+            int xi = k < 0 ? 0 : (k >= n ? n - 1 : k);
+            sum += src[y * n + xi];
+        }
+        for (int x = 0; x < n; x++) {
+            dst[y * n + x] = (uint8_t)(sum / cnt);
+            int out_x = x - r, in_x = x + r + 1;
+            if (out_x < 0) out_x = 0; else if (out_x >= n) out_x = n - 1;
+            if (in_x >= n) in_x = n - 1;
+            sum -= src[y * n + out_x];
+            sum += src[y * n + in_x];
+        }
+    }
+}
+
+static void bs_blur_v(const uint8_t* src, uint8_t* dst, int n, int r) {
+    const int cnt = 2 * r + 1;
+    for (int x = 0; x < n; x++) {
+        int sum = 0;
+        for (int k = -r; k <= r; k++) {
+            int yi = k < 0 ? 0 : (k >= n ? n - 1 : k);
+            sum += src[yi * n + x];
+        }
+        for (int y = 0; y < n; y++) {
+            dst[y * n + x] = (uint8_t)(sum / cnt);
+            int out_y = y - r, in_y = y + r + 1;
+            if (out_y < 0) out_y = 0; else if (out_y >= n) out_y = n - 1;
+            if (in_y >= n) in_y = n - 1;
+            sum -= src[out_y * n + x];
+            sum += src[in_y * n + x];
+        }
+    }
+}
+
 // Foveal Center-Box hue extraction — simple, fool-proof.
 // ROI: x [110..210], y [78..178] (around cx=160, cy=128).
 // Only pixels with dY >= 14 and V >= 0.15 survive. Skin rejection: H [15..35], S <= 0.50.
@@ -306,6 +376,12 @@ ColorFeatures process_foveal_box(const uint16_t* flash, const uint16_t* ambient,
     float hist[10] = {0};
     int valid_pixels = 0;
 
+    // Black-spot grid: EVERY box pixel feeds it (the histogram gates below
+    // would throw the dark ones away), so the spot detector sees the skin
+    // the fruit actually has.
+    memset(s_bs_vsum, 0, sizeof(s_bs_vsum));
+    memset(s_bs_dysum, 0, sizeof(s_bs_dysum));
+
     for (int y = Y0; y <= Y1; y++) {
         for (int x = X0; x <= X1; x++) {
             size_t idx = (size_t)y * w + (size_t)x;
@@ -318,6 +394,14 @@ ColorFeatures process_foveal_box(const uint16_t* flash, const uint16_t* ambient,
             float v_flash = v;
             float dy = std::abs((float)r1 - (float)r2) + std::abs((float)g1 - (float)g2) + std::abs((float)b1 - (float)b2);
             float dY = dy / 3.0f; // approximate luminance diff
+
+            // ── Black-spot grid accumulation (before any gate) ──
+            const int gx = (x - X0) >> 1, gy = (y - Y0) >> 1;
+            if (gx < BS_GRID && gy < BS_GRID) {
+                const int gi = gy * BS_GRID + gx;
+                s_bs_vsum[gi]  += (uint16_t)(v * 255.0f + 0.5f);
+                s_bs_dysum[gi] += (uint16_t)std::min(255.0f, dY);
+            }
 
             // Saturation floor + value floor + dY gate
             if (dY < MIN_DY || v_flash < MIN_V || s < 0.25f || v < 0.25f) continue;
@@ -332,6 +416,35 @@ ColorFeatures process_foveal_box(const uint16_t* flash, const uint16_t* ambient,
             if (bin < 0) bin = 0;
             if (bin > 9) bin = 9;
             hist[bin] += 1.0f;
+        }
+    }
+
+    // ── Black / brown spot statistics ──
+    {
+        for (int i = 0; i < BS_GRID * BS_GRID; i++) {
+            s_bs_v[i]  = (uint8_t)(s_bs_vsum[i] / 4);            // 2x2 cell mean (V, 0..255)
+            s_bs_dy[i] = (uint8_t)std::min(255, s_bs_dysum[i] / 4);
+        }
+        bs_blur_h(s_bs_v,  s_bs_tmp, BS_GRID, BS_RADIUS);
+        bs_blur_v(s_bs_tmp, s_bs_vb,  BS_GRID, BS_RADIUS);
+        bs_blur_h(s_bs_dy, s_bs_tmp, BS_GRID, BS_RADIUS);
+        bs_blur_v(s_bs_tmp, s_bs_dyb, BS_GRID, BS_RADIUS);
+
+        int fruit_cells = 0, spot_cells = 0, dark_cells = 0;
+        for (int i = 0; i < BS_GRID * BS_GRID; i++) {
+            const float nb_dy = (float)s_bs_dyb[i];          // 0..255 flash response
+            const float nb_v  = (float)s_bs_vb[i] / 255.0f;   // neighbourhood brightness
+            if (nb_dy < BS_MIN_DY) continue;   // nothing nearby responded to the flash
+            if (nb_v  < BS_MIN_LIT) continue;  // neighbourhood dark: shadow, not a spot
+            fruit_cells++;
+            const float cv = (float)s_bs_v[i] / 255.0f;
+            if (cv < BS_DARK_ABS) dark_cells++;
+            if (cv < BS_DARK_ABS && cv < BS_SPOT_REL * nb_v) spot_cells++;
+        }
+        if (fruit_cells > 0) {
+            features.dark_spot_fraction = (float)spot_cells / (float)fruit_cells;
+            features.dark_mass          = (float)dark_cells / (float)fruit_cells;
+            features.dark_spot_valid    = 1;
         }
     }
 

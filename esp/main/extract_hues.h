@@ -13,6 +13,24 @@ struct ColorFeatures {
     float raw_rgb_means[3];     // Active multispectral: per-flash mean reflectance (0-255 scale)
     float ambient_rgb_means[3]; // No-flash ambient baseline means (0-255 scale)
 
+    // ── Black / brown spot detection (v2 fruit-rule discriminators) ───
+    // The hue histogram deliberately DROPS dark pixels (the foveal box gates on
+    // value + saturation), so a black spot is invisible to it. These two
+    // scalars re-introduce that information as a per-fruit discriminator:
+    //   dark_spot_fraction — share of the fruit area that is a locally dark
+    //                       patch (black/brown spot, bruising, mould);
+    //   dark_mass          — share of the fruit area that is simply dark.
+    // Both are 0 when the vision path did not run (no camera) — the rule
+    // engine treats a missing optical channel as "no evidence", never as
+    // "no spots".
+    float dark_spot_fraction;
+    float dark_mass;
+    uint8_t dark_spot_valid;   // 1 = the two scalars above were measured;
+                               // 0 = the vision path did not measure them
+                               // (no camera / no fruit) — the rule engine then
+                               // treats the black-spot discriminator as
+                               // "no evidence", never as "no spots".
+
     // ── Natural-ellipse (oval) fit + frame-overflow signal ──────────
     // The fruit's intrinsic oval, estimated from the chosen mask's 2nd central
     // image moments (covariance of pixel positions). Unlike the axis-aligned

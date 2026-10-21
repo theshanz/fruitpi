@@ -107,6 +107,146 @@ const char* modality_name(uint8_t m) {
     }
 }
 
+// ─── v2 rule-engine helpers ─────────────────────────────────────────
+// Where each class sits on the ripeness axis. UNRIPE 0, PERFECTLY_RIPE 1,
+// OVERRIPE past the peak, ROTTEN decayed, ARTIFICIALLY_RIPENED chemically
+// ripened. The rule posterior is projected onto this axis to produce the
+// ripeness index.
+constexpr float RULE_CLASS_RANK[NUM_CLASSES] = {0.00f, 1.00f, 0.70f, 0.20f, 0.50f};
+
+// Per-feature values for one scan. Acoustic ids are medians over the taps,
+// optical ids come from the hue histogram and the black-spot statistics.
+struct RuleFeatureSet {
+    float v[DISC_COUNT];
+    bool  ok[DISC_COUNT];
+};
+
+void rule_feature_values(const DualLatentParams& p,
+                         const AcousticFeatures taps[MAX_DUAL_TAPS],
+                         uint8_t n_taps,
+                         const ColorFeatures& vision,
+                         RuleFeatureSet& out)
+{
+    memset(&out, 0, sizeof(out));
+
+    const float vol_norm = dual_volume_norm(p, vision.volume_cm3);
+
+    float f_shear[MAX_DUAL_TAPS], f_rspec[MAX_DUAL_TAPS], f_rmom[MAX_DUAL_TAPS];
+    float f_ent[MAX_DUAL_TAPS], f_centroid[MAX_DUAL_TAPS], f_tail[MAX_DUAL_TAPS];
+    float f_harm[MAX_DUAL_TAPS], f_abbott[MAX_DUAL_TAPS], f_bioent[MAX_DUAL_TAPS];
+    float f_damp[MAX_DUAL_TAPS], f_t1[MAX_DUAL_TAPS], f_peak[MAX_DUAL_TAPS];
+    float f_modeband[MAX_DUAL_TAPS];
+
+    for (uint8_t i = 0; i < n_taps; i++) {
+        const AcousticFeatures& t = taps[i];
+        f_shear[i] = t.fbm2d_r_high_low;
+        f_rspec[i] = t.fbm2d_r_high_low -
+                     p.beta * logf(fmaxf(t.peak_abs * PIEZO_ADC_FULL_SCALE,
+                                         LOG_PEAK_FLOOR));
+        const float ab = clamp_f(t.bio_moments[3] * vol_norm, 0.0f, 1.0f);
+        f_rmom[i]  = (t.bio_moments[4] + t.bio_moments[1]) - (ab + t.stft_grid[0]);
+        f_ent[i]     = t.spectral_entropy;
+        f_centroid[i]= t.bio_moments[0];
+        f_tail[i]    = t.bio_moments[1];
+        f_harm[i]    = t.bio_moments[2];
+        f_abbott[i]  = t.bio_moments[3];
+        f_bioent[i]  = t.bio_moments[4];
+        f_damp[i]    = t.bio_moments[5];
+        f_t1[i]      = t.stft_grid[1 * 4 + 2];
+        f_peak[i]    = t.peak_abs;
+        f_modeband[i]= t.mode_band_energy;
+    }
+
+    out.v[DISC_SHEAR]       = median_n(f_shear, n_taps);    out.ok[DISC_SHEAR] = true;
+    out.v[DISC_R_SPEC]      = median_n(f_rspec, n_taps);    out.ok[DISC_R_SPEC] = true;
+    out.v[DISC_R_MOM]       = median_n(f_rmom, n_taps);     out.ok[DISC_R_MOM] = true;
+    out.v[DISC_ENTROPY]     = median_n(f_ent, n_taps);      out.ok[DISC_ENTROPY] = true;
+    out.v[DISC_CENTROID]    = median_n(f_centroid, n_taps); out.ok[DISC_CENTROID] = true;
+    out.v[DISC_TAIL]        = median_n(f_tail, n_taps);     out.ok[DISC_TAIL] = true;
+    out.v[DISC_HARMONIC]    = median_n(f_harm, n_taps);     out.ok[DISC_HARMONIC] = true;
+    out.v[DISC_ABBOTT]      = median_n(f_abbott, n_taps);   out.ok[DISC_ABBOTT] = true;
+    out.v[DISC_BIO_ENTROPY] = median_n(f_bioent, n_taps);   out.ok[DISC_BIO_ENTROPY] = true;
+    out.v[DISC_DAMPING]     = median_n(f_damp, n_taps);     out.ok[DISC_DAMPING] = true;
+    out.v[DISC_STFT_T1]     = median_n(f_t1, n_taps);       out.ok[DISC_STFT_T1] = true;
+    out.v[DISC_PEAK]        = median_n(f_peak, n_taps);     out.ok[DISC_PEAK] = true;
+    // The mean, not the median: the mode band is a narrow cell, so its
+    // per-tap values scatter more than the wide-band features, and the
+    // median throws away the resolution the class boundary needs.  Measured
+    // on the Mango-capped corpus with the device's own quantity: the mean
+    // separates the two classes 9/9 on the usable strike sites, the median
+    // only 8/9.
+    {
+        float sum = 0.0f;
+        for (uint8_t i = 0; i < n_taps; i++) sum += f_modeband[i];
+        out.v[DISC_MODE_BAND] = n_taps ? (sum / (float)n_taps) : 0.0f;
+    }
+    out.ok[DISC_MODE_BAND] = true;
+
+    // ── Optical channel (skin colour) ──
+    float hue_sum = 0.0f;
+    for (int i = 0; i < 8; i++) hue_sum += vision.hue_histogram[i];
+    if (hue_sum > 0.5f) {
+        float green = 0.0f, warm = 0.0f, wsum = 0.0f, hsum = 0.0f, ent = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            const float w = vision.hue_histogram[i];
+            const float centre = HUE_WINDOW_MIN +
+                (HUE_WINDOW_MAX - HUE_WINDOW_MIN) * ((float)i + 0.5f) /
+                (float)HUE_BIN_COUNT;
+            hsum += w * centre;
+            wsum += w;
+            if (i >= p.green_bin_start && i < p.green_bin_end) green += w;
+            if (i < p.green_bin_start) warm += w;
+            const float pi = w / hue_sum;
+            if (pi > 1e-5f) ent -= pi * logf(pi);
+        }
+        out.v[DISC_GREEN] = green;   out.ok[DISC_GREEN] = true;
+        out.v[DISC_WARM]  = warm;    out.ok[DISC_WARM] = true;
+        if (wsum > 1e-6f) {
+            out.v[DISC_HUE_MEAN] = hsum / wsum;  out.ok[DISC_HUE_MEAN] = true;
+        }
+        out.v[DISC_HUE_ENT] = ent;  out.ok[DISC_HUE_ENT] = true;
+        out.v[DISC_DISPERSION] = vision.chromatic_dispersion;
+        out.ok[DISC_DISPERSION] = true;
+    }
+
+    // ── Black-spot channel (foveal-box vision path only) ──
+    if (vision.dark_spot_valid) {
+        out.v[DISC_DARK_SPOT] = vision.dark_spot_fraction;
+        out.ok[DISC_DARK_SPOT] = true;
+        out.v[DISC_DARK_MASS] = vision.dark_mass;
+        out.ok[DISC_DARK_MASS] = true;
+    }
+}
+
+// Weighted band membership for one class. A slot whose feature could NOT be
+// measured contributes 0 (no evidence) but still counts in the denominator —
+// so a class that needs a channel we do not have is penalised instead of
+// winning by default. That is what makes the black-spot discriminator safe:
+// without a camera the ROTTEN class cannot win.
+float rule_class_score(const FruitRuleParams& rp, const RuleFeatureSet& fs,
+                       uint8_t cls) {
+    float num = 0.0f, den = 0.0f;
+    for (uint8_t i = 0; i < FRM_MAX_SLOTS; i++) {
+        if (!((rp.class_slot_mask[cls] >> i) & 1U)) continue;
+        const float w = rp.slot_weight[i];
+        den += w;
+        if (w <= 0.0f) continue;
+        const uint8_t fid = rp.slot_feature[i];
+        if (fid >= DISC_COUNT || !fs.ok[fid]) continue;   // no evidence -> 0
+        float lo = rp.class_lo[cls][i];
+        float hi = rp.class_hi[cls][i];
+        float soft = rp.class_soft[cls][i];
+        if (hi < lo) { const float t = lo; lo = hi; hi = t; }
+        if (soft <= 0.0f) soft = 1e-3f;
+        const float x = fs.v[fid];
+        float d = 0.0f;
+        if (x < lo) d = lo - x; else if (x > hi) d = x - hi;
+        const float m = (d <= 0.0f) ? 1.0f : expf(-0.5f * (d / soft) * (d / soft));
+        num += w * m;
+    }
+    return (den > 0.0f) ? (num / den) : 0.0f;
+}
+
 }  // namespace
 
 // ─── Dual-native BLE debug payload helpers (repurposed) ─────────────
@@ -183,7 +323,10 @@ static uint16_t wire_min_peak_adc(const DualModelWire& m) {
 bool dual_wire_valid(const DualModelWire& m) {
     // Magic + wire version: anything else is a legacy 32D/corrupt blob.
     if (m.magic != DUAL_MODEL_MAGIC) return false;
-    if (m.wire_version != DUAL_MODEL_WIRE_VERSION) return false;
+    // v1 = classic single-latent blob, v2 = fruit-specific rule block.
+    if (m.wire_version != DUAL_MODEL_WIRE_VERSION &&
+        m.wire_version != DUAL_MODEL_WIRE_VERSION_RULES)
+        return false;
 
     // Name: printable ASCII, NUL-terminated inside the 32-byte field.
     const uint8_t* name = reinterpret_cast<const uint8_t*>(m.fruit_name);
@@ -206,15 +349,22 @@ bool dual_wire_valid(const DualModelWire& m) {
     // Reserved regions must be canonical (all zero). The STFT-acoustic hook
     // bytes (acoustic_feature_mode @116 and stft_t1_prior @120..123) are now
     // ACTIVE fields, so they are excluded from the zero-check below and
-    // validated explicitly; 115 / 117..119 / 124..851 stay reserved.
+    // validated explicitly; 115 / 117..119 stay reserved.
     for (size_t i = 0; i < sizeof(m.reserved); i++)
         if (m.reserved[i] != 0) return false;
     if (m.reserved2_pad != 0) return false;
     if (m.reserved2_tail0 != 0) return false;
     for (size_t i = 0; i < sizeof(m.reserved2_tail); i++)
         if (m.reserved2_tail[i] != 0) return false;
-    for (size_t i = 0; i < sizeof(m.reserved2); i++)
-        if (m.reserved2[i] != 0) return false;
+
+    // The 728 bytes at offset 124 are the v2 RULE BLOCK. A v1 blob must
+    // carry it zeroed (canonical); a v2 blob must carry a structurally
+    // valid block — that is where the fruit-specific discriminators live.
+    if (m.wire_version == DUAL_MODEL_WIRE_VERSION_RULES) {
+        if (!fruit_rule_block_valid(m.rules)) return false;
+    } else {
+        if (!fruit_rule_block_empty(m.rules)) return false;
+    }
 
     // Acoustic feature hook: mode must be known; prior finite.
     if (m.acoustic_feature_mode != ACOUSTIC_FEATURE_MODE_LEGACY &&
@@ -263,6 +413,10 @@ DualLatentParams dual_params_decode(const DualModelWire& m) {
     p.min_peak_adc = mp != 0 ? mp : (uint16_t)DUAL_DEFAULT_MIN_PEAK_ADC;
     p.acoustic_feature_mode = m.acoustic_feature_mode;
     p.stft_t1_prior = m.stft_t1_prior;
+    // v2 blobs decide with the fruit-specific rule block; v1 keeps the
+    // classic single-latent path (rules stay disabled).
+    p.use_rules = (m.wire_version >= DUAL_MODEL_WIRE_VERSION_RULES);
+    if (p.use_rules) p.rules = fruit_rule_decode(m.rules);
     return p;
 }
 
@@ -277,6 +431,11 @@ static BiologicalStatus evaluate_fruit_dual_impl(
 {
     if (n_taps == 0) n_taps = 1;
     if (n_taps > MAX_DUAL_TAPS) n_taps = MAX_DUAL_TAPS;
+
+    // ── v2 blobs decide with the fruit-specific rule engine ──
+    if (p.use_rules) {
+        return evaluate_fruit_rules(p.rules, p, taps, n_taps, vision);
+    }
 
     float vol_norm = dual_volume_norm(p, vision.volume_cm3);
 
@@ -406,4 +565,137 @@ BiologicalStatus evaluate_fruit_dual(
 {
     return evaluate_fruit_dual_impl(dual_params_default(), taps, n_taps,
                                     vision, "default");
+}
+
+// ─── v2 fruit-specific discriminator rules (the decision path for
+//     wire_version == 2 blobs) ───────────────────────────────────────
+BiologicalStatus evaluate_fruit_rules(
+    const FruitRuleParams& rp,
+    const DualLatentParams& p,
+    const AcousticFeatures taps[MAX_DUAL_TAPS],
+    uint8_t n_taps,
+    const ColorFeatures& vision)
+{
+    BiologicalStatus result;
+    memset(&result, 0, sizeof(result));
+
+    if (n_taps == 0) n_taps = 1;
+    if (n_taps > MAX_DUAL_TAPS) n_taps = MAX_DUAL_TAPS;
+
+    RuleFeatureSet fs;
+    rule_feature_values(p, taps, n_taps, vision, fs);
+
+    const uint8_t mask = p.active_class_mask;
+
+    // ── Class scores from the handcrafted bands ──
+    float score[NUM_CLASSES];
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        score[c] = ((mask >> c) & 1U) ? rule_class_score(rp, fs, (uint8_t)c) : 0.0f;
+    }
+
+    // ── Winner / runner-up, then the "too close to call" fallback ──
+    int best = -1, second = -1;
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        if (!((mask >> c) & 1U)) continue;
+        if (best < 0 || score[c] > score[best]) {
+            second = best; best = c;
+        } else if (second < 0 || score[c] > score[second]) {
+            second = c;
+        }
+    }
+    if (best < 0) { best = 0; second = -1; }
+
+    bool defaulted = false;
+    if (rp.default_class < NUM_CLASSES && ((mask >> rp.default_class) & 1U)) {
+        const float gap = (second >= 0) ? (score[best] - score[second]) : score[best];
+        if (gap < rp.margin) {
+            score[rp.default_class] = score[best] + 1e-3f;
+            best = rp.default_class;
+            defaulted = true;
+        }
+    }
+
+    // ── Posterior over the enabled classes ──
+    float logits[NUM_CLASSES];
+    float running_max = -1e30f;
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        if (!((mask >> c) & 1U)) { logits[c] = -100000.0f; continue; }
+        logits[c] = score[c] / rp.temperature;
+        if (logits[c] > running_max) running_max = logits[c];
+    }
+    float sum_exp = 0.0f;
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        result.probabilities[c] =
+            (running_max > -1e29f) ? expf(logits[c] - running_max) : 0.0f;
+        sum_exp += result.probabilities[c];
+    }
+    const float inv = 1.0f / (sum_exp + 1e-15f);
+    for (int c = 0; c < NUM_CLASSES; c++) result.probabilities[c] *= inv;
+
+    // ── Hard override: two handcrafted conditions that win outright ──
+    bool overridden = false;
+    if (rp.override_class < NUM_CLASSES) {
+        const uint8_t f1 = rp.override_slot1, f2 = rp.override_slot2;
+        bool c1 = false, c2 = false;
+        if (f1 < DISC_COUNT && fs.ok[f1])
+            c1 = (rp.override_op1 == DISC_OP_GT) ? (fs.v[f1] > rp.override_val1)
+                                                 : (fs.v[f1] < rp.override_val1);
+        if (f2 < DISC_COUNT && fs.ok[f2])
+            c2 = (rp.override_op2 == DISC_OP_GT) ? (fs.v[f2] > rp.override_val2)
+                                                 : (fs.v[f2] < rp.override_val2);
+        if (c1 && c2) {
+            overridden = true;
+            best = rp.override_class;
+            float others = 0.0f;
+            for (int c = 0; c < NUM_CLASSES; c++)
+                if (c != best && ((mask >> c) & 1U)) others += 1.0f;
+            for (int c = 0; c < NUM_CLASSES; c++) result.probabilities[c] = 0.0f;
+            result.probabilities[best] = 0.90f;
+            if (others > 0.0f) {
+                for (int c = 0; c < NUM_CLASSES; c++)
+                    if (c != best && ((mask >> c) & 1U))
+                        result.probabilities[c] = 0.10f / others;
+            }
+        }
+    }
+
+    // ── Ripeness index: the posterior projected onto the ripeness axis ──
+    const float gain = rp.ripeness_gain > 0.0f ? rp.ripeness_gain : 1.0f;
+    float ripeness = 0.0f;
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        const float rank = clamp_f(0.5f + gain * (RULE_CLASS_RANK[c] - 0.5f),
+                                   0.0f, 1.0f);
+        ripeness += result.probabilities[c] * rank;
+    }
+    result.ripeness_index = clamp_f(ripeness, 0.0f, 1.0f);
+
+    result.primary_decision = CLASS_LABELS[best];
+    result.confidence = clamp_f(result.probabilities[best] * 100.0f, 0.0f, 100.0f);
+
+    float H = 0.0f;
+    for (int c = 0; c < NUM_CLASSES; c++) {
+        const float p_i = result.probabilities[c];
+        if (p_i > 1e-5f) H -= p_i * logf(p_i);
+    }
+    result.transition_entropy = H;
+
+    // Rotten/hollow and artificially-ripened are biological anomalies. The
+    // black-spot discriminator lands here: a model that gives the ROTTEN
+    // class a band on DISC_DARK_SPOT flips the decision into the anomaly
+    // class as soon as spots are seen.
+    result.is_anomaly = ((best == 3 || best == 4) &&
+                          (overridden || score[best] >= rp.anomaly_threshold));
+
+    Serial.printf("[Rule] N=%u score=[%.3f %.3f %.3f %.3f %.3f] "
+                  "spot=%.3f dark=%.3f -> %s (%.1f%%) ri=%.3f%s%s mask=0x%02X\n",
+                  n_taps, score[0], score[1], score[2], score[3], score[4],
+                  fs.ok[DISC_DARK_SPOT] ? fs.v[DISC_DARK_SPOT] : -1.0f,
+                  fs.ok[DISC_DARK_MASS] ? fs.v[DISC_DARK_MASS] : -1.0f,
+                  result.primary_decision, (double)result.confidence,
+                  result.ripeness_index,
+                  overridden ? " [override]" : "",
+                  defaulted ? " [default]" : "",
+                  mask);
+
+    return result;
 }

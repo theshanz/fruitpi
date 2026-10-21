@@ -31,6 +31,13 @@ struct AcousticFeatures {
                               // on this exact estimator).
     float peak_abs;           // max |raw ADC| over the window — force/amplitude
                               // cue for the BETA*ln(peak) de-coating term.
+    // The share of the spectrum's energy in the mode band (the 16 log cells
+    // of config.h, cell LOG_MODE_BAND_INDEX).  This is the discriminator
+    // that separated a green from a yellow mango on the Mango-capped corpus,
+    // and it is computed from the same 512-point Hann FFT of the same
+    // mean-centred window the host's timbre features use, so the device and
+    // the trainer measure the same band.
+    float mode_band_energy;
     float stft_t1_decay;      // = stft_grid[1*4 + 2] — the prominent early-decay
                               // STFT cell (T1 time slice, 500..850 Hz band),
                               // contrast-normalized 0..1. Exposed explicitly so

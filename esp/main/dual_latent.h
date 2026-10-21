@@ -3,6 +3,7 @@
 #include <cstdint>
 #include "config.h"
 #include "extract_hues.h"
+#include "fruit_rule.h"
 #include "piezo_acoustic.h"
 #include "sci_32d.h"
 
@@ -49,8 +50,11 @@ struct DualLatentParams {
                                      // wire @116; default = LEGACY so pre-hook
                                      // blobs run the exact validated engine.
     float   stft_t1_prior;           // decision midpoint on the STFT T1
-                                     // early-decay coordinate (wire @120), read
-                                     // only when acoustic_feature_mode == 1.
+                                      // early-decay coordinate (wire @120), read
+                                      // only when acoustic_feature_mode == 1.
+    bool    use_rules;               // wire_version >= 2: the fruit-specific
+                                      // discriminator rules drive the decision
+    FruitRuleParams rules;           // decoded rule block (wire @124..851)
 };
 
 // Compiled-in defaults (config.h) — used when no model blob is active.
@@ -75,6 +79,18 @@ BiologicalStatus evaluate_fruit_dual(
 // spectral/moment manifolds FIRST, then a SINGLE decision (matches the
 // validated Python engine — a median of posterior votes is NOT used).
 BiologicalStatus evaluate_fruit_dual(
+    const AcousticFeatures taps[MAX_DUAL_TAPS],
+    uint8_t n_taps,
+    const ColorFeatures& vision);
+
+// ─── Fruit-specific discriminator rules (wire v2) ───────────────────
+// The v2 decision path. `p` supplies the classic latent knobs the rules
+// still need (beta for the de-coated shear, volume clamp for the abbott
+// term, green-bin range for the optical channels); `rp` supplies the
+// per-fruit discriminators, bands and weights that actually decide.
+BiologicalStatus evaluate_fruit_rules(
+    const FruitRuleParams& rp,
+    const DualLatentParams& p,
     const AcousticFeatures taps[MAX_DUAL_TAPS],
     uint8_t n_taps,
     const ColorFeatures& vision);
