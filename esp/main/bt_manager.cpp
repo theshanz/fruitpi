@@ -8,6 +8,11 @@
 #include "lcd_display.h"
 #include "fruit_rule.h"
 
+// Writes the ACTIVE MODEL's per-site anchor table into a JSON document, so
+// the app's site picker knows which strike sites the model was measured on
+// without pulling the 852-byte blob back over BLE.
+static void add_site_table(JsonDocument& doc, FruitStore* store);
+
 BTManager::BTManager() : pServer(nullptr), pCharModelTransfer(nullptr), pCharScanConfig(nullptr),
                          pCharScanResults(nullptr), pCharRawStream(nullptr), store_ref(nullptr),
                          device_connected(false), current_mode(MODE_INFERENCE),
@@ -251,6 +256,8 @@ void BTManager::onWrite(NimBLECharacteristic *pCharacteristic)
                     {
                         resp["mode"] = (current_mode == MODE_DATA_COLLECTION) ? "data_collection" :
                                        (current_mode == MODE_DEBUG) ? "debug" : "inference";
+                        resp["site_id"] = (int)current_config.site_id;
+                        add_site_table(resp, store_ref);
                         resp["tap_count"] = get_target_tap_count();
                         resp["volume_cm3"] = get_override_volume_cm3();
                         resp["volume_override"] = has_volume_override();
@@ -783,6 +790,33 @@ uint32_t BTManager::inter_chunk_delay_ms()
     return d;
 }
 
+
+// ── The active model's per-site anchor table ─────────────────────────────
+// The app's site picker needs to know which strike sites a model was
+// measured on.  The model blob carries the table, and the DEVICE holds the
+// active model, so the device reports it rather than the app having to pull
+// the 852-byte blob back over BLE.
+static void add_site_table(JsonDocument& doc, FruitStore* store) {
+    if (!store) return;
+    const DualModelWire* m = store->get_active_model_ptr();
+    if (!m) return;
+    const FruitSideTable table = *reinterpret_cast<const FruitSideTable*>(m->rules.reserved);
+    // An all-zero run means the model has no table (the device then picks the
+    // site itself), so there is nothing to report.
+    bool any = false;
+    for (size_t i = 0; i < sizeof(FruitSideTable); i++) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&table) + i;
+        if (*p != 0) { any = true; break; }
+    }
+    if (!any) return;
+    JsonArray arr = doc.createNestedArray("sites");
+    for (uint8_t i = 0; i < table.side_count && i < FRM_MAX_SIDES; i++) {
+        JsonObject o = arr.createNestedObject();
+        o["id"] = (int)table.sides[i].side_id;
+        o["anchor"] = table.sides[i].anchor;
+    }
+}
+
 // ─── Save Received Dual-Latent Model to NVS ──────────────────────────
 void BTManager::process_incoming_model()
 {
@@ -1011,10 +1045,20 @@ void BTManager::notify_status_change(const char *status_msg)
     StaticJsonDocument<128> doc;
     doc["status"] = status_msg;
 
-    char output[128];
+    char output[512];
     size_t len = serializeJson(doc, output);
     pCharScanResults->setValue((uint8_t *)output, len);
     pCharScanResults->notify();
+    // The app's site picker needs to know the model's sites, and the device
+    // is the only side that has the active model.
+    if (doc["sites"].is<JsonArray>()) {
+        JsonArray sites = doc["sites"];
+        Serial.printf("[BTManager] site table: %u site(s) [", (unsigned)sites.size());
+        for (size_t i = 0; i < sites.size(); i++) {
+            Serial.printf(" %d=%.6f", sites[i]["id"].as<int>(), sites[i]["anchor"].as<float>());
+        }
+        Serial.println(" ]");
+    }
 }
 
 // Pushed scan-config snapshot: sent back to the app after the app writes
@@ -1025,19 +1069,30 @@ void BTManager::notify_scan_config()
     if (!device_connected)
         return;
 
-    StaticJsonDocument<128> doc;
+    StaticJsonDocument<512> doc;
     doc["status"] = "scan_config";
     doc["site_id"] = (int)current_config.site_id;
+    add_site_table(doc, store_ref);
     doc["mode"] = (current_mode == MODE_DATA_COLLECTION) ? "data_collection" :
                   (current_mode == MODE_DEBUG) ? "debug" : "inference";
     doc["tap_count"] = get_target_tap_count();
     doc["volume_cm3"] = get_override_volume_cm3();
     doc["volume_override"] = has_volume_override();
 
-    char output[128];
+    char output[512];
     size_t len = serializeJson(doc, output);
     pCharScanResults->setValue((uint8_t *)output, len);
     pCharScanResults->notify();
+    // The app's site picker needs to know the model's sites, and the device
+    // is the only side that has the active model.
+    if (doc["sites"].is<JsonArray>()) {
+        JsonArray sites = doc["sites"];
+        Serial.printf("[BTManager] site table: %u site(s) [", (unsigned)sites.size());
+        for (size_t i = 0; i < sites.size(); i++) {
+            Serial.printf(" %d=%.6f", sites[i]["id"].as<int>(), sites[i]["anchor"].as<float>());
+        }
+        Serial.println(" ]");
+    }
 }
 
 // Pushed inventory snapshot: identical payload to the `list_models` reply,

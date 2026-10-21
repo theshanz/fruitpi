@@ -150,12 +150,22 @@ class _CozySpectraDashboardState extends State<CozySpectraDashboard>
   static const int kAutoSite = 255;
   int _siteId = kAutoSite;
 
-  List<DualModelSite> get _availableSites {
+  /// The strike sites the active model was measured on.
+  ///
+  /// The DEVICE reports them (it holds the active model, so it knows its
+  /// per-site table) - that is the only source that works for a model
+  /// uploaded from a host, which the app's session vault has never seen.
+  /// The vault is the fallback for a model the app itself produced.
+  List<ModelSite> get _availableSites {
+    final reported = widget.bleService.scanConfig.value?.sites;
+    if (reported != null && reported.isNotEmpty) return reported;
     final name = widget.bleService.activeModel.value;
     if (name == null || name.isEmpty) return const [];
     final bin = ModelVault.get(name);
     if (bin == null) return const [];
-    return DualModelWire.siteTable(bin);
+    return DualModelWire.siteTable(bin)
+        .map((s) => ModelSite(id: s.id, anchor: s.anchor))
+        .toList();
   }
 
   void _setSite(int id) {

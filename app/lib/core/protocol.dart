@@ -173,12 +173,20 @@ class ScanConfigData {
   final int tapCount;
   final double volumeCm3;
   final bool volumeOverride;
+  /// The strike site the operator tapped (255 = auto).
+  final int siteId;
+  /// The strike sites the ACTIVE MODEL was measured on, as the device
+  /// reports them.  Empty means the model carries no per-site table and the
+  /// device picks the site itself.
+  final List<ModelSite> sites;
 
   const ScanConfigData({
     required this.mode,
     required this.tapCount,
     required this.volumeCm3,
     required this.volumeOverride,
+    this.siteId = 255,
+    this.sites = const [],
   });
 
   static ScanConfigData? tryParse(Map<String, dynamic> j) {
@@ -188,11 +196,23 @@ class ScanConfigData {
         !j.containsKey('volume_override')) {
       return null;
     }
+    final rawSites = (j['sites'] as List?) ?? const [];
+    final sites = <ModelSite>[];
+    for (final s in rawSites) {
+      if (s is Map) {
+        final id = (s['id'] as num?)?.toInt();
+        if (id != null) {
+          sites.add(ModelSite(id: id, anchor: _d(s['anchor'])));
+        }
+      }
+    }
     return ScanConfigData(
       mode: (j['mode'] as String?) ?? 'inference',
       tapCount: (j['tap_count'] as num?)?.toInt() ?? 3,
       volumeCm3: _d(j['volume_cm3']),
       volumeOverride: j['volume_override'] == true || j['volume_override'] == 1,
+      siteId: (j['site_id'] as num?)?.toInt() ?? 255,
+      sites: sites,
     );
   }
 
@@ -296,3 +316,23 @@ class TransferProgressEvent extends ResultsEvent {
 }
 
 class UnknownEvent extends ResultsEvent {}
+
+/// One strike site a model was measured on.
+class ModelSite {
+  final int id;
+  final double anchor;
+
+  const ModelSite({required this.id, required this.anchor});
+
+  /// The name shown in the picker.  The ids are the app's own convention (the
+  /// order the corpus was captured in), so the names live here.
+  String get label => kSiteNames[id] ?? 'site $id';
+}
+
+/// The site ids, in the order the corpus captured them.
+const Map<int, String> kSiteNames = {
+  0: 'cheekA',
+  1: 'cheekB',
+  2: 'edge',
+  3: 'top',
+};

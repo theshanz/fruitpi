@@ -1,8 +1,17 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'protocol.dart';
+
 /// Dual-Latent 852-byte wire helpers (DLAT format, esp/main/sci_32d.h).
 /// Mirrors RulesModel32D for the new dual-latent model blob.
+///
+/// WIRE VERSIONS
+///   1 — classic latent: one global ripeness latent for every fruit.
+///   2 — fruit rules: the previously reserved 728 bytes at offset 124 hold a
+///       per-fruit RULE BLOCK (discriminator bands per class). This is the
+///       format the Python trainer (datacollection/fruit_rules.py) emits and
+///       the format the firmware's evaluate_fruit_rules() consumes.
 class DualModelWire {
   DualModelWire._();
 
@@ -29,6 +38,13 @@ class DualModelWire {
   static const offsetVol23Hi = 88;
   static const offsetAnchors = 92;
 
+  // ── v2 rule block ──────────────────────────────────────────────────
+  /// The rule block starts where the legacy blob kept its reserved tail.
+  static const int ruleOffset = 124;
+  static const int ruleBytes = 728;
+  static const int wireVersionClassic = 1;
+  static const int wireVersionRules = 2;
+
   static const List<String> modalityLabels = ['ACOUSTIC', 'OPTICS', 'DUAL'];
   static const int modalityAcoustic = 0;
   static const int modalityOptics = 1;
@@ -40,17 +56,88 @@ class DualModelWire {
         bin.sublist(0, end < 0 ? 31 : end).where((b) => b >= 32 && b <= 126));
   }
 
+  static int wireVersionOf(Uint8List bin) =>
+      bin.length >= wireBytes ? bin[offsetVersion] : 0;
+
+  static bool isRulesWire(Uint8List bin) =>
+      wireVersionOf(bin) >= wireVersionRules;
+
   static bool isValid(Uint8List bin) {
     if (bin.length != wireBytes) return false;
-    // Magic check for DLAT: bytes 32..35 should be 0x44 0x4C 0x41 0x54
-    if (bin[32] != 0x44 || bin[33] != 0x4C || bin[34] != 0x41 || bin[35] != 0x54)
+    // Magic: the firmware reads a little-endian uint32 and compares it with
+    // DUAL_MODEL_MAGIC (0x444C4154), so the bytes on the wire are
+    // 54 41 4C 44 ("TALD") — not the ASCII spelling "DLAT".
+    if (bin[32] != 0x54 ||
+        bin[33] != 0x41 ||
+        bin[34] != 0x4C ||
+        bin[35] != 0x44) {
       return false;
-    if (bin[offsetVersion] != 1) return false;
+    }
+    final version = bin[offsetVersion];
+    if (version != wireVersionClassic && version != wireVersionRules)
+      return false;
     final mask = bin[offsetMask];
     if (mask == 0 || (mask & ~(0x1F)) != 0) return false;
     final mod = bin[offsetModality];
     if (mod > 2) return false;
+    // v2 additionally carries a rule block the device validates strictly.
+    if (version >= wireVersionRules) {
+      final rules = DualFruitRules.parse(bin);
+      if (rules == null || !rules.isValid) return false;
+    } else {
+      // The firmware demands an EMPTY rule block on a classic wire.
+      if (!isRuleBlockEmpty(bin)) return false;
+    }
     return true;
+  }
+
+  /// True when the 728-byte rule block is all zeros (a classic v1 wire).
+  static bool isRuleBlockEmpty(Uint8List bin) {
+    if (bin.length < ruleOffset + ruleBytes) return true;
+    for (var i = ruleOffset; i < ruleOffset + ruleBytes; i++) {
+      if (bin[i] != 0) return false;
+    }
+    return true;
+  }
+
+  // ── the per-site anchor table ──────────────────────────────────────
+  /// The table lives in the rule block's 156 reserved bytes (the blob's
+  /// offset 696): a version, a count, and up to 14 rows of 10 bytes
+  /// (site_id, flags, anchor, softness).  An all-zero run means the model
+  /// has no table and the device picks the site itself.
+  static const int sideTableOffset = ruleOffset + 572;
+  static const int sideTableBytes = 156;
+  static const int sideTableVersion = 1;
+  static const int maxSides = 14;
+  static const int sideRowBytes = 10;
+
+  /// The strike sites a model was measured on.
+  static List<DualModelSite> siteTable(Uint8List bin) {
+    if (bin.length < sideTableOffset + sideTableBytes) return const [];
+    var allZero = true;
+    for (var i = sideTableOffset; i < sideTableOffset + sideTableBytes; i++) {
+      if (bin[i] != 0) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) return const [];
+    final version = ByteData.sublistView(
+            bin, sideTableOffset, sideTableOffset + 4)
+        .getUint32(0, Endian.little);
+    if (version != sideTableVersion) return const [];
+    final count = bin[sideTableOffset + 4];
+    final view = ByteData.sublistView(bin);
+    final sites = <DualModelSite>[];
+    for (var i = 0; i < count && i < maxSides; i++) {
+      final off = sideTableOffset + 8 + i * sideRowBytes;
+      sites.add(DualModelSite(
+        id: bin[off],
+        anchor: view.getFloat32(off + 2, Endian.little),
+        softness: view.getFloat32(off + 6, Endian.little),
+      ));
+    }
+    return sites;
   }
 
   static int maskOf(Uint8List bin) =>
@@ -102,6 +189,44 @@ class DualModelWire {
       out[i] = i < raw.length ? raw[i] : 0;
     }
     return out;
+  }
+
+  // ── v2 rule block access ───────────────────────────────────────────
+
+  /// The parsed rule block of a v2 blob (null for a v1 blob).
+  static DualFruitRules? rulesOf(Uint8List bin) => DualFruitRules.parse(bin);
+
+  /// Write a rule block into the blob and mark the wire as v2.
+  static Uint8List withRules(Uint8List bin, DualFruitRules rules) {
+    final out = Uint8List.fromList(bin);
+    if (out.length < wireBytes) return out;
+    out[offsetVersion] = wireVersionRules;
+    out.setRange(ruleOffset, ruleOffset + ruleBytes, rules.pack());
+    return out;
+  }
+
+  /// Rewrite only the global rule knobs (temperature, margin, default class,
+  /// anomaly threshold, ripeness gain). Every band is preserved byte for
+  /// byte, so a trained model stays trained.
+  static Uint8List withRuleKnobs(
+    Uint8List bin, {
+    double? temperature,
+    double? margin,
+    int? defaultClass,
+    double? anomalyThreshold,
+    double? ripenessGain,
+  }) {
+    final rules = DualFruitRules.parse(bin);
+    if (rules == null) return bin;
+    return withRules(
+        bin,
+        rules.copyWith(
+          temperature: temperature,
+          margin: margin,
+          defaultClass: defaultClass,
+          anomalyThreshold: anomalyThreshold,
+          ripenessGain: ripenessGain,
+        ));
   }
 
   static Uint8List? tryParseBinText(String text) {
@@ -176,7 +301,7 @@ class DualModelWire {
     final bd = ByteData.sublistView(out);
     final raw = name.codeUnits.take(31).toList();
     for (var i = 0; i < 32; i++) out[i] = i < raw.length ? raw[i] : 0;
-    out[32] = 0x44; out[33] = 0x4C; out[34] = 0x41; out[35] = 0x54; // DLAT
+    out[32] = 0x54; out[33] = 0x41; out[34] = 0x4C; out[35] = 0x44; // "DLAT" as LE u32
     out[offsetVersion] = 1;
     out[offsetMask] = activeMask & 0xFF;
     out[offsetModality] = modality.clamp(0, 2);
@@ -582,14 +707,7 @@ class DualModelSite {
 
   /// The name shown in the picker.  The site ids are the app's own
   /// convention (the order the corpus was captured in), so the names live
-  /// here rather than in the blob - the blob's table has no room for them.
+  /// in the app rather than in the blob - the blob's table has no room for
+  /// them.
   String get label => kSiteNames[id] ?? 'site $id';
 }
-
-/// The site ids, in the order the corpus captured them.
-const Map<int, String> kSiteNames = {
-  0: 'cheekA',
-  1: 'cheekB',
-  2: 'edge',
-  3: 'top',
-};
