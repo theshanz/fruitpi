@@ -247,6 +247,48 @@ float rule_class_score(const FruitRuleParams& rp, const RuleFeatureSet& fs,
     return (den > 0.0f) ? (num / den) : 0.0f;
 }
 
+// The class score with a per-site anchor: the site's edge replaces the
+// global band edge for the two classes that read the mode band.  The site is
+// not declared by the app: the device evaluates every row and keeps the one
+// that matches, because "if the taps are identical it does not matter which
+// site it is, and if they differ, that is a different site".
+float rule_class_score_site(const FruitRuleParams& rp, const RuleFeatureSet& fs,
+                            uint8_t cls, float anchor, float softness) {
+    if (rp.side_count == 0) return rule_class_score(rp, fs, cls);
+    // Only the classes that read the mode band carry a per-site edge.
+    for (uint8_t i = 0; i < FRM_MAX_SLOTS; i++) {
+        if (!((rp.class_slot_mask[cls] >> i) & 1U)) continue;
+        if (rp.slot_feature[i] != DISC_MODE_BAND) continue;
+        float num = 0.0f, den = 0.0f;
+        for (uint8_t j = 0; j < FRM_MAX_SLOTS; j++) {
+            if (!((rp.class_slot_mask[cls] >> j) & 1U)) continue;
+            const float w = rp.slot_weight[j];
+            den += w;
+            if (w <= 0.0f) continue;
+            const uint8_t fid = rp.slot_feature[j];
+            if (fid >= DISC_COUNT || !fs.ok[fid]) continue;
+            float lo = rp.class_lo[cls][j];
+            float hi = rp.class_hi[cls][j];
+            float soft = rp.class_soft[cls][j];
+            if (j == i) {
+                // this slot's edge comes from the site
+                lo = (cls == 0) ? 0.0f : anchor;
+                hi = (cls == 0) ? anchor : 1.0f;
+                soft = softness;
+            }
+            if (hi < lo) { const float t = lo; lo = hi; hi = t; }
+            if (soft <= 0.0f) soft = 1e-3f;
+            const float x = fs.v[fid];
+            float d = 0.0f;
+            if (x < lo) d = lo - x; else if (x > hi) d = x - hi;
+            const float m = (d <= 0.0f) ? 1.0f : expf(-0.5f * (d / soft) * (d / soft));
+            num += w * m;
+        }
+        return (den > 0.0f) ? (num / den) : 0.0f;
+    }
+    return rule_class_score(rp, fs, cls);
+}
+
 }  // namespace
 
 // ─── Dual-native BLE debug payload helpers (repurposed) ─────────────
@@ -588,9 +630,37 @@ BiologicalStatus evaluate_fruit_rules(
     const uint8_t mask = p.active_class_mask;
 
     // ── Class scores from the handcrafted bands ──
+    // With a per-site table the device tries every site's anchor and keeps
+    // the one whose bands match best; without one it uses the global bands.
     float score[NUM_CLASSES];
-    for (int c = 0; c < NUM_CLASSES; c++) {
-        score[c] = ((mask >> c) & 1U) ? rule_class_score(rp, fs, (uint8_t)c) : 0.0f;
+    int chosen_side = -1;
+    if (rp.side_count > 0) {
+        // The site whose anchor the feature sits CLOSEST to.  The sites'
+        // score ranges overlap, so the feature cannot IDENTIFY the site -
+        // the anchors are within ~15 % of each other and picking the site
+        // with the biggest separation would always pick the same one.  The
+        // nearest anchor is the best available guess, and the app can do
+        // better by uploading the blob for the site it knows.
+        float best_dist = -1.0f;
+        for (uint8_t side = 0; side < rp.side_count; side++) {
+            float s[NUM_CLASSES];
+            for (int c = 0; c < NUM_CLASSES; c++) {
+                s[c] = ((mask >> c) & 1U)
+                    ? rule_class_score_site(rp, fs, (uint8_t)c, rp.side_anchor[side],
+                                            rp.side_soft[side])
+                    : 0.0f;
+            }
+            float dist = fabsf(fs.v[DISC_MODE_BAND] - rp.side_anchor[side]);
+            if (best_dist < 0.0f || dist < best_dist) {
+                best_dist = dist;
+                chosen_side = (int)side;
+                for (int c = 0; c < NUM_CLASSES; c++) score[c] = s[c];
+            }
+        }
+    } else {
+        for (int c = 0; c < NUM_CLASSES; c++) {
+            score[c] = ((mask >> c) & 1U) ? rule_class_score(rp, fs, (uint8_t)c) : 0.0f;
+        }
     }
 
     // ── Winner / runner-up, then the "too close to call" fallback ──

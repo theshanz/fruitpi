@@ -38,7 +38,29 @@ bool fruit_rule_block_valid(const FruitRuleBlock& b) {
 
     // Padding must stay canonical so the blob round-trips byte-for-byte.
     if (!zeroed(b.pad0, sizeof(b.pad0))) return false;
-    if (!zeroed(b.reserved, sizeof(b.reserved))) return false;
+    // The 156-byte run is EITHER the legacy all-zero padding OR a valid
+    // per-side anchor table.  A model without a table keeps the legacy
+    // behaviour byte for byte.
+    {
+        const FruitSideTable t = *reinterpret_cast<const FruitSideTable*>(b.reserved);
+        const bool all_zero = zeroed(b.reserved, sizeof(b.reserved));
+        if (!all_zero) {
+            if (t.table_version != FRM_SIDE_TABLE_VERSION) return false;
+            if (t.side_count > FRM_MAX_SIDES) return false;
+            if (!zeroed(t.reserved, sizeof(t.reserved))) return false;
+            for (uint8_t i = 0; i < t.side_count; i++) {
+                if (!finite_f(t.sides[i].anchor)) return false;
+                if (!finite_f(t.sides[i].softness) || t.sides[i].softness <= 0.0f)
+                    return false;
+            }
+            for (uint8_t i = t.side_count; i < FRM_MAX_SIDES; i++) {
+                if (t.sides[i].side_id != 0 || t.sides[i].flags != 0 ||
+                    t.sides[i].anchor != 0.0f || t.sides[i].softness != 0.0f)
+                    return false;
+            }
+            if (!zeroed(t.tail, sizeof(t.tail))) return false;
+        }
+    }
 
     // Per-slot feature id + weight. Inactive slots are canonical zeros.
     for (uint8_t i = 0; i < FRM_MAX_SLOTS; i++) {
@@ -110,6 +132,16 @@ FruitRuleParams fruit_rule_decode(const FruitRuleBlock& b) {    FruitRuleParams 
     for (uint8_t i = 0; i < FRM_MAX_SLOTS; i++) {
         p.slot_feature[i] = b.slot_feature[i];
         p.slot_weight[i]  = b.slot_weight[i];
+    }
+    // The per-side anchor table, when the blob carries one.
+    {
+        const FruitSideTable t = *reinterpret_cast<const FruitSideTable*>(b.reserved);
+        p.side_count = t.side_count;
+        for (uint8_t i = 0; i < FRM_MAX_SIDES; i++) {
+            p.side_id[i] = t.sides[i].side_id;
+            p.side_anchor[i] = t.sides[i].anchor;
+            p.side_soft[i] = t.sides[i].softness;
+        }
     }
     for (uint8_t c = 0; c < FRM_NUM_CLASSES; c++) {
         p.class_slot_mask[c] = b.class_slot_mask[c];

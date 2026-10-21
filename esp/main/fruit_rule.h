@@ -111,6 +111,43 @@ struct __attribute__((packed)) FruitRuleBlock {
 };
 static_assert(sizeof(FruitRuleBlock) == 728, "FruitRuleBlock must be 728 bytes");
 
+// ─── The per-side anchor table (the 156 reserved bytes) ────────────────
+// A fruit's strike SITES do not share one score level: the same mango's
+// two cheeks and its edge sit at different mode-band levels, because what
+// moves the level is how the fruit is coupled to the piezo (the placement),
+// not which fruit it is.  A single band therefore misclassifies the
+// sessions that sit near it, so the model carries one anchor per site.
+//
+// The table lives in the rule block's 156 reserved bytes, which keeps the
+// blob at 852 bytes and the wire format otherwise untouched.  The bytes stay
+// all-zero when a model has no table, and the firmware then behaves exactly
+// as before (legacy blobs are unaffected).
+//
+// The device does NOT need the site declared: it evaluates every row's
+// anchor and takes the one that matches ("if the taps are identical it does
+// not matter which site it is; if they differ, that is a different site").
+// An app may still declare the site to skip the search.
+constexpr uint8_t FRM_SIDE_TABLE_VERSION = 1;
+constexpr uint8_t FRM_MAX_SIDES = 14;
+constexpr uint8_t FRM_SIDE_FLAG_NONE = 0;
+
+struct __attribute__((packed)) FruitSideEntry {
+    uint8_t side_id;    // the site's index (the app's label for it)
+    uint8_t flags;      // FRM_SIDE_FLAG_*
+    float   anchor;     // the class band edge for this site
+    float   softness;   // the band softness for this site
+};
+
+struct __attribute__((packed)) FruitSideTable {
+    uint32_t table_version;                       // FRM_SIDE_TABLE_VERSION
+    uint8_t  side_count;                          // 0 = no table
+    uint8_t  reserved[3];
+    FruitSideEntry sides[FRM_MAX_SIDES];
+    uint8_t  tail[8];                             // the 156-byte run, exactly
+};
+static_assert(sizeof(FruitSideEntry) == 10, "a side row is 10 bytes packed");
+static_assert(sizeof(FruitSideTable) == 156, "the side table must fill the reserved run");
+
 // ─── Decoded, runnable rule parameters ──────────────────────────────
 struct FruitRuleParams {
     bool    enabled;                              // wire_version >= 2
@@ -121,6 +158,11 @@ struct FruitRuleParams {
     float   class_lo[FRM_NUM_CLASSES][FRM_MAX_SLOTS];
     float   class_hi[FRM_NUM_CLASSES][FRM_MAX_SLOTS];
     float   class_soft[FRM_NUM_CLASSES][FRM_MAX_SLOTS];
+    // The per-site anchor table (empty when the model has none).
+    uint8_t side_count;
+    uint8_t side_id[FRM_MAX_SIDES];
+    float   side_anchor[FRM_MAX_SIDES];
+    float   side_soft[FRM_MAX_SIDES];
     float   temperature;
     float   margin;
     uint8_t default_class;
