@@ -52,6 +52,13 @@ A rule file is JSON:
       }
     }
 
+An override may also carry ONE condition (a pure defect check, e.g. "black
+spots"): it is packed into BOTH wire condition slots, which the firmware
+ANDs - so the wire keeps its exact shape and old blobs are unaffected.  An
+override whose conditions are all OPTICAL is evaluated by the device RIGHT
+AFTER the camera scan: a defect the camera can see does not wait for the
+taps.
+
 Band semantics: the membership is 1.0 inside [lo, hi] and decays as
 exp(-0.5*(d/soft)^2) outside, where d is the distance to the nearest edge.
 A class score is the weighted MEAN of its band memberships over the slots it
@@ -94,6 +101,7 @@ FEATURES = {
     "hue_entropy": 16,   # optics: hue-histogram entropy
     "dark_spot":   17,   # optics: black/brown SPOT area fraction
     "dark_mass":   18,   # optics: total dark area fraction
+    "mode_band":   19,   # MEAN of per-tap mode-cell share (262-332 Hz)
 }
 
 # Mirrors esp/main/sci_32d.h (CLASS_LABELS)
@@ -248,8 +256,8 @@ class RuleSet:
         if ov:
             oci = _class_index(ov["class"])
             conds = ov.get("conditions", [])
-            if len(conds) != 2:
-                raise RuleError("the override needs exactly two conditions")
+            if len(conds) not in (1, 2):
+                raise RuleError("the override needs one or two conditions")
             parsed = []
             for c in conds:
                 sname = str(c["feature"])
@@ -303,6 +311,12 @@ def pack_rule_block(rs: RuleSet) -> bytes:
     default_class = 0xFF if rs.default_class is None else rs.default_class
     if rs.override:
         oci, conds = rs.override
+        if len(conds) == 1:
+            # A ONE-condition override is packed into BOTH wire condition
+            # slots.  The firmware ANDs the two conditions, so the same
+            # condition twice is exactly the same rule - and the wire keeps
+            # its shape (no new field, no new op code, old blobs unchanged).
+            conds = [conds[0], conds[0]]
         (s1, op1, v1), (s2, op2, v2) = conds
         # The firmware evaluates the override against the FEATURE table
         # (fs.ok[slot] / fs.v[slot] in esp/main/dual_latent.cpp), so the
@@ -423,6 +437,17 @@ def describe(blob: bytes) -> None:
         print(f"override    : {CLASS_NAMES[oclass]} if "
               f"{inv.get(slot_feature[os1], os1)} {opname.get(oop1,'?')} {ov1:g} "
               f"AND {inv.get(slot_feature[os2], os2)} {opname.get(oop2,'?')} {ov2:g}")
+    elif oclass == OVERRIDE_ANOMALY_ONLY:
+        opname = {0: ">", 1: "<"}
+        f1 = inv.get(os1, os1)
+        f2 = inv.get(os2, os2)
+        optical = {"green", "warm", "hue_mean", "dispersion", "hue_entropy",
+                   "dark_spot", "dark_mass"}
+        when = ("RIGHT AFTER the camera scan (optical)"
+                if f1 in optical and f2 in optical else "after the taps")
+        print(f"override    : ANOMALY_ONLY if "
+              f"{f1} {opname.get(oop1,'?')} {ov1:g} "
+              f"AND {f2} {opname.get(oop2,'?')} {ov2:g}  -> {when}")
 
 
 def validate_blob(blob: bytes):

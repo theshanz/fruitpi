@@ -1,0 +1,61 @@
+{
+ "name": "Banana v1",
+ "modality": 2,
+ "min_peak_adc": 160,
+ "temperature": 0.08,
+ "margin": 0.03,
+ "default_class": "UNRIPE",
+ "anomaly_threshold": 0.5,
+ "ripeness_gain": 1.0,
+ "green_start": 4,
+ "green_end": 8,
+ "slots": [
+  {
+   "feature": "shear",
+   "weight": 1.0
+  },
+  {
+   "feature": "peak",
+   "weight": 0.5
+  }
+ ],
+ "classes": {
+  "UNRIPE": {
+   "slots": [
+    "shear",
+    "peak"
+   ],
+   "bands": {
+    "shear": [
+     0.0675,
+     0.7,
+     0.03
+    ],
+    "peak": [
+     1650.0,
+     3000.0,
+     250.0
+    ]
+   }
+  },
+  "PERFECTLY_RIPE": {
+   "slots": [
+    "shear",
+    "peak"
+   ],
+   "bands": {
+    "shear": [
+     0.0,
+     0.0675,
+     0.025
+    ],
+    "peak": [
+     0.0,
+     1650.0,
+     250.0
+    ]
+   }
+  }
+ },
+ "active_class_mask": 3
+}

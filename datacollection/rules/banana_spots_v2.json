@@ -1,0 +1,104 @@
+{
+ "name": "Banana Spots v2",
+ "modality": 2,
+ "min_peak_adc": 160,
+ "temperature": 0.08,
+ "margin": 0.03,
+ "default_class": "UNRIPE",
+ "anomaly_threshold": 0.5,
+ "ripeness_gain": 1.0,
+ "green_start": 4,
+ "green_end": 8,
+ "slots": [
+  {
+   "feature": "shear",
+   "weight": 1.0
+  },
+  {
+   "feature": "peak",
+   "weight": 0.5
+  },
+  {
+   "feature": "dark_spot",
+   "weight": 1.0
+  }
+ ],
+ "classes": {
+  "UNRIPE": {
+   "slots": [
+    "shear",
+    "peak",
+    "dark_spot"
+   ],
+   "bands": {
+    "shear": [
+     0.0675,
+     0.7,
+     0.03
+    ],
+    "peak": [
+     1650.0,
+     3000.0,
+     250.0
+    ],
+    "dark_spot": [
+     0.0,
+     0.02,
+     0.01
+    ]
+   }
+  },
+  "PERFECTLY_RIPE": {
+   "slots": [
+    "shear",
+    "peak",
+    "dark_spot"
+   ],
+   "bands": {
+    "shear": [
+     0.0,
+     0.0675,
+     0.025
+    ],
+    "peak": [
+     0.0,
+     1650.0,
+     250.0
+    ],
+    "dark_spot": [
+     0.0,
+     0.02,
+     0.01
+    ]
+   }
+  },
+  "ROTTEN_OR_HOLLOW": {
+   "slots": [
+    "dark_spot"
+   ],
+   "bands": {
+    "dark_spot": [
+     0.05,
+     1.0,
+     0.015
+    ]
+   }
+  }
+ },
+ "active_class_mask": 3,
+ "override": {
+  "class": "ANOMALY_ONLY",
+  "conditions": [
+   {
+    "feature": "dark_spot",
+    "op": ">",
+    "value": 0.05
+   },
+   {
+    "feature": "shear",
+    "op": ">",
+    "value": 0.0
+   }
+  ]
+ }
+}

@@ -1,0 +1,61 @@
+{
+ "name": "mango-normal",
+ "modality": 2,
+ "min_peak_adc": 160,
+ "temperature": 0.08,
+ "margin": 0.03,
+ "default_class": "UNRIPE",
+ "anomaly_threshold": 0.5,
+ "ripeness_gain": 1.0,
+ "green_start": 4,
+ "green_end": 8,
+ "slots": [
+  {
+   "feature": "mode_band",
+   "weight": 0.5
+  },
+  {
+   "feature": "green",
+   "weight": 1.0
+  }
+ ],
+ "classes": {
+  "UNRIPE": {
+   "slots": [
+    "mode_band",
+    "green"
+   ],
+   "bands": {
+    "mode_band": [
+     0.065,
+     1.0,
+     0.02
+    ],
+    "green": [
+     0.5,
+     1.0,
+     0.15
+    ]
+   }
+  },
+  "PERFECTLY_RIPE": {
+   "slots": [
+    "mode_band",
+    "green"
+   ],
+   "bands": {
+    "mode_band": [
+     0.0,
+     0.032,
+     0.013
+    ],
+    "green": [
+     0.0,
+     0.5,
+     0.15
+    ]
+   }
+  }
+ },
+ "active_class_mask": 3
+}
